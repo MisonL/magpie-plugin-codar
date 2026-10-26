@@ -1,0 +1,377 @@
+// The plugin against a fake Codar: every request goes to a stub, nothing here
+// talks to speedai. Fixtures follow the clock, so they don't expire on a day.
+
+import { test } from "node:test"
+import assert from "node:assert/strict"
+
+import CodarPlugin, { testables } from "../index.mjs"
+import * as mod from "../index.mjs"
+
+const { usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf } = testables
+
+// mkToken is a JWT-shaped string with the claims the plugin reads.
+const mkToken = (claims) => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  return `${b64({ alg: "HS256", typ: "JWT" })}.${b64(claims)}.sig`
+}
+const TOKEN = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 86400 })
+const auth = async () => ({ type: "api", key: TOKEN })
+
+// withFetch stubs global fetch for the duration of fn, answering by URL.
+async function withFetch(routes, fn) {
+  const real = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    const u = String(url)
+    calls.push({ url: u, init })
+    for (const [match, answer] of Object.entries(routes)) {
+      if (u.includes(match)) {
+        if (typeof answer === "function") return answer(u, init)
+        if (answer instanceof Response) return answer
+        return new Response(JSON.stringify(answer.body ?? answer), { status: answer.status ?? 200, headers: { "Content-Type": "application/json" } })
+      }
+    }
+    return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 })
+  }
+  try {
+    return await fn(calls)
+  } finally {
+    globalThis.fetch = real
+  }
+}
+
+test("a token's claims give the account name and the expiry", () => {
+  assert.equal(usernameOf(TOKEN), "user_1")
+  assert.ok(expiresAt(TOKEN) > Date.now())
+  assert.equal(payloadOf("not a jwt"), null)
+  assert.equal(usernameOf("garbage"), "")
+})
+
+test("an expired token is not sent, and says to sign in", async () => {
+  const old = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 10 })
+  const p = await CodarPlugin()
+  await withFetch({}, async (calls) => {
+    const r = await p.auth.checkin(async () => ({ type: "api", key: old }))
+    assert.equal(r.outcome, "failed")
+    assert.equal(r.signIn, "expired")
+    assert.match(r.message, /过期/)
+    assert.equal(calls.length, 0, "an expired token must not reach the vendor")
+  })
+})
+
+test("check-in claims, reports the points it added, and reads the balance after", async () => {
+  let points = 500
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        // the first read is before the claim, the second after it
+        const now = points
+        points += 50
+        return new Response(JSON.stringify({ code: 200, token: now, agent_token: 1970 }), { status: 200 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async (calls) => {
+      const out = await p.auth.checkin(auth)
+      // two point reads: before and after
+      assert.equal(calls.filter((c) => c.url.includes("/v1/gettoken")).length, 2)
+      return out
+    },
+  )
+  assert.equal(r.outcome, "claimed")
+  assert.equal(r.credit, 50)
+})
+
+test("already claimed today is `done`, with when to come back", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 3600 } } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "done")
+  assert.match(r.message, /1 小时/)
+})
+
+test("a 401 from the sign-in endpoint marks the sign-in expired", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign": { status: 401, body: { detail: "Not authenticated" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "failed")
+  assert.equal(r.signIn, "expired")
+})
+
+test("a body we do not recognise fails instead of reading as claimed", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 500, message: "系统繁忙" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "failed")
+  assert.match(r.message, /系统繁忙/)
+})
+
+test("usage reports both balances and the claim window", async () => {
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 1970 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 7200 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.user, "user_1")
+  assert.match(u.balance, /500/)
+  assert.match(u.balance, /1970/)
+  const win = u.windows.find((w) => w.name === "每日签到")
+  assert.ok(win, "the claim window is there")
+  assert.equal(win.used, 100)
+  assert.ok(win.resetsAt > Date.now())
+})
+
+test("a balance that cannot be read fails the read, it does not become 0", async () => {
+  const p = await CodarPlugin()
+  const u = await withFetch({ "/v1/gettoken": { status: 500, body: { detail: "boom" } } }, async () => p.auth.usage(auth))
+  assert.ok(u.error, "an unreadable balance is an error, not an empty card")
+})
+
+test("activities that are still running become windows; a failed read does not sink the card", async () => {
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false, retry_after: 60 } } },
+      "/api/codar/activities/mine": {
+        body: {
+          code: 200,
+          data: [
+            { free_until: until, remaining_quota: null, model_ids: ["a", "b"] },
+            { free_until: until - 7200, remaining_quota: 10, model_ids: ["c"] },
+          ],
+        },
+      },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
+  assert.equal(free.length, 1, "only the one still running")
+  assert.equal(free[0].resetsAt, until * 1000, "ms, as magpie's when() reads a number past 1e11")
+
+  const u2 = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { status: 500, body: { detail: "boom" } },
+      "/api/codar/activities/mine": { status: 500, body: { detail: "boom" } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u2.error, undefined, "the extra reads failing must not sink the balance")
+  assert.match(u2.balance, /500/)
+})
+
+test("the models hook replaces the list with the vendor's, and falls back to it", async () => {
+  const p = await CodarPlugin()
+  const given = { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash", context: 1000000 }) }
+
+  const fresh = await withFetch(
+    {
+      "/v1/codar/models": {
+        body: {
+          catalog: {
+            data: [
+              { id: "new-model", display_name: "New", context_window: 2000, input_modalities: ["text"], output_modalities: ["text"], protocol: { type: "openai_chat_completions" } },
+            ],
+          },
+        },
+      },
+    },
+    async () => p.provider.models(given, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(fresh), ["new-model"])
+
+  const fell = await withFetch({ "/v1/codar/models": { status: 500, body: { detail: "boom" } } }, async () =>
+    p.provider.models(given, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(fell), ["deepseek-v4.1-flash"], "the list it was given is kept")
+  assert.equal(fell[Symbol.for("magpie.fellBack")], true, "and says the vendor was not reached")
+})
+
+test("the config hook names the provider and lists the catalog", async () => {
+  const p = await CodarPlugin()
+  const config = {}
+  await p.config(config)
+  assert.equal(config.provider.codar.name, "Codar 科搭")
+  assert.equal(config.provider.codar.api, "https://api.claw.speedai.com/v1")
+  assert.ok(config.provider.codar.models["deepseek-v4.1-flash"])
+  assert.ok(config.provider.codar.models["claude-opus-5"], "the anthropic models are listed too")
+})
+
+test("claude models go out on the anthropic SDK, the rest on openai-compatible", () => {
+  assert.equal(modelOf({ id: "claude-opus-5", protocol: "anthropic_messages" }).api.npm, "@ai-sdk/anthropic")
+  assert.equal(modelOf({ id: "deepseek-v4.1-flash", protocol: "openai_chat_completions" }).api.npm, "@ai-sdk/openai-compatible")
+})
+
+test("catalogOf reads the vendor's shape and refuses one it does not know", () => {
+  const list = catalogOf({ catalog: { data: [{ id: "x", context_window: 10, protocol: { type: "anthropic_messages" } }] } })
+  assert.equal(list[0].id, "x")
+  assert.equal(list[0].protocol, "anthropic_messages")
+  assert.equal(catalogOf({ data: "nope" }), null)
+  assert.equal(catalogOf({}), null)
+})
+
+test("humanSecs says seconds, minutes, hours and days", () => {
+  assert.equal(humanSecs(30), "30 秒")
+  assert.equal(humanSecs(600), "10 分钟")
+  assert.equal(humanSecs(3600), "1 小时")
+  assert.equal(humanSecs(3600 + 1800), "1 小时 30 分钟")
+  assert.equal(humanSecs(86400 * 2 + 3600), "2 天 1 小时")
+})
+
+test("every request carries the User-Agent the desktop app sends on that host", async () => {
+  const p = await CodarPlugin()
+  await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 10 } } },
+      "/v1/codar/models": { body: { catalog: { data: [{ id: "x" }] } } },
+    },
+    async (calls) => {
+      await p.auth.checkin(auth)
+      await p.provider.models({}, { auth: await auth() })
+      const sign = calls.find((c) => c.url.includes("/v1/daily-sign"))
+      const cat = calls.find((c) => c.url.includes("/v1/codar/models"))
+      assert.equal(sign.init.headers["User-Agent"], "node", "the desktop's own fetch sends `node`")
+      assert.equal(cat.init.headers["User-Agent"], "Go-http-client/1.1", "the sidecar sends the Go UA")
+    },
+  )
+  const out = { headers: {} }
+  await p["chat.headers"]({}, out)
+  assert.equal(out.headers["User-Agent"], "Go-http-client/1.1")
+})
+
+test("the token never leaves in a message", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign": new Response(`{"detail":"bad token ${TOKEN}"}`, { status: 400, headers: { "Content-Type": "application/json" } }),
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.doesNotMatch(r.message, new RegExp(TOKEN.slice(0, 20)))
+})
+
+test("the module exports one function, the plugin: magpie runs every exported function", async () => {
+  // host.js servers() takes every function the module exports as a plugin
+  // entry and calls it with the plugin input. A helper exported for a test
+  // would run as a second plugin in every magpie, and a throw from it marks
+  // the whole package as failed to load. Pure helpers live on `testables`.
+  const seen = new Set()
+  const entries = []
+  for (const v of Object.values(mod)) {
+    if (seen.has(v)) continue
+    seen.add(v)
+    if (typeof v === "function") entries.push(v)
+  }
+  assert.equal(entries.length, 1, `one entry, not ${entries.length}`)
+  assert.equal(entries[0], CodarPlugin)
+})
+
+test("a sign-in with no token says to sign in, and a token with no name says which", async () => {
+  const p = await CodarPlugin()
+  const none = await p.auth.checkin(async () => ({ type: "api", key: "" }))
+  assert.equal(none.outcome, "failed")
+  assert.match(none.message, /没有登录信息/)
+
+  const spaces = await p.auth.checkin(async () => ({ type: "api", key: "  \n " }))
+  assert.match(spaces.message, /没有登录信息/, "whitespace only is an empty key, not an unusable one")
+
+  const zero = await p.auth.checkin(async () => ({ type: "api", key: "eyJ​abc" }))
+  assert.match(zero.message, /无法识别/, "a key with an invisible character in it cannot be sent")
+
+  const nameless = mkToken({ exp: Math.floor(Date.now() / 1000) + 60 })
+  const r = await p.auth.checkin(async () => ({ type: "api", key: nameless }))
+  assert.match(r.message, /没有账号名/)
+})
+
+test("a getAuth that throws fails the hook, and a 401 marks the sign-in", async () => {
+  const p = await CodarPlugin()
+  const plain = await p.auth.checkin(async () => {
+    throw new Error("no account")
+  })
+  assert.equal(plain.outcome, "failed")
+  assert.equal(plain.message, "no account")
+
+  const denied = Object.assign(new Error("denied"), { status: 401 })
+  const r = await p.auth.checkin(async () => {
+    throw denied
+  })
+  assert.equal(r.signIn, "expired")
+
+  const u = await p.auth.usage(async () => {
+    throw denied
+  })
+  assert.equal(u.signIn, "expired")
+  assert.ok(u.error)
+})
+
+test("usage with no token is an error, not a zero", async () => {
+  const p = await CodarPlugin()
+  const u = await p.auth.usage(async () => ({ type: "api", key: "" }))
+  assert.match(u.error, /没有登录信息/)
+  const nameless = mkToken({ exp: Math.floor(Date.now() / 1000) + 60 })
+  const u2 = await p.auth.usage(async () => ({ type: "api", key: nameless }))
+  assert.match(u2.error, /没有账号名/)
+})
+
+test("an answer that is not JSON is a failure with its reason, not a crash", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign": new Response("<html>bad gateway</html>", { status: 200, headers: { "Content-Type": "text/html" } }),
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "failed")
+  assert.match(r.message, /不是 JSON/)
+})
+
+test("a JWT whose payload is not JSON reads as no claims", () => {
+  const broken = `a.${Buffer.from("not json").toString("base64url")}.c`
+  assert.equal(payloadOf(broken), null)
+})
+
+test("a claim whose point reads fail still claims, with no made-up credit", async () => {
+  // The claim is what the vendor said; the points are a bonus we can only
+  // report when both reads worked. A failed read must not turn a claim into
+  // a failure, and must not report 0 as if it were the amount.
+  let n = 0
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        n += 1
+        return new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(n, 2, "both point reads were tried")
+  assert.equal(r.outcome, "claimed")
+  assert.equal(r.credit, 0)
+})
