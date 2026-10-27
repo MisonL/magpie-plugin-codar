@@ -33,15 +33,20 @@ for the plugin's key:
 python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.codar/config.json")))["provider"]["speedai"]["token"])'
 ```
 
+Or let the plugin do it: the sign-in offers **"从本机科搭读取"** (read from
+this machine), which reads that file itself — read only, never written — and
+checks the token has an account name and has not run out before handing it
+over, so a broken file says why instead of saving an unusable key.
+
 The token carries the account name and an expiry (7 days after the app's last
 login). When it runs out the plugin says so instead of calling the API — open
-Codar once to refresh it there, then paste the new one.
+Codar once to refresh it there, then sign in again.
 
 ## Install
 
 ```bash
 magpie plugin add github:MisonL/magpie-plugin-codar
-printf 'eyJ-your-token\n' | magpie plugin login codar
+magpie plugin login codar     # pick "read from this machine", or paste the token
 ```
 
 Then pick a `codar` model in magpie, and turn on its check-in under
@@ -52,8 +57,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 - **It does not claim the free-model activity.** `POST /api/codar/activities/free-model/claim`
   is a one-time campaign claim, not a daily check-in, and the plugin only
   reports the activities that are running.
-- **It does not read or write the desktop app's config file.** The token is
-  pasted once and kept in magpie's own `plugin-auth.json`.
+- **It does not read or write the desktop app's config file**, except for the
+  "read from this machine" sign-in, which reads `~/.codar/config.json` once
+  (read only) and keeps the token in magpie's own `plugin-auth.json`.
 - **It does not convert prices.** Codar lists prices in CNY per million
   tokens; magpie's cost column is US dollars, so the models show as unpriced
   rather than with an invented exchange rate. Set a per-model price in
@@ -65,6 +71,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   HTTP client's `User-Agent` to the gateway (that is what the app's Go
   sidecar sends) and Node's default to the account API (that is what the
   app's Electron main process sends). Nothing else is added.
+- magpie runs every plugin's `chat.headers` hook for every provider's
+  requests, not just the plugin's own; this one checks the provider id and
+  only touches `codar` requests, leaving other providers' traffic alone.
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
   embedded in `catalog.mjs` and magpie marks the list as fallen back.
 - Codar's free models allow 3 requests per model at a time (measured: with

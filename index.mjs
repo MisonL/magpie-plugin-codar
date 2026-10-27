@@ -16,11 +16,15 @@
 //   - 点数：POST /v1/gettoken {username, token: 0} → {token, agent_token}。
 //
 // 令牌是桌面端登录后写进 ~/.codar/config.json 的那把 JWT
-// （provider.speedai.token），里面带 username 和 exp（登录后 7 天）。插件
-// 只读它自己存的那一份，不碰桌面端的文件；过期了就报「登录已过期」，由
-// 用户重新粘贴。
+// （provider.speedai.token），里面带 username 和 exp（登录后 7 天）。magpie
+// 只保存插件交上去的那一份；过期后就报「登录已过期」，由用户重新登录。
+// 第二个登录方式「从本机科搭读取」会在登录时读一次那个文件（只读，不写），
+// 省掉手工复制。
 
 import { CATALOG } from "./catalog.mjs"
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 
 const ID = "codar"
 
@@ -108,6 +112,31 @@ const signedOut = (e) => e?.status === 401 || e?.status === 403
 
 // whyOf is the message to show for an error, without the token it might name.
 const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
+
+// appToken reads the token the Codar desktop app keeps, for the "read from
+// this machine" sign-in: provider.speedai.token in ~/.codar/config.json
+// (%USERPROFILE%\.codar\config.json on Windows, as the app's own docs say;
+// on macOS/Linux the home directory is the same place). Read only — the file
+// is the app's, and the plugin never writes it. A failure says why in words
+// the sign-in dialog can show, since this runs where no card exists yet.
+function appToken(file = join(homedir(), ".codar", "config.json")) {
+  let text
+  try {
+    text = readFileSync(file, "utf8")
+  } catch {
+    return { error: `没找到 ${file}，先在这台机器上登录一次科搭，或改用「Codar 访问令牌」粘贴` }
+  }
+  let token = ""
+  try {
+    token = String(JSON.parse(text)?.provider?.speedai?.token ?? "").trim()
+  } catch {
+    return { error: `${file} 读不出 JSON，可能损坏了；改用「Codar 访问令牌」粘贴` }
+  }
+  if (!token) return { error: `${file} 里没有 provider.speedai.token；先在这台机器上登录一次科搭，或改用粘贴` }
+  if (!tokenOf({ type: "api", key: token })) return { error: `${file} 里的令牌无法识别；改用「Codar 访问令牌」粘贴` }
+  if (expired(token)) return { error: `${file} 里的令牌已过期；打开一次科搭让它续期，再试一次` }
+  return { token }
+}
 
 async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_MS, fetchImpl = fetch, ua = UA_DESKTOP } = {}) {
   const ctl = new AbortController()
@@ -229,9 +258,24 @@ export async function CodarPlugin(input) {
       // 用户在供应商设置里可以调高。
       maxConcurrency: 3,
 
-      // 静态令牌：粘贴 ~/.codar/config.json 里 provider.speedai.token 那把。
-      // 不声明 prompts/authorize 的理由与 msmoli 插件相同：令牌只落在 key。
+      // 两种登录：粘贴令牌，或让插件在这台机器上读科搭自己的登录信息。
+      // 后者是 keyless + authorize（magpie 的契约，host.js 的 apiKey()）：
+      // 不弹输入框，由插件把令牌交上去，存进 magpie 的 plugin-auth.json。
+      // 令牌过期后重新登录一次即可，不用手工复制。
       methods: [
+        {
+          type: "api",
+          keyless: true,
+          label: "从本机科搭读取",
+          // inputs.file is not a magpie prompt (this method asks nothing); it
+          // lets a test name the file instead of reading the real one, which
+          // Bun's os.homedir() would not redirect through $HOME.
+          async authorize(inputs = {}) {
+            const got = appToken(inputs?.file)
+            if (got.error) return { type: "failed", error: got.error }
+            return { type: "success", key: got.token }
+          },
+        },
         {
           type: "api",
           label: "Codar 访问令牌",
@@ -403,7 +447,13 @@ export async function CodarPlugin(input) {
 
     // 聊天请求的请求头：桌面端侧车是 Go 客户端，只多一个 UA。这里补上同一个，
     // 让网关看到的客户端与 App 自己一致。
-    "chat.headers": async (_input, out) => {
+    //
+    // 这个钩子会被用在**每个**供应商的请求上（host.js 只按「是不是函数」筛，
+    // 不按供应商；qoder 插件的注释也说 "Every plugin's hook sees every
+    // provider's requests"）。不改自己供应商的，就别动别人的头。
+    "chat.headers": async (input, out) => {
+      const owner = input?.model?.providerID ?? input?.provider?.info?.id
+      if (owner !== ID) return
       out.headers["User-Agent"] = UA_SIDECAR
     },
 
@@ -421,6 +471,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, humanSecs }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, humanSecs, request, appToken }
 
 export default CodarPlugin

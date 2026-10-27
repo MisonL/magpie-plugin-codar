@@ -3,11 +3,14 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 
-const { usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf } = testables
+const { usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf, request, appToken } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -267,8 +270,90 @@ test("every request carries the User-Agent the desktop app sends on that host", 
     },
   )
   const out = { headers: {} }
-  await p["chat.headers"]({}, out)
+  await p["chat.headers"]({ model: { providerID: "codar" }, provider: { info: { id: "codar" } } }, out)
   assert.equal(out.headers["User-Agent"], "Go-http-client/1.1")
+})
+
+test("chat.headers leaves another provider's request alone", async () => {
+  // Every plugin's chat.headers hook is run for every provider's request
+  // (host.js filters only on "is it a function"; the qoder plugin says so
+  // too). Setting a User-Agent without checking would rewrite the traffic
+  // of every other provider through magpie.
+  const p = await CodarPlugin()
+  for (const input of [
+    { model: { providerID: "qoder-cn" }, provider: { info: { id: "qoder-cn" } } },
+    { model: { providerID: "zcode" } },
+    { provider: { info: { id: "trae-cn" } } },
+    {},
+    undefined,
+  ]) {
+    const out = { headers: {} }
+    await p["chat.headers"](input, out)
+    assert.deepEqual(out.headers, {}, `left ${JSON.stringify(input)} alone`)
+  }
+})
+
+test("a request that never answers is aborted and says so in words", async () => {
+  // The vendor has hung for 30s before (2026-10-27, every /v1/* 500 after a
+  // long wait). The budget is what keeps a card from waiting that long, so
+  // the timer's abort is what this exercises: a fetch that answers only when
+  // the signal aborts, with a timeout small enough to run in a test.
+  const hang = (_url, init) =>
+    new Promise((_ok, fail) => {
+      init.signal.addEventListener("abort", () => fail(Object.assign(new Error("aborted"), { name: "AbortError" })))
+    })
+  await assert.rejects(
+    () => request("https://api.kuaipaper.com/v1/gettoken", { method: "POST", token: TOKEN, fetchImpl: hang, timeoutMs: 25 }),
+    /请求超时/,
+    "the timeout is said in words, not left as an AbortError",
+  )
+})
+
+test("the read-from-this-machine sign-in hands magpie a key, and says why when it can't", async () => {
+  const p = await CodarPlugin()
+  const [read, paste] = p.auth.methods
+  assert.equal(read.keyless, true, "magpie skips the key prompt for a keyless method")
+  assert.equal(typeof read.authorize, "function")
+  assert.equal(paste.keyless, undefined, "pasting stays a plain key method")
+
+  // a file the app would leave: nested provider → speedai → token
+  const dir = mkdtempSync(join(tmpdir(), "codar-plugin-"))
+  const file = join(dir, "config.json")
+  const token = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 86400 })
+  writeFileSync(file, JSON.stringify({ provider: { speedai: { token, username: "user_1" } } }))
+  try {
+    assert.equal(appToken(file).token, token, "the token is handed over as it is")
+    assert.match(appToken(join(dir, "nope.json")).error, /没找到/)
+
+    writeFileSync(file, "{ not json")
+    assert.match(appToken(file).error, /读不出 JSON/)
+
+    writeFileSync(file, JSON.stringify({ provider: { speedai: {} } }))
+    assert.match(appToken(file).error, /没有 provider\.speedai\.token/)
+
+    writeFileSync(file, JSON.stringify({ provider: { speedai: { token: "eyJ​abc" } } }))
+    assert.match(appToken(file).error, /无法识别/, "an invisible character is refused here, not by fetch")
+
+    const old = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 60 })
+    writeFileSync(file, JSON.stringify({ provider: { speedai: { token: old } } }))
+    assert.match(appToken(file).error, /已过期/, "a lapsed token is caught before magpie saves it")
+
+    // the method as magpie calls it: authorize() answers in the host's own
+    // shape. inputs.file is this plugin's own test seam — Bun's homedir()
+    // ignores $HOME, so the real file must never be the one read here.
+    const none = await read.authorize({ file: join(dir, "nope.json") })
+    assert.equal(none.type, "failed", "no file is a refusal with words")
+    assert.match(none.error, /没找到/)
+
+    const lapsed = await read.authorize({ file })
+    assert.equal(lapsed.type, "failed", "the lapsed token is refused, not handed to magpie")
+    assert.match(lapsed.error, /已过期/)
+
+    writeFileSync(file, JSON.stringify({ provider: { speedai: { token } } }))
+    assert.deepEqual(await read.authorize({ file }), { type: "success", key: token }, "the app's own token, handed over")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("the token never leaves in a message", async () => {
