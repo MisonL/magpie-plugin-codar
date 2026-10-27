@@ -18,7 +18,7 @@
 // 令牌是桌面端登录后写进 ~/.codar/config.json 的那把 JWT
 // （provider.speedai.token），里面带 username 和 exp（登录后 7 天）。magpie
 // 只保存插件交上去的那一份；过期后就报「登录已过期」，由用户重新登录。
-// 第二个登录方式「从本机科搭读取」会在登录时读一次那个文件（只读，不写），
+// 另一个登录方式「读取本机科搭令牌」会在登录时读一次那个文件（只读，不写），
 // 省掉手工复制。
 
 import { CATALOG } from "./catalog.mjs"
@@ -124,16 +124,16 @@ function appToken(file = join(homedir(), ".codar", "config.json")) {
   try {
     text = readFileSync(file, "utf8")
   } catch {
-    return { error: `没找到 ${file}，先在这台机器上登录一次科搭，或改用「Codar 访问令牌」粘贴` }
+    return { error: `没找到 ${file}，先在这台机器上登录一次科搭，或改用「科搭访问令牌」粘贴` }
   }
   let token = ""
   try {
     token = String(JSON.parse(text)?.provider?.speedai?.token ?? "").trim()
   } catch {
-    return { error: `${file} 读不出 JSON，可能损坏了；改用「Codar 访问令牌」粘贴` }
+    return { error: `${file} 读不出 JSON，可能损坏了；改用「科搭访问令牌」粘贴` }
   }
   if (!token) return { error: `${file} 里没有 provider.speedai.token；先在这台机器上登录一次科搭，或改用粘贴` }
-  if (!tokenOf({ type: "api", key: token })) return { error: `${file} 里的令牌无法识别；改用「Codar 访问令牌」粘贴` }
+  if (!tokenOf({ type: "api", key: token })) return { error: `${file} 里的令牌无法识别；改用「科搭访问令牌」粘贴` }
   if (expired(token)) return { error: `${file} 里的令牌已过期；打开一次科搭让它续期，再试一次` }
   return { token }
 }
@@ -266,7 +266,7 @@ export async function CodarPlugin(input) {
         {
           type: "api",
           keyless: true,
-          label: "从本机科搭读取",
+          label: "读取本机科搭令牌",
           // inputs.file is not a magpie prompt (this method asks nothing); it
           // lets a test name the file instead of reading the real one, which
           // Bun's os.homedir() would not redirect through $HOME.
@@ -278,7 +278,7 @@ export async function CodarPlugin(input) {
         },
         {
           type: "api",
-          label: "Codar 访问令牌",
+          label: "科搭访问令牌",
           placeholder: "eyJ…（~/.codar/config.json 的 provider.speedai.token）",
         },
       ],
@@ -299,7 +299,7 @@ export async function CodarPlugin(input) {
             message: unusableKey(auth) ? "令牌内容无法识别（含空格、换行或非 ASCII 字符），请重新登录" : "没有登录信息，请先登录",
           }
         const username = usernameOf(token)
-        if (!username) return { outcome: "failed", message: "令牌里没有账号名，请粘贴 Codar 登录后的完整令牌" }
+        if (!username) return { outcome: "failed", message: "令牌里没有账号名，请粘贴科搭登录后的完整令牌" }
         if (expired(token)) return { outcome: "failed", message: "登录已过期，请重新登录", signIn: "expired" }
 
         const deadline = Date.now() + CHECKIN_BUDGET_MS
@@ -460,15 +460,19 @@ export async function CodarPlugin(input) {
       out.headers["User-Agent"] = UA_SIDECAR
     },
 
+    // 用户自己改过的名字留着：magpie 把 provider 的名字存在 providers.json
+    // 里，而 config 钩子在每次启动时都跑——无条件写回默认值会把 UI 里的改名
+    // 悄悄撤销。值不是对象时当作没有，其余字段照旧原样带过。
     async config(config) {
       config.provider ??= {}
+      const was = config.provider[ID] && typeof config.provider[ID] === "object" ? config.provider[ID] : {}
       const models = modelsOf(CATALOG)
       config.provider[ID] = {
-        ...(config.provider[ID] ?? {}),
-        name: "Codar 科搭",
+        ...was,
+        name: typeof was.name === "string" && was.name ? was.name : "科搭 Codar",
         npm: OPENAI,
         api: `${API}/v1`,
-        models: { ...models, ...(config.provider[ID]?.models ?? {}) },
+        models: { ...models, ...(was.models ?? {}) },
       }
     },
   }

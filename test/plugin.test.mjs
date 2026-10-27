@@ -248,10 +248,24 @@ test("the config hook names the provider and lists the catalog", async () => {
   const p = await CodarPlugin()
   const config = {}
   await p.config(config)
-  assert.equal(config.provider.codar.name, "Codar 科搭")
+  assert.equal(config.provider.codar.name, "科搭 Codar")
   assert.equal(config.provider.codar.api, "https://api.claw.speedai.com/v1")
   assert.ok(config.provider.codar.models["deepseek-v4.1-flash"])
   assert.ok(config.provider.codar.models["claude-opus-5"], "the anthropic models are listed too")
+})
+
+test("the config hook keeps a provider name the user set", async () => {
+  // magpie keeps a provider's name in providers.json and runs every config
+  // hook on each start: writing ours over it would undo a rename made in its
+  // UI, with no sign of why. Everything else the entry carries stays too —
+  // including model entries the user added or overrode themselves.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: { name: "我的科搭", options: { note: "kept" }, models: { "my-model": { name: "自建" } } } } }
+  await p.config(config)
+  assert.equal(config.provider.codar.name, "我的科搭")
+  assert.deepEqual(config.provider.codar.options, { note: "kept" })
+  assert.deepEqual(config.provider.codar.models["my-model"], { name: "自建" }, "the user's own model entry survives")
+  assert.ok(config.provider.codar.models["deepseek-v4.1-flash"], "the catalog is still filled in")
 })
 
 test("the auth hook asks magpie for the vendor's three concurrent requests", async () => {
@@ -347,6 +361,11 @@ test("the read-from-this-machine sign-in hands magpie a key, and says why when i
   assert.equal(read.keyless, true, "magpie skips the key prompt for a keyless method")
   assert.equal(typeof read.authorize, "function")
   assert.equal(paste.keyless, undefined, "pasting stays a plain key method")
+  assert.deepEqual(
+    p.auth.methods.map((m) => m.label),
+    ["读取本机科搭令牌", "科搭访问令牌"],
+    "both buttons lead with the vendor's name and say which token each one takes",
+  )
 
   // a file the app would leave: nested provider → speedai → token
   const dir = mkdtempSync(join(tmpdir(), "codar-plugin-"))

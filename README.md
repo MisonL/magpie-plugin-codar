@@ -10,7 +10,7 @@ the usage card.
 | Hook | What it does |
 |---|---|
 | `config` / `provider` | Adds a `codar` provider with Codar's model list (16 models: DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
-| `auth.methods` | Two ways to sign in: "read from this machine" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the access token. |
+| `auth.methods` | Two ways to sign in: "读取本机科搭令牌" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the "科搭访问令牌". |
 | `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one. |
 | `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. |
 | `chat.headers` | Sends the desktop client's `User-Agent` on Codar's own requests, so the gateway sees the app's traffic shape. The hook runs for every provider's requests, so it filters by provider id and leaves the others alone. |
@@ -34,10 +34,10 @@ for the plugin's key:
 python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.codar/config.json")))["provider"]["speedai"]["token"])'
 ```
 
-Or let the plugin do it: the sign-in offers **"从本机科搭读取"** (read from
-this machine), which reads that file itself — read only, never written — and
-checks the token has an account name and has not run out before handing it
-over, so a broken file says why instead of saving an unusable key.
+Or let the plugin do it: the sign-in offers **"读取本机科搭令牌"** (read this
+machine's Codar token), which reads that file itself — read only, never
+written — and checks the token has an account name and has not run out before
+handing it over, so a broken file says why instead of saving an unusable key.
 
 The token carries the account name and an expiry (7 days after the app's last
 login). When it runs out the plugin says so instead of calling the API — open
@@ -47,7 +47,7 @@ Codar once to refresh it there, then sign in again.
 
 ```bash
 magpie plugin add github:MisonL/magpie-plugin-codar
-magpie plugin login codar     # pick "read from this machine", or paste the token
+magpie plugin login codar     # pick "读取本机科搭令牌", or paste the token
 ```
 
 Then pick a `codar` model in magpie, and turn on its check-in under
@@ -75,6 +75,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 - magpie runs every plugin's `chat.headers` hook for every provider's
   requests, not just the plugin's own; this one checks the provider id and
   only touches `codar` requests, leaving other providers' traffic alone.
+- The provider is named 科搭 Codar only while it has no name of its own: the
+  `config` hook fills that name in when it is missing and never writes it over
+  one you set in magpie, so a rename survives restarts.
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
   embedded in `catalog.mjs` and magpie marks the list as fallen back.
 - Codar's free models allow 3 requests per model at a time (measured: with
