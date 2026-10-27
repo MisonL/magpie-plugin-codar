@@ -7,9 +7,10 @@
 | 钩子 | 作用 |
 |---|---|
 | `config` / `provider` | 增加一个 `codar` 供应商，带科搭的模型表（16 个：DeepSeek、GLM、GPT、Claude 各系）。表是从 App 自己的目录里取的，登录后还会从 `GET /v1/codar/models` 刷新。 |
+| `auth.methods` | 两种登录：「从本机科搭读取」（keyless，插件自己去读 `~/.codar/config.json`，只读）和粘贴访问令牌。 |
 | `auth.checkin` | 每天 `POST /v1/daily-sign` 一次。返回能区分「本次领到」和「今天已经领过」，并给出距下次可领的时间。 |
-| `auth.usage` | 点数（`/v1/gettoken`：通用点数 + Agent 点数）、今天签到状态、还在进行中的免费模型活动及其到期时间。 |
-| `chat.headers` | 发和桌面端一样的 `User-Agent`，让网关看到的客户端与 App 自己的流量同形。 |
+| `auth.usage` | 点数（`/v1/gettoken`：通用点数 + Agent 点数）、今天签到状态、还在进行中的免费模型活动及其到期时间。三处读取并行发出。 |
+| `chat.headers` | 只对 `codar` 自己的请求发和桌面端一样的 `User-Agent`（这个钩子对所有供应商的请求都会被调用，插件按供应商 id 自筛）。 |
 
 聊天请求由 magpie 直接发到科搭的网关 `https://api.claw.speedai.com/v1`：多数模型走 OpenAI 兼容协议，Claude 系走 Anthropic Messages 协议——和桌面端侧车用的是同样两条。
 
@@ -57,9 +58,10 @@ magpie plugin login codar     # 选「从本机科搭读取」，或「Codar 访
 
 ```bash
 node --test        # 整个测试套件，不联网
+bun test           # magpie 真正加载插件的运行时
 ```
 
-测试会桩掉 `fetch`，不连 SpeedAI。
+测试会桩掉 `fetch`，不连 SpeedAI。CI 在 Node 18–24、Bun（Linux/macOS/Windows）、以及 Windows/macOS 的 Node 上跑同一套——插件会读主目录下的文件，平台差异就在那里暴露。
 
 ## 许可
 

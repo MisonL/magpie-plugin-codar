@@ -10,9 +10,10 @@ the usage card.
 | Hook | What it does |
 |---|---|
 | `config` / `provider` | Adds a `codar` provider with Codar's model list (16 models: DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
+| `auth.methods` | Two ways to sign in: "read from this machine" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the access token. |
 | `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one. |
-| `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. |
-| `chat.headers` | Sends the same `User-Agent` the desktop client sends, so the gateway sees the app's own traffic shape. |
+| `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. |
+| `chat.headers` | Sends the desktop client's `User-Agent` on Codar's own requests, so the gateway sees the app's traffic shape. The hook runs for every provider's requests, so it filters by provider id and leaves the others alone. |
 
 Chat itself goes straight from magpie to Codar's gateway
 (`https://api.claw.speedai.com/v1`): OpenAI-compatible for most models, the
@@ -86,9 +87,13 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 
 ```bash
 node --test        # the whole suite, no network
+bun test           # the runtime magpie actually loads plugins on
 ```
 
-The tests stub `fetch`; nothing here talks to SpeedAI.
+The tests stub `fetch`; nothing here talks to SpeedAI. CI runs the suite on
+Node 18–24, on Bun across Linux/macOS/Windows, and on Node on Windows and
+macOS — the plugin reads a file under the home directory, and that is where
+per-platform differences show up.
 
 ## Licence
 
