@@ -69,9 +69,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   embedded in `catalog.mjs` and magpie marks the list as fallen back.
 - Codar's free models allow 3 requests per model at a time (measured: with
   four in flight, the fourth answers 429 `concurrent_limit_exceeded`, "Too
-  many concurrent requests"). Clients that fan out — Claude Code among them —
-  can reach that; magpie retries the request and it still gets answered, so
-  the 429 is a limit in the routing log, not a failed request.
+  many concurrent requests"). The auth hook declares `maxConcurrency: 3`, so
+  magpie queues requests past three per account instead of letting them
+  reach the vendor's limit; the provider's own setting can raise it.
 
 ## Development
 

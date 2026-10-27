@@ -219,6 +219,15 @@ test("the config hook names the provider and lists the catalog", async () => {
   assert.ok(config.provider.codar.models["claude-opus-5"], "the anthropic models are listed too")
 })
 
+test("the auth hook asks magpie for the vendor's three concurrent requests", async () => {
+  // Codar turns away the 4th concurrent request of one model with 429
+  // concurrent_limit_exceeded (measured 2026-10-27: 2 and 3 in flight pass,
+  // 4 and 5 get 429 for all but three). magpie queues past maxConcurrency
+  // and lets the user raise it on the provider.
+  const p = await CodarPlugin()
+  assert.equal(p.auth.maxConcurrency, 3)
+})
+
 test("claude models go out on the anthropic SDK, the rest on openai-compatible", () => {
   assert.equal(modelOf({ id: "claude-opus-5", protocol: "anthropic_messages" }).api.npm, "@ai-sdk/anthropic")
   assert.equal(modelOf({ id: "deepseek-v4.1-flash", protocol: "openai_chat_completions" }).api.npm, "@ai-sdk/openai-compatible")

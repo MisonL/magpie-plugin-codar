@@ -224,6 +224,11 @@ export async function CodarPlugin(input) {
     auth: {
       provider: ID,
 
+      // 科搭按模型限 3 个并发（实测：同时发 4 个，第 4 个收到 429
+      // concurrent_limit_exceeded）。按账号限 3，让 magpie 排队而不是撞限流；
+      // 用户在供应商设置里可以调高。
+      maxConcurrency: 3,
+
       // 静态令牌：粘贴 ~/.codar/config.json 里 provider.speedai.token 那把。
       // 不声明 prompts/authorize 的理由与 msmoli 插件相同：令牌只落在 key。
       methods: [
