@@ -219,7 +219,9 @@ test("the usage reads go out together, and a dead balance still reads the rest",
 
 test("the models hook replaces the list with the vendor's, and falls back to it", async () => {
   const p = await CodarPlugin()
-  const given = { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash", context: 1000000 }) }
+  // the host hands the hook the whole provider; the list is provider.models,
+  // and the host reads the answer as the list itself (host.js info()).
+  const given = { id: "codar", name: "科搭 Codar", api: "https://api.claw.speedai.com/v1", models: { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash", context: 1000000 }) } }
 
   const fresh = await withFetch(
     {
@@ -242,6 +244,22 @@ test("the models hook replaces the list with the vendor's, and falls back to it"
   )
   assert.deepEqual(Object.keys(fell), ["deepseek-v4.1-flash"], "the list it was given is kept")
   assert.equal(fell[Symbol.for("magpie.fellBack")], true, "and says the vendor was not reached")
+})
+
+test("the models hook hands back the list, never the provider around it", async () => {
+  // host.js: `out.models = Object.fromEntries(Object.entries(next ?? {})…)` —
+  // the answer is used as the model list itself. Handing back the provider
+  // would list its fields (id, name, api, searches, models…) as models.
+  const p = await CodarPlugin()
+  const given = { id: "codar", name: "科搭 Codar", api: "https://api.claw.speedai.com/v1", models: { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash" }) } }
+
+  const old = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 60 })
+  const lapsed = await p.provider.models(given, { auth: { type: "api", key: old } })
+  assert.deepEqual(Object.keys(lapsed), ["deepseek-v4.1-flash"], "an expired sign-in keeps the list, not the provider")
+  assert.equal(lapsed[Symbol.for("magpie.fellBack")], undefined, "nothing was tried, so nothing fell back")
+
+  const signedOut = await p.provider.models(given, { auth: undefined })
+  assert.deepEqual(Object.keys(signedOut), ["deepseek-v4.1-flash"])
 })
 
 test("the config hook names the provider and lists the catalog", async () => {

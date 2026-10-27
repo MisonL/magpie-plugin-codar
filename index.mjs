@@ -432,9 +432,15 @@ export async function CodarPlugin(input) {
     },
 
     // provider: 目录随账号刷新。拿不到就用 config 里那份（catalog.mjs）。
+    //
+    // 宿主给的是整个 provider（模型表在它的 .models 下），要回去的也只是那张
+    // 表：host.js 把钩子的返回值直接当 models 用，拿整个 provider 回去，它会
+    // 把 id/name/api 这些字段当成模型列出来（实测：过期令牌下 16 个变 26 个，
+    // 多出 searches、models 两个）。
     provider: {
       id: ID,
-      async models(given, { auth } = {}) {
+      async models(provider, { auth } = {}) {
+        const given = provider?.models ?? {}
         const token = tokenOf(auth)
         if (!token || expired(token)) return given
         try {
