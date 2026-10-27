@@ -44,8 +44,8 @@ magpie plugin add github:MisonL/magpie-plugin-codar
 printf 'eyJ-your-token\n' | magpie plugin login codar
 ```
 
-Then pick a `codar` model in magpie and turn on its check-in under
-Settings → Usage → Plugins.
+Then pick a `codar` model in magpie, and turn on its check-in under
+Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) → 插件 (Plugins).
 
 ## What this plugin does not do
 
@@ -67,9 +67,11 @@ Settings → Usage → Plugins.
   app's Electron main process sends). Nothing else is added.
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
   embedded in `catalog.mjs` and magpie marks the list as fallen back.
-- Codar's own gateway has had short outages (the model catalog returning 500
-  for every client, the desktop app included); the plugin keeps the card's
-  balance in that case and only drops the parts it could not read.
+- Codar's free models allow 3 requests per model at a time (measured: with
+  four in flight, the fourth answers 429 `concurrent_limit_exceeded`, "Too
+  many concurrent requests"). Clients that fan out — Claude Code among them —
+  can reach that; magpie retries the request and it still gets answered, so
+  the 429 is a limit in the routing log, not a failed request.
 
 ## Development
 
