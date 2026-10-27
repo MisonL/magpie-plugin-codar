@@ -365,18 +365,25 @@ export async function CodarPlugin(input) {
         const left = () => Math.max(1000, deadline - Date.now())
         const opts = () => ({ fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
 
-        let points
-        try {
-          points = await pointsOf(token, username, opts())
-        } catch (e) {
+        // 三处读取互不依赖，一起发：卡片等最慢的那个，而不是三个之和。点数
+        // 读不到整张卡就是错的（余额是主项）；另两个是附加信息，读不到就不报。
+        const [pointsR, statusR, actsR] = await Promise.allSettled([
+          pointsOf(token, username, opts()),
+          request(`${ACCOUNT}${SIGN_STATUS_PATH}`, { method: "POST", body: { username }, token, ...opts() }),
+          request(`${API}${ACTIVITIES_PATH}`, { method: "GET", token, ...opts() }),
+        ])
+
+        if (pointsR.status === "rejected") {
+          const e = pointsR.reason
           return { error: scrub(whyOf(e), token) || "点数查询失败", signIn: signedOut(e) ? "expired" : "" }
         }
+        const points = pointsR.value
 
         const windows = []
 
         // 今日签到：明天这个时候能再领一次。
-        try {
-          const st = await request(`${ACCOUNT}${SIGN_STATUS_PATH}`, { method: "POST", body: { username }, token, ...opts() })
+        if (statusR.status === "fulfilled") {
+          const st = statusR.value
           const signed = Boolean(st?.data?.isSigned)
           const retry = Number(st?.data?.retry_after)
           if (Number.isFinite(retry) && retry > 0) {
@@ -388,14 +395,12 @@ export async function CodarPlugin(input) {
               aside: true,
             })
           }
-        } catch {
-          // 状态读不到就不放这个窗口
         }
 
         // 免费模型活动：免费到什么时候。remaining_quota 是 null 时表示不限量，
         // 有数时它才是这个活动还剩多少。列表拿不到就整段跳过。
-        try {
-          const r = await request(`${API}${ACTIVITIES_PATH}`, { method: "GET", token, ...opts() })
+        if (actsR.status === "fulfilled") {
+          const r = actsR.value
           const list = Array.isArray(r?.data) ? r.data : []
           const now = Date.now() / 1000
           for (const a of list) {
@@ -413,8 +418,6 @@ export async function CodarPlugin(input) {
               ...(ids.length ? { models: ids } : {}),
             })
           }
-        } catch {
-          // 活动接口挂了（2026-10-27 实测过整段 500）不影响余额
         }
 
         const parts = []

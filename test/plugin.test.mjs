@@ -185,6 +185,38 @@ test("activities that are still running become windows; a failed read does not s
   assert.match(u2.balance, /500/)
 })
 
+test("the usage reads go out together, and a dead balance still reads the rest", async () => {
+  // The card waits for the slowest read, not for three in a row. All three
+  // are launched before any is awaited: a points read that fails must not
+  // stop the other two from having been asked, and the three must overlap
+  // in flight (inFlight reaches 3) rather than run one after another.
+  const p = await CodarPlugin()
+  const seen = []
+  let inFlight = 0
+  let most = 0
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    seen.push(String(url))
+    inFlight++
+    most = Math.max(most, inFlight)
+    // all three must be in before any answer goes out; a serial run would
+    // hold each of these until the timeout
+    await new Promise((ok) => setTimeout(ok, 15))
+    inFlight--
+    if (String(url).includes("/v1/gettoken")) return new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
+    if (String(url).includes("/v1/daily-sign/status")) return new Response(JSON.stringify({ code: 200, data: { isSigned: true, retry_after: 60 } }), { status: 200 })
+    return new Response(JSON.stringify({ code: 200, data: [] }), { status: 200 })
+  }
+  try {
+    const u = await p.auth.usage(auth)
+    assert.ok(u.error, "the balance failing is the card's error")
+    assert.equal(seen.length, 3, "all three were launched, not the balance first and the rest after")
+    assert.equal(most, 3, "the three overlapped in flight, not one after another")
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
 test("the models hook replaces the list with the vendor's, and falls back to it", async () => {
   const p = await CodarPlugin()
   const given = { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash", context: 1000000 }) }
