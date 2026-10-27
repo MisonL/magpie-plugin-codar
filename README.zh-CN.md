@@ -51,7 +51,8 @@ magpie plugin login codar     # 选「读取本机科搭令牌」，或「科搭
 - 请求头和 App 保持一致：网关（`api.claw.speedai.com`）用 Go HTTP 客户端的 `User-Agent`（App 的 Go 侧车就是这么发的），账号接口（`api.kuaipaper.com`）用 Node 的默认值（App 的 Electron 主进程就是这么发的）。除此之外不加任何东西。
 - `chat.headers` 钩子会被 magpie 用在每个供应商的请求上（不是只用在科搭上），插件按供应商 id 判断，只改 `codar` 自己的请求，别家的流量原样不动。
 - 供应商默认叫「科搭 Codar」，但只在这个供应商还没有名字时才写：在 magpie 里给它改过名之后，`config` 钩子不会把名字改回去，重启也保留。
-- `GET /v1/codar/models` 拿不到时，供应商保留 `catalog.mjs` 里内嵌的那份，magpie 会把列表标成回退。
+- `GET /v1/codar/models` 拿不到时，供应商保留 `catalog.mjs` 里内嵌的那份，magpie 会把列表标成回退。回退列表里 Claude 系同样走 Anthropic 协议：每个模型自带自己的 SDK，而不只是供应商的默认值。
+- 你自己加到这个供应商里的模型条目（内嵌目录里没有的 id）在实时目录刷新后仍然保留；厂商自己的模型以厂商的目录为准。
 - 科搭自己的网关出过短时故障（模型目录对所有客户端都 500，桌面端也一样）；这种情况下插件保留卡片上的点数，只丢掉读不到的部分。
 - 科搭的免费模型对每个模型限定 3 个并发请求（实测：同时发 4 个，第 4 个收到 429 `concurrent_limit_exceeded`，「Too many concurrent requests」）。插件的 auth 钩子声明了 `maxConcurrency: 3`，magpie 会把每个账号超过 3 个的请求排队，而不是让它们撞上厂商的限流；供应商设置里可以调高。
 

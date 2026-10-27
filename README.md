@@ -79,7 +79,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   `config` hook fills that name in when it is missing and never writes it over
   one you set in magpie, so a rename survives restarts.
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
-  embedded in `catalog.mjs` and magpie marks the list as fallen back.
+  embedded in `catalog.mjs` and magpie marks the list as fallen back. Claude
+  models keep the Anthropic protocol on that list too: each model carries its
+  own SDK, not just the provider's default.
+- Models you add to this provider yourself (ids the embedded catalog does not
+  have) are kept when the vendor's list refreshes; the vendor's own entries
+  follow the vendor.
 - Codar's free models allow 3 requests per model at a time (measured: with
   four in flight, the fourth answers 429 `concurrent_limit_exceeded`, "Too
   many concurrent requests"). The auth hook declares `maxConcurrency: 3`, so

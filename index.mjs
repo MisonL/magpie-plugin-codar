@@ -185,9 +185,17 @@ function humanSecs(secs) {
 }
 
 // pointsOf reads the account's two balances. `token` is the general points,
-// `agent_token` the agent ones; both are integers the server keeps.
+// `agent_token` the agent ones; both are integers the server keeps. A refusal
+// comes back as HTTP 200 with a body code (measured 2026-10-27: {"code":401,
+// "message":"Invalid token"}); left as "two fields we cannot read", the card
+// came out blank with no error and no expired mark.
 const pointsOf = async (token, username, opts) => {
   const r = await request(`${ACCOUNT}${POINTS_PATH}`, { method: "POST", body: { username, token: 0 }, token, ...opts })
+  const code = Number(r?.code)
+  if (Number.isFinite(code) && code >= 400) {
+    const said = typeof r?.message === "string" ? r.message.trim() : ""
+    throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
+  }
   const num = (v) => (typeof v === "number" && isFinite(v) ? v : Number.isFinite(Number(v)) && v !== null && v !== "" ? Number(v) : null)
   return { general: num(r.token), agent: num(r.agent_token) }
 }
@@ -195,12 +203,19 @@ const pointsOf = async (token, username, opts) => {
 // modelOf is one catalog record as magpie's provider list has it.
 function modelOf(m) {
   const anthropic = m?.protocol === "anthropic_messages"
+  const npm = anthropic ? CLAUDE : OPENAI
   const input = Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, (m?.input ?? []).includes(k)]))
   const output = Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, (m?.output ?? []).includes(k)]))
   return {
     id: m.id,
     name: m.name || m.id,
-    api: { id: m.id, url: `${API}/v1`, npm: anthropic ? CLAUDE : OPENAI },
+    // host.js resolves a config model's SDK as m.provider?.npm ?? cfg.npm ??
+    // … (line ~1696): api.npm is not read on that path. Without provider.npm
+    // the fallback list gave every model the provider-level openai-compatible,
+    // so Claude models lost the anthropic protocol whenever the vendor's
+    // catalog could not be fetched.
+    provider: { npm },
+    api: { id: m.id, url: `${API}/v1`, npm },
     limit: { context: Number(m.context) || 0, output: 0 },
     // The vendor prices in CNY per million tokens; magpie's cost column is
     // US dollars, and inventing an exchange rate here would put a wrong
@@ -381,20 +396,20 @@ export async function CodarPlugin(input) {
 
         const windows = []
 
-        // 今日签到：明天这个时候能再领一次。
-        if (statusR.status === "fulfilled") {
+        // 今日签到：明天这个时候能再领一次。等待结束时（retry_after 0）这
+        // 一行也要在——那正是"现在可以领"的时刻，旧写法 retry > 0 会让它消失。
+        if (statusR.status === "fulfilled" && statusR.value?.data && typeof statusR.value.data === "object") {
           const st = statusR.value
-          const signed = Boolean(st?.data?.isSigned)
-          const retry = Number(st?.data?.retry_after)
-          if (Number.isFinite(retry) && retry > 0) {
-            windows.push({
-              name: "每日签到",
-              used: signed ? 100 : 0,
-              resetsAt: Date.now() + retry * 1000,
-              display: signed ? `今天已领，${humanSecs(retry)}后可再领` : `今天还没领，${humanSecs(retry)}后可以领`,
-              aside: true,
-            })
-          }
+          const signed = Boolean(st.data.isSigned)
+          const retry = Number(st.data.retry_after)
+          const wait = Number.isFinite(retry) && retry > 0 ? humanSecs(retry) : ""
+          windows.push({
+            name: "每日签到",
+            used: signed ? 100 : 0,
+            ...(wait ? { resetsAt: Date.now() + retry * 1000 } : {}),
+            display: signed ? (wait ? `今天已领，${wait}后可再领` : "今天已领") : wait ? `今天还没领，${wait}后可以领` : "今天还没领，现在可以领",
+            aside: true,
+          })
         }
 
         // 免费模型活动：免费到什么时候。remaining_quota 是 null 时表示不限量，
@@ -447,7 +462,11 @@ export async function CodarPlugin(input) {
           const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ua: UA_SIDECAR })
           const list = catalogOf(body)
           if (!list) return Object.assign(given, { [Symbol.for("magpie.fellBack")]: true })
-          return modelsOf(list)
+          // 厂商的目录对自家的模型说了算；用户自己往这个供应商里加的条目
+          // （内嵌目录里没有的 id）在刷新后留着，config 钩子也是这么合并的。
+          const known = new Set(CATALOG.map((m) => m.id))
+          const own = Object.fromEntries(Object.entries(given).filter(([id]) => !known.has(id)))
+          return { ...own, ...modelsOf(list) }
         } catch {
           return Object.assign(given, { [Symbol.for("magpie.fellBack")]: true })
         }

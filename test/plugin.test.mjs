@@ -150,6 +150,61 @@ test("a balance that cannot be read fails the read, it does not become 0", async
   assert.ok(u.error, "an unreadable balance is an error, not an empty card")
 })
 
+test("a token the vendor turns away is an error on the card, not an empty one", async () => {
+  // The account API refuses with HTTP 200 and a body code (measured
+  // 2026-10-27: {"code":401,"message":"Invalid token"} from /v1/gettoken).
+  // Read as "two fields we cannot see", the card came out blank with no
+  // error and no expired mark, while the same token's check-in said to sign
+  // in again.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 401, message: "Invalid token" } },
+      "/v1/daily-sign/status": { body: { code: 401, message: "Invalid token" } },
+      "/api/codar/activities/mine": { status: 401, body: { detail: "Invalid or expired token" } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.error, /登录已过期/, "a refused token is said in words, not left as a blank card")
+  assert.equal(u.signIn, "expired", "and marks the sign-in for magpie")
+
+  const busy = await withFetch(
+    { "/v1/gettoken": { body: { code: 500, message: "系统繁忙" } } },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(busy.error, /系统繁忙/, "another body code is its own error, not an empty card")
+  assert.equal(busy.signIn, "", "and is not mistaken for an expired sign-in")
+})
+
+test("the claim window is on the card the moment it opens", async () => {
+  // The card only drew the window while retry_after > 0, so at the moment
+  // the wait ran out the row vanished — exactly when it should say it can
+  // be claimed now.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false, retry_after: 0 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const win = u.windows.find((w) => w.name === "每日签到")
+  assert.ok(win, "the window is still on the card when the wait is over")
+  assert.equal(win.used, 0)
+  assert.match(win.display, /现在可以领/)
+
+  const bad = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 401, message: "Invalid token" } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(bad.windows.find((w) => w.name === "每日签到"), undefined, "a status body we cannot read is no claim window")
+})
+
 test("activities that are still running become windows; a failed read does not sink the card", async () => {
   const until = Math.floor(Date.now() / 1000) + 3600
   const p = await CodarPlugin()
@@ -246,6 +301,29 @@ test("the models hook replaces the list with the vendor's, and falls back to it"
   assert.equal(fell[Symbol.for("magpie.fellBack")], true, "and says the vendor was not reached")
 })
 
+test("the live list keeps models the user added, and follows the vendor for its own", async () => {
+  // The config hook keeps entries the user added to the provider; the live
+  // refresh used to replace the whole list, dropping them while signed in.
+  const p = await CodarPlugin()
+  const given = {
+    id: "codar",
+    models: {
+      "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash" }),
+      "my-model": { name: "自建", api: { id: "my-model", url: "https://api.claw.speedai.com/v1", npm: "@ai-sdk/openai-compatible" } },
+    },
+  }
+  const fresh = await withFetch(
+    {
+      "/v1/codar/models": {
+        body: { catalog: { data: [{ id: "new-model", display_name: "New", protocol: { type: "openai_chat_completions" } }] } },
+      },
+    },
+    async () => p.provider.models(given, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(fresh).sort(), ["my-model", "new-model"], "the vendor's list plus the user's own entry")
+  assert.equal(fresh["deepseek-v4.1-flash"], undefined, "a model the vendor dropped is gone")
+})
+
 test("the models hook hands back the list, never the provider around it", async () => {
   // host.js: `out.models = Object.fromEntries(Object.entries(next ?? {})…)` —
   // the answer is used as the model list itself. Handing back the provider
@@ -298,6 +376,18 @@ test("the auth hook asks magpie for the vendor's three concurrent requests", asy
 test("claude models go out on the anthropic SDK, the rest on openai-compatible", () => {
   assert.equal(modelOf({ id: "claude-opus-5", protocol: "anthropic_messages" }).api.npm, "@ai-sdk/anthropic")
   assert.equal(modelOf({ id: "deepseek-v4.1-flash", protocol: "openai_chat_completions" }).api.npm, "@ai-sdk/openai-compatible")
+})
+
+test("a fallback list keeps each model's own SDK, not the provider's", () => {
+  // host.js builds a config model's SDK as m.provider?.npm ?? cfg.npm ??
+  // was?.api.npm ?? … (line ~1696) — api.npm is not read on that path. With
+  // only api.npm set, the fallback list gave every model the provider-level
+  // openai-compatible, so Claude models lost the anthropic protocol whenever
+  // the vendor's catalog could not be fetched.
+  const cfg = { npm: "@ai-sdk/openai-compatible", models: { "claude-opus-5": modelOf({ id: "claude-opus-5", protocol: "anthropic_messages" }) } }
+  const m = cfg.models["claude-opus-5"]
+  const npm = m.provider?.npm ?? cfg.npm ?? m.api?.npm ?? "@ai-sdk/openai-compatible"
+  assert.equal(npm, "@ai-sdk/anthropic", "the per-model SDK wins over the provider default")
 })
 
 test("catalogOf reads the vendor's shape and refuses one it does not know", () => {
