@@ -4,13 +4,13 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 
-const { usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf, request, appToken } = testables
+const { usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf, request, appToken, configPath } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -56,7 +56,6 @@ test("an expired token is not sent, and says to sign in", async () => {
   await withFetch({}, async (calls) => {
     const r = await p.auth.checkin(async () => ({ type: "api", key: old }))
     assert.equal(r.outcome, "failed")
-    assert.equal(r.signIn, "expired")
     assert.match(r.message, /过期/)
     assert.equal(calls.length, 0, "an expired token must not reach the vendor")
   })
@@ -99,7 +98,7 @@ test("already claimed today is `done`, with when to come back", async () => {
   assert.match(r.message, /1 小时/)
 })
 
-test("a 401 from the sign-in endpoint marks the sign-in expired", async () => {
+test("a 401 from the sign-in endpoint is said as an expired sign-in", async () => {
   const p = await CodarPlugin()
   const r = await withFetch(
     {
@@ -109,7 +108,7 @@ test("a 401 from the sign-in endpoint marks the sign-in expired", async () => {
     async () => p.auth.checkin(auth),
   )
   assert.equal(r.outcome, "failed")
-  assert.equal(r.signIn, "expired")
+  assert.match(r.message, /过期/)
 })
 
 test("a body we do not recognise fails instead of reading as claimed", async () => {
@@ -140,7 +139,7 @@ test("usage reports both balances and the claim window", async () => {
   assert.match(u.balance, /1970/)
   const win = u.windows.find((w) => w.name === "每日签到")
   assert.ok(win, "the claim window is there")
-  assert.equal(win.used, 100)
+  assert.equal(win.used, undefined, "a check-in is not a share of an allowance: no used, so the host shows it as its text")
   assert.ok(win.resetsAt > Date.now())
 })
 
@@ -191,7 +190,7 @@ test("the claim window is on the card the moment it opens", async () => {
   )
   const win = u.windows.find((w) => w.name === "每日签到")
   assert.ok(win, "the window is still on the card when the wait is over")
-  assert.equal(win.used, 0)
+  assert.equal(win.used, undefined)
   assert.match(win.display, /现在可以领/)
 
   const bad = await withFetch(
@@ -216,8 +215,8 @@ test("activities that are still running become windows; a failed read does not s
         body: {
           code: 200,
           data: [
-            { free_until: until, remaining_quota: null, model_ids: ["a", "b"] },
-            { free_until: until - 7200, remaining_quota: 10, model_ids: ["c"] },
+            { status: "active", free_until: until, remaining_quota: null, user_quota_limit: null, model_ids: ["a", "b"] },
+            { status: "active", free_until: until - 7200, remaining_quota: 10, user_quota_limit: 100, model_ids: ["c"] },
           ],
         },
       },
@@ -227,6 +226,25 @@ test("activities that are still running become windows; a failed read does not s
   const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
   assert.equal(free.length, 1, "only the one still running")
   assert.equal(free[0].resetsAt, until * 1000, "ms, as magpie's when() reads a number past 1e11")
+  assert.equal(free[0].aside, true, "using the activity up does not stop the account")
+  assert.deepEqual(free[0].models, ["a", "b"], "the window counts the activity's own models")
+  assert.equal(free[0].used, 0, "an unlimited activity has no share to tell")
+  assert.equal(free[0].amount, undefined, "and no invented count")
+
+  const capped = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false, retry_after: 60 } } },
+      "/api/codar/activities/mine": {
+        body: { code: 200, data: [{ status: "active", free_until: until, remaining_quota: 25, user_quota_limit: 100, model_ids: ["c"] }] },
+      },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const one = capped.windows.find((w) => w.name.startsWith("免费模型"))
+  assert.equal(one.used, 75, "amount is what is used of the limit: 100 given, 25 left")
+  assert.equal(one.amount, 75, "amount of limit used")
+  assert.equal(one.limit, 100, "the activity's own total")
 
   const u2 = await withFetch(
     {
@@ -238,6 +256,27 @@ test("activities that are still running become windows; a failed read does not s
   )
   assert.equal(u2.error, undefined, "the extra reads failing must not sink the balance")
   assert.match(u2.balance, /500/)
+})
+
+test("a free activity that ended is not drawn, whatever the list still says", async () => {
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": {
+        body: {
+          code: 200,
+          data: [
+            { status: "ended", free_until: Math.floor(Date.now() / 1000) + 3600, remaining_quota: null, model_ids: ["a"] },
+            { status: "active", free_until: Math.floor(Date.now() / 1000) - 3600, remaining_quota: null, model_ids: ["b"] },
+          ],
+        },
+      },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0)
 })
 
 test("the usage reads go out together, and a dead balance still reads the rest", async () => {
@@ -350,6 +389,30 @@ test("the config hook names the provider and lists the catalog", async () => {
   assert.ok(config.provider.codar.models["claude-opus-5"], "the anthropic models are listed too")
 })
 
+test("a model the config hook lists keeps its reasoning and its eyes", async () => {
+  // What host.js 0.1.1788 makes of the config entry (its `info()`, the
+  // `...(m.reasoning !== undefined ? { reasoning: m.reasoning } : {})` merge):
+  // replayed here, since this is the list magpie has before the vendor's
+  // catalog can be reached at all.
+  const p = await CodarPlugin()
+  const config = {}
+  await p.config(config)
+  const merged = (id) => {
+    const m = config.provider.codar.models[id]
+    return {
+      ...{ temperature: true, toolcall: true, input: { text: true }, output: { text: true } },
+      ...(m.reasoning !== undefined ? { reasoning: m.reasoning } : {}),
+      ...(m.attachment !== undefined ? { attachment: m.attachment } : {}),
+      ...(m.tool_call !== undefined ? { toolcall: m.tool_call } : {}),
+      ...(m.modalities?.input ? { input: Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, m.modalities.input.includes(k)])) } : {}),
+    }
+  }
+  const opus = merged("claude-opus-5")
+  assert.equal(opus.reasoning, true, "the config-path list kept reasoning")
+  const flash = merged("deepseek-v4.1-flash")
+  assert.equal(flash.input.image, true, "and the vendor's own catalog says this one takes images")
+})
+
 test("the config hook keeps a provider name the user set", async () => {
   // magpie keeps a provider's name in providers.json and runs every config
   // hook on each start: writing ours over it would undo a rename made in its
@@ -373,9 +436,59 @@ test("the auth hook asks magpie for the vendor's three concurrent requests", asy
   assert.equal(p.auth.maxConcurrency, 3)
 })
 
+test("a concurrency the vendor's catalog states is used, without a reload", async () => {
+  // The number is read when magpie builds the provider's info (host.js
+  // concurrencyOf), and the models hook runs before that in the same pass.
+  // So a catalog that starts saying max_concurrency reaches the queue on
+  // the next listing: no plugin update, no restart.
+  const p = await CodarPlugin()
+  const given = { id: "codar", models: {} }
+  await withFetch(
+    {
+      "/v1/codar/models": {
+        body: { catalog: { data: [{ id: "x", display_name: "X", protocol: { type: "openai_chat_completions" }, max_concurrency: 5 }] } },
+      },
+    },
+    async () => p.provider.models(given, { auth: await auth() }),
+  )
+  assert.equal(p.auth.maxConcurrency, 5, "the vendor's own number replaces the measured default")
+
+  const q = await CodarPlugin()
+  await withFetch(
+    {
+      "/v1/codar/models": {
+        body: { catalog: { data: [{ id: "x", display_name: "X", protocol: { type: "openai_chat_completions" } }] } },
+      },
+    },
+    async () => q.provider.models({ id: "codar", models: {} }, { auth: await auth() }),
+  )
+  assert.equal(q.auth.maxConcurrency, 3, "a catalog with no number keeps the measured one")
+})
+
 test("claude models go out on the anthropic SDK, the rest on openai-compatible", () => {
   assert.equal(modelOf({ id: "claude-opus-5", protocol: "anthropic_messages" }).api.npm, "@ai-sdk/anthropic")
   assert.equal(modelOf({ id: "deepseek-v4.1-flash", protocol: "openai_chat_completions" }).api.npm, "@ai-sdk/openai-compatible")
+})
+
+test("a model's abilities reach both of the host's paths, not just one", () => {
+  // host.js builds a config model's capabilities from the top-level
+  // m.reasoning / m.attachment / m.tool_call / m.modalities alone (the
+  // `...(m.reasoning !== undefined ? …)` merge), and reads the models hook's
+  // answer through m.capabilities (`kinds(m.capabilities?.input)`). Only one
+  // set was written, so a config-path model had neither reasoning nor image.
+  const m = modelOf({ id: "claude-opus-5", protocol: "anthropic_messages", reasoning: true, input: ["text", "image"], output: ["text"] })
+  assert.equal(m.reasoning, true, "the config path reads this")
+  assert.equal(m.tool_call, true)
+  assert.equal(m.attachment, true, "it takes images, so it takes attachments")
+  assert.deepEqual(m.modalities.input, ["text", "image"])
+  assert.deepEqual(m.modalities.output, ["text"])
+  assert.equal(m.capabilities.reasoning, true, "the models hook path reads this")
+  assert.deepEqual(m.capabilities.input, { text: true, image: true, audio: false, video: false, pdf: false })
+  assert.deepEqual(m.capabilities.output, { text: true, image: false, audio: false, video: false, pdf: false })
+
+  const plain = modelOf({ id: "deepseek-v4.1-flash", input: ["text"], output: ["text"] })
+  assert.equal(plain.reasoning, false)
+  assert.equal(plain.attachment, false)
 })
 
 test("a fallback list keeps each model's own SDK, not the provider's", () => {
@@ -420,12 +533,12 @@ test("every request carries the User-Agent the desktop app sends on that host", 
       const sign = calls.find((c) => c.url.includes("/v1/daily-sign"))
       const cat = calls.find((c) => c.url.includes("/v1/codar/models"))
       assert.equal(sign.init.headers["User-Agent"], "node", "the desktop's own fetch sends `node`")
-      assert.equal(cat.init.headers["User-Agent"], "Go-http-client/1.1", "the sidecar sends the Go UA")
+      assert.equal(cat.init.headers["User-Agent"], "node", "the catalog is read by that same main-process fetch (the sidecar's Go UA is chat only)")
     },
   )
   const out = { headers: {} }
   await p["chat.headers"]({ model: { providerID: "codar" }, provider: { info: { id: "codar" } } }, out)
-  assert.equal(out.headers["User-Agent"], "Go-http-client/1.1")
+  assert.equal(out.headers["User-Agent"], "Go-http-client/1.1", "chat goes out through the app's Go sidecar")
 })
 
 test("chat.headers leaves another provider's request alone", async () => {
@@ -490,7 +603,7 @@ test("the read-from-this-machine sign-in hands magpie a key, and says why when i
     writeFileSync(file, JSON.stringify({ provider: { speedai: {} } }))
     assert.match(appToken(file).error, /没有 provider\.speedai\.token/)
 
-    writeFileSync(file, JSON.stringify({ provider: { speedai: { token: "eyJ​abc" } } }))
+    writeFileSync(file, JSON.stringify({ provider: { speedai: { token: "eyJ\u200Babc" } } }))
     assert.match(appToken(file).error, /无法识别/, "an invisible character is refused here, not by fetch")
 
     const old = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 60 })
@@ -527,6 +640,136 @@ test("the token never leaves in a message", async () => {
   assert.doesNotMatch(r.message, new RegExp(TOKEN.slice(0, 20)))
 })
 
+test("the points are a wallet window, so routing has a figure for this account", async () => {
+  // magpie's routing page says "what's left not known yet" for an account
+  // whose windows are all aside or text (routedAllowance skips them). The
+  // points are a prepaid wallet: Balance leaves it known, with the figure
+  // left, and no share invented (magpie #3950).
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 2348, agent_token: 4000 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": {
+        body: { code: 200, data: [{ status: "active", free_until: until, remaining_quota: null, user_quota_limit: null, model_ids: ["auto", "deepseek-v4.1-flash"] }] },
+      },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const wallet = u.windows.find((w) => w.name === "点数余额")
+  assert.ok(wallet, "the wallet window is there")
+  assert.equal(wallet.balance, 2348, "the figure left, as a wallet reading")
+  assert.equal(wallet.used, undefined, "no share invented for a wallet")
+  assert.equal(wallet.aside, undefined, "not set aside: it still counts")
+})
+
+test("vendor strings are cleaned, and an id that needs cleaning is left out", () => {
+  const list = catalogOf({
+    data: [
+      { id: "ok", display_name: "Fine\u0007Name", protocol: { type: "openai_chat_completions" } },
+      { id: "bad\u0001id", display_name: "Bad", protocol: { type: "openai_chat_completions" } },
+      { id: "  ", display_name: "Blank" },
+    ],
+  })
+  assert.deepEqual(list.map((m) => m.id), ["ok"], "the two unusable ids are left out")
+  assert.equal(list[0].name, "Fine Name", "the control character in the name is a space")
+})
+
+test("a reply that starts with a byte-order mark still reads", async () => {
+  // Node's fetch and Bun's both drop a leading BOM from text(), but the
+  // fetch the host hands in need not: this stub answers text() with the BOM
+  // still in it, which is what the plugin's own strip is for.
+  const p = await CodarPlugin()
+  const bodied = (body) => ({ ok: true, status: 200, text: async () => body })
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) =>
+    String(url).includes("/v1/gettoken")
+      ? bodied(JSON.stringify({ code: 200, token: 1, agent_token: 0 }))
+      : bodied('\uFEFF{"code":200,"message":"Success"}')
+  try {
+    const r = await p.auth.checkin(auth)
+    assert.equal(r.outcome, "claimed", "a BOM is not a broken reply")
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test("a token quoted back in an error is cut by its shape, even with no token in hand", async () => {
+  // The getAuth-throw path has no token to split on. A vendor (or the fetch
+  // underneath) that quotes the credential back must still not put it on the
+  // card: the shape of a JWT is what is cut.
+  const jwt = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const boom = Object.assign(new Error(`bad key ${jwt}`), {})
+  const p = await CodarPlugin()
+  const r = await p.auth.checkin(async () => {
+    throw boom
+  })
+  assert.doesNotMatch(r.message, new RegExp(jwt.slice(10, 30)))
+  assert.match(r.message, /…/)
+
+  const u = await p.auth.usage(async () => {
+    throw boom
+  })
+  assert.doesNotMatch(u.error, new RegExp(jwt.slice(10, 30)))
+})
+
+test("a message is one line", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 500, message: "line one\nline two\u0007" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.message, "line one line two", "control characters never reach the card")
+})
+
+test("the read-from-this-machine sign-in follows CODAR_HOME, as the app does", () => {
+  // `codar config path` answers <CODAR_HOME>/config.json when CODAR_HOME is
+  // set (verified against the installed app's sidecar), so the plugin reads
+  // the same file the app would have written.
+  const dir = mkdtempSync(join(tmpdir(), "codar-home-"))
+  const token = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 86400 })
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ provider: { speedai: { token } } }))
+  const had = process.env.CODAR_HOME
+  process.env.CODAR_HOME = dir
+  try {
+    assert.deepEqual(appToken(), { token }, "the default path follows CODAR_HOME")
+  } finally {
+    if (had === undefined) delete process.env.CODAR_HOME
+    else process.env.CODAR_HOME = had
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("without CODAR_HOME the file is the app's under the home directory", () => {
+  // the path alone, not a read: this machine's own ~/.codar must not decide
+  // what a test sees
+  const had = process.env.CODAR_HOME
+  delete process.env.CODAR_HOME
+  try {
+    assert.equal(configPath(), join(homedir(), ".codar", "config.json"))
+  } finally {
+    if (had !== undefined) process.env.CODAR_HOME = had
+  }
+})
+
+test("a token with no account name is refused at sign-in, not saved", () => {
+  // Every call the plugin makes sends the account name from the token's own
+  // claims. A token without one used to be saved and then fail on the card.
+  const dir = mkdtempSync(join(tmpdir(), "codar-plugin-"))
+  const file = join(dir, "config.json")
+  const nameless = mkToken({ exp: Math.floor(Date.now() / 1000) + 86400 })
+  writeFileSync(file, JSON.stringify({ provider: { speedai: { token: nameless } } }))
+  try {
+    assert.match(appToken(file).error, /没有账号名/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("the module exports one function, the plugin: magpie runs every exported function", async () => {
   // host.js servers() takes every function the module exports as a plugin
   // entry and calls it with the plugin input. A helper exported for a test
@@ -552,7 +795,7 @@ test("a sign-in with no token says to sign in, and a token with no name says whi
   const spaces = await p.auth.checkin(async () => ({ type: "api", key: "  \n " }))
   assert.match(spaces.message, /没有登录信息/, "whitespace only is an empty key, not an unusable one")
 
-  const zero = await p.auth.checkin(async () => ({ type: "api", key: "eyJ​abc" }))
+  const zero = await p.auth.checkin(async () => ({ type: "api", key: "eyJ\u200Babc" }))
   assert.match(zero.message, /无法识别/, "a key with an invisible character in it cannot be sent")
 
   const nameless = mkToken({ exp: Math.floor(Date.now() / 1000) + 60 })
@@ -560,7 +803,10 @@ test("a sign-in with no token says to sign in, and a token with no name says whi
   assert.match(r.message, /没有账号名/)
 })
 
-test("a getAuth that throws fails the hook, and a 401 marks the sign-in", async () => {
+test("a getAuth that throws fails the hook; the usage read marks a 401 as expired", async () => {
+  // checkin's own answer carries no signIn: host.js's checkinOf keeps only
+  // outcome, credit, streak and message, so a signIn here would be written
+  // and never read. What marks an account is usage's.
   const p = await CodarPlugin()
   const plain = await p.auth.checkin(async () => {
     throw new Error("no account")
@@ -572,7 +818,8 @@ test("a getAuth that throws fails the hook, and a 401 marks the sign-in", async 
   const r = await p.auth.checkin(async () => {
     throw denied
   })
-  assert.equal(r.signIn, "expired")
+  assert.equal(r.outcome, "failed")
+  assert.equal(r.signIn, undefined, "the check-in's own answer has no signIn to be read")
 
   const u = await p.auth.usage(async () => {
     throw denied

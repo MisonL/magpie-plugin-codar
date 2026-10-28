@@ -7,8 +7,9 @@
 //     provider.api_base 设成这个地址，请求头只有 Authorization、Content-Type
 //     和一个 Go HTTP 客户端的 User-Agent。插件照发同样的请求头（见
 //     chat.headers 与 UA 的注释），不做别的事。
-//   - 模型目录：GET /v1/codar/models，返回 {catalog:{data:[…]}}，字段见
-//     catalog.mjs（那份是桌面端缓存的同一份数据，作为拿不到时的底）。
+//   - 模型目录：GET /v1/codar/models，返回 {object:"list", data:[…]}（也有
+//     {catalog:{data:[…]}} 的形状，两种都认），字段见 catalog.mjs（那份是
+//     桌面端缓存的同一份数据，作为拿不到时的底）。
 //   - 签到：POST https://api.kuaipaper.com/v1/daily-sign，body 是
 //     {username}，同一把 Bearer 令牌。返回 {code, message, data}：code 200
 //     是领到了，code 400「24小时内仅可领取一次」是今天已经领过，
@@ -40,9 +41,9 @@ const SIGN_STATUS_PATH = "/v1/daily-sign/status"
 const POINTS_PATH = "/v1/gettoken"
 
 // 桌面端两条链路各发各的 User-Agent，插件按接口分开对齐：
-//   - 对话与模型目录走 Go 侧车 → "Go-http-client/1.1"（实测抓包）
-//   - 账号、签到、点数、活动走 Electron 主进程的 fetch → "node"（Node
-//     fetch 的默认值，实测同一台机器上的 Node 24 就是它）
+//   - 对话走 Go 侧车 → "Go-http-client/1.1"（实测抓包）
+//   - 模型目录、账号、签到、点数、活动走 Electron 主进程的 fetch → "node"
+//     （Node fetch 的默认值；主进程的 auth-request 自己不加 UA）
 // 目标是让请求和 App 自己的流量同形，而不是一个陌生的客户端。
 const UA_SIDECAR = "Go-http-client/1.1"
 const UA_DESKTOP = "node"
@@ -113,13 +114,36 @@ const signedOut = (e) => e?.status === 401 || e?.status === 403
 // whyOf is the message to show for an error, without the token it might name.
 const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
 
+// controlChars would break a card's line or ride along invisibly: a vendor
+// string is shown as one line, never as a control sequence.
+const controlChars = /[\u0000-\u001f\u007f]/g
+
+// cleanText is a vendor string as a card can show it: control characters
+// out, one line (runs of spaces folded), and never longer than a card reads.
+const cleanText = (s) => String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim().slice(0, 120)
+
+// jwtShape is a credential as a server might quote it back: three
+// dot-joined base64url runs, as every Codar token is. Matched by shape, so
+// it is cut from a message even when no token is in hand (a getAuth that
+// threw leaves nothing to cut by).
+const jwtShape = /eyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]*/g
+
+// configPath is where the Codar app keeps its own config. The app takes
+// CODAR_HOME over the home directory when it is set (its sidecar's
+// `codar config path` says so), so the file is looked for in the same
+// place the app would have written it.
+const configPath = () => {
+  const home = String(process.env.CODAR_HOME ?? "").trim()
+  return join(home || join(homedir(), ".codar"), "config.json")
+}
+
 // appToken reads the token the Codar desktop app keeps, for the "read from
 // this machine" sign-in: provider.speedai.token in ~/.codar/config.json
 // (%USERPROFILE%\.codar\config.json on Windows, as the app's own docs say;
 // on macOS/Linux the home directory is the same place). Read only — the file
 // is the app's, and the plugin never writes it. A failure says why in words
 // the sign-in dialog can show, since this runs where no card exists yet.
-function appToken(file = join(homedir(), ".codar", "config.json")) {
+function appToken(file = configPath()) {
   let text
   try {
     text = readFileSync(file, "utf8")
@@ -134,6 +158,9 @@ function appToken(file = join(homedir(), ".codar", "config.json")) {
   }
   if (!token) return { error: `${file} 里没有 provider.speedai.token；先在这台机器上登录一次科搭，或改用粘贴` }
   if (!tokenOf({ type: "api", key: token })) return { error: `${file} 里的令牌无法识别；改用「科搭访问令牌」粘贴` }
+  // every call this plugin makes sends the account name from the token's
+  // own claims; one without it would be saved and then fail on the card
+  if (!usernameOf(token)) return { error: `${file} 里的令牌没有账号名；打开一次科搭重新登录，或改用「科搭访问令牌」粘贴` }
   if (expired(token)) return { error: `${file} 里的令牌已过期；打开一次科搭让它续期，再试一次` }
   return { token }
 }
@@ -152,7 +179,11 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ctl.signal,
     })
-    const text = await res.text()
+    // A leading BOM would make JSON.parse refuse the whole body. Node's and
+    // Bun's network fetch drop it from text(), but the fetch the host hands
+    // in need not, so it is dropped here too: one line, one guarantee less
+    // that depends on which fetch answered.
+    const text = (await res.text()).replace(/^\uFEFF/, "")
     let data = null
     try {
       data = text ? JSON.parse(text) : null
@@ -204,24 +235,39 @@ const pointsOf = async (token, username, opts) => {
 function modelOf(m) {
   const anthropic = m?.protocol === "anthropic_messages"
   const npm = anthropic ? CLAUDE : OPENAI
-  const input = Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, (m?.input ?? []).includes(k)]))
-  const output = Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, (m?.output ?? []).includes(k)]))
+  const reasons = Boolean(m?.reasoning)
+  const input = ["text", "image", "audio", "video", "pdf"].filter((k) => (m?.input ?? []).includes(k))
+  const output = ["text", "image", "audio", "video", "pdf"].filter((k) => (m?.output ?? []).includes(k))
+  const takes = (list) => Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, list.includes(k)]))
   return {
     id: m.id,
     name: m.name || m.id,
     // host.js resolves a config model's SDK as m.provider?.npm ?? cfg.npm ??
-    // … (line ~1696): api.npm is not read on that path. Without provider.npm
-    // the fallback list gave every model the provider-level openai-compatible,
-    // so Claude models lost the anthropic protocol whenever the vendor's
-    // catalog could not be fetched.
+    // … (the `m.provider?.npm ?? cfg.npm ?? was?.api.npm` line): api.npm is
+    // not read on that path. Without provider.npm the fallback list gave
+    // every model the provider-level openai-compatible, so Claude models
+    // lost the anthropic protocol whenever the vendor's catalog could not
+    // be fetched.
     provider: { npm },
     api: { id: m.id, url: `${API}/v1`, npm },
     limit: { context: Number(m.context) || 0, output: 0 },
     // The vendor prices in CNY per million tokens; magpie's cost column is
     // US dollars, and inventing an exchange rate here would put a wrong
-    // number on the Usage page. Left at 0, which magpie shows as unpriced.
+    // number on the Usage page. Left at 0, which magpie shows as unpriced
+    // where no catalog knows the model's maker price.
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    capabilities: { temperature: true, toolcall: true, reasoning: Boolean(m.reasoning), input, output },
+    // The model's abilities are read from two places, and only together do
+    // they cover both paths a model takes into magpie: the config hook's
+    // list is merged from these top-level fields (`m.reasoning`,
+    // `m.attachment`, `m.tool_call`, `m.modalities`), while the list the
+    // models hook returns is read through `capabilities` (`m.capabilities?
+    // .reasoning`, `kinds(m.capabilities?.input)`). The config path alone
+    // had neither reasoning nor image.
+    reasoning: reasons,
+    tool_call: true,
+    attachment: input.includes("image"),
+    modalities: { input, output },
+    capabilities: { temperature: true, toolcall: true, reasoning: reasons, input: takes(input), output: takes(output) },
     headers: {},
   }
 }
@@ -229,16 +275,22 @@ function modelOf(m) {
 const modelsOf = (list) => Object.fromEntries(list.map((m) => [m.id, modelOf(m)]))
 
 // catalogOf is the vendor's answer as our catalog records: the same fields
-// catalog.mjs keeps, so both paths build the same entries.
+// catalog.mjs keeps, so both paths build the same entries. Vendor text is
+// cleaned: a control character would break the card it lands on, and an id
+// that has to be cleaned is not an id a request can ask for, so that record
+// is left out rather than renamed.
 function catalogOf(body) {
   const list = body?.catalog?.data ?? body?.data ?? null
   if (!Array.isArray(list)) return null
   const out = []
   for (const m of list) {
-    if (!m || typeof m.id !== "string" || !m.id) continue
+    const rawId = typeof m?.id === "string" ? m.id.trim() : ""
+    const id = cleanText(rawId)
+    if (!id || id !== rawId) continue
+    const said = typeof m.display_name === "string" ? cleanText(m.display_name) : ""
     out.push({
-      id: m.id,
-      name: typeof m.display_name === "string" && m.display_name ? m.display_name : m.id,
+      id,
+      name: said || id,
       context: Number(m.context_window) || 0,
       input: Array.isArray(m.input_modalities) ? m.input_modalities : ["text"],
       output: Array.isArray(m.output_modalities) ? m.output_modalities : ["text"],
@@ -249,13 +301,45 @@ function catalogOf(body) {
   return out.length ? out : null
 }
 
+// runningActivities are the free-model activities on right now, as the
+// vendor's own list says (status and free_until): one that ended the while
+// a reading was kept is no longer free.
+const runningActivities = (body) => {
+  const list = Array.isArray(body?.data) ? body.data : []
+  const now = Date.now() / 1000
+  return list.filter(
+    (a) => a && typeof a === "object" && a.status === "active" && typeof a.free_until === "number" && a.free_until > now,
+  )
+}
+
+// publishedConcurrency is the concurrency a vendor's catalog states, when it
+// states one: a max_concurrency on the catalog or on any of its models, the
+// smallest it names. 0 when it says nothing — which is every reading so far
+// (measured 2026-10-27: no such field in /v1/codar/models, none in
+// /api/pricing, and the 429's own body carries only retry-after).
+const publishedConcurrency = (body) => {
+  const nums = []
+  const take = (v) => {
+    const n = Number(v)
+    if (Number.isInteger(n) && n > 0 && n <= 1000) nums.push(n)
+  }
+  const list = body?.catalog?.data ?? body?.data
+  take(body?.max_concurrency)
+  take(body?.catalog?.max_concurrency)
+  if (Array.isArray(list)) for (const m of list) take(m?.max_concurrency)
+  return nums.length ? Math.min(...nums) : 0
+}
+
 // signMessage says what the check-in answered, in the user's words, with the
 // token scrubbed: a server that quotes the credential back would otherwise
-// put it on the card and in magpie's log.
+// put it on the card and in magpie's log. The token itself is cut where it
+// is known; a credential-shaped string is cut by its shape, which covers the
+// path where the sign-in threw and there is no token to cut by.
 const scrub = (said, token) => {
-  const text = typeof said === "string" ? said : ""
+  let text = typeof said === "string" ? said.replace(controlChars, " ") : ""
   const key = String(token ?? "")
-  return key ? text.split(key).join("…") : text
+  if (key) text = text.split(key).join("…")
+  return text.replace(jwtShape, "…").replace(/\s{2,}/g, " ").trim().slice(0, 400)
 }
 const signMessage = (r, token) => scrub(typeof r?.message === "string" ? r.message : "", token)
 
@@ -264,14 +348,25 @@ export async function CodarPlugin(input) {
   // 在这之后换掉全局的那个。
   const fetchImpl = (...args) => (input?.fetch ?? globalThis.fetch)(...args)
 
+  // 并发数：厂商目前哪个接口都不说（实测 2026-10-27 的目录、pricing、429
+  // 响应里都没有这个数），默认值 3 是量出来的——同时发 4 个，第 4 个收到
+  // 429 concurrent_limit_exceeded。目录里一旦出现 max_concurrency，下面
+  // 的目录刷新会把它记下来，auth 的 getter 下次被读时就用它。宿主在建
+  // provider 信息时才读一次这个值（host.js 的 concurrencyOf），而模型钩子
+  // 在那之前跑，所以刷新后的第一个请求就按新数排队。
+  let vendorConcurrency = 0
+
   return {
     auth: {
       provider: ID,
 
       // 科搭按模型限 3 个并发（实测：同时发 4 个，第 4 个收到 429
       // concurrent_limit_exceeded）。按账号限 3，让 magpie 排队而不是撞限流；
-      // 用户在供应商设置里可以调高。
-      maxConcurrency: 3,
+      // 用户在供应商设置里可以调高。getter：目录说了个数时用它（见上），
+      // 没说就是量出来的 3。
+      get maxConcurrency() {
+        return vendorConcurrency || 3
+      },
 
       // 两种登录：粘贴令牌，或让插件在这台机器上读科搭自己的登录信息。
       // 后者是 keyless + authorize（magpie 的契约，host.js 的 apiKey()）：
@@ -299,14 +394,16 @@ export async function CodarPlugin(input) {
       ],
 
       // 签到：POST /v1/daily-sign。服务端用业务码区分「领到了」与「今天已领
-      // 过」——HTTP 状态都是 200，所以看 body 的 code。
+      // 过」——HTTP 状态都是 200，所以看 body 的 code。返回里不带 signIn：
+      // 宿主只把 outcome/credit/streak/message 交给 magpie（host.js 的
+      // checkinOf），标账号过期是 usage 的活（usage 的 signIn 会被读走）。
       async checkin(getAuth) {
         let auth, token
         try {
           auth = await getAuth()
           token = tokenOf(auth)
         } catch (e) {
-          return { outcome: "failed", message: scrub(whyOf(e), auth?.key) || "签到失败", ...(signedOut(e) ? { signIn: "expired" } : {}) }
+          return { outcome: "failed", message: scrub(whyOf(e), auth?.key) || "签到失败" }
         }
         if (!token)
           return {
@@ -315,7 +412,7 @@ export async function CodarPlugin(input) {
           }
         const username = usernameOf(token)
         if (!username) return { outcome: "failed", message: "令牌里没有账号名，请粘贴科搭登录后的完整令牌" }
-        if (expired(token)) return { outcome: "failed", message: "登录已过期，请重新登录", signIn: "expired" }
+        if (expired(token)) return { outcome: "failed", message: "登录已过期，请重新登录" }
 
         const deadline = Date.now() + CHECKIN_BUDGET_MS
         const left = () => Math.max(1000, deadline - Date.now())
@@ -339,7 +436,7 @@ export async function CodarPlugin(input) {
             timeoutMs: Math.min(TIMEOUT_MS, left()),
           })
         } catch (e) {
-          if (signedOut(e)) return { outcome: "failed", message: "登录已过期，请重新登录", signIn: "expired" }
+          if (signedOut(e)) return { outcome: "failed", message: "登录已过期，请重新登录" }
           return { outcome: "failed", message: scrub(whyOf(e), token) || "签到失败" }
         }
 
@@ -358,7 +455,7 @@ export async function CodarPlugin(input) {
           const wait = humanSecs(r?.data?.retry_after)
           return { outcome: "done", message: `今天已领过${r?.data?.retry_after ? `，${wait}后可再领` : ""}` }
         }
-        if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录", signIn: "expired" }
+        if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
         return { outcome: "failed", message: signMessage(r, token) || `签到失败（code ${code || "?"}）` }
       },
 
@@ -398,6 +495,9 @@ export async function CodarPlugin(input) {
 
         // 今日签到：明天这个时候能再领一次。等待结束时（retry_after 0）这
         // 一行也要在——那正是"现在可以领"的时刻，旧写法 retry > 0 会让它消失。
+        // 不带 used：签到不是一份会用完的额度，宿主把没有份额的 aside 行当
+        // 文字行显示（host.js 的 Text，magpie 自己的注释也拿「每日签到」当
+        // 例子），不会画成一个 100% 的进度条。
         if (statusR.status === "fulfilled" && statusR.value?.data && typeof statusR.value.data === "object") {
           const st = statusR.value
           const signed = Boolean(st.data.isSigned)
@@ -405,30 +505,48 @@ export async function CodarPlugin(input) {
           const wait = Number.isFinite(retry) && retry > 0 ? humanSecs(retry) : ""
           windows.push({
             name: "每日签到",
-            used: signed ? 100 : 0,
             ...(wait ? { resetsAt: Date.now() + retry * 1000 } : {}),
             display: signed ? (wait ? `今天已领，${wait}后可再领` : "今天已领") : wait ? `今天还没领，${wait}后可以领` : "今天还没领，现在可以领",
             aside: true,
           })
         }
 
-        // 免费模型活动：免费到什么时候。remaining_quota 是 null 时表示不限量，
-        // 有数时它才是这个活动还剩多少。列表拿不到就整段跳过。
+        // 点数余额：账号真正会花掉的东西。它是一个预付钱包，没有「总额」可
+        // 以取份额，所以按钱包读数（balance，magpie 的 #3950）报，而不是编
+        // 一个百分比。magpie 靠它把这个账号从「剩余额度未知」变成已知：路由
+        // 页会直接说还剩多少点，而不是把账号排到已知的之后。它不按模型划范围
+        // ——活动期的免费模型眼下不花点数，活动一结束就花，而点数归零时
+        // magpie 只是把账号排到最后（spent），不是拒绝它。
+        // 窗口上的 balance 要宿主和 magpie 都认（0.1.1822 起，magpie #3950）；
+        // 旧版（如 0.1.1788）只把它当文字行显示，读数不丢，路由暂仍未知。
+        if (points.general != null) {
+          windows.push({
+            name: "点数余额",
+            balance: points.general,
+            unit: "点",
+            display: `${points.general} 点`,
+          })
+        }
+
+        // 免费模型活动：免费到什么时候，以及厂商给了总额时的用量。
+        // remaining_quota 是 null 表示不限量——用不完，也就没有一个能如实
+        // 报出的份额，宿主会把它当文字行显示。user_quota_limit 是这次活动给
+        // 的总额，有总额时 amount/limit 才是「已用 / 总额」两个真数，而不是
+        // 拿剩余数当总额报。aside 表示「用完了也不停账号」：活动用完只是回到
+        // 按点数计费，账号照常可用。
         if (actsR.status === "fulfilled") {
-          const r = actsR.value
-          const list = Array.isArray(r?.data) ? r.data : []
-          const now = Date.now() / 1000
-          for (const a of list) {
-            if (!a || typeof a !== "object") continue
-            if (typeof a.free_until !== "number" || a.free_until <= now) continue
-            const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string") : []
-            const left = typeof a.remaining_quota === "number" ? a.remaining_quota : null
+          for (const a of runningActivities(actsR.value)) {
+            const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string" && x).map(cleanText) : []
+            const cap = typeof a.user_quota_limit === "number" && a.user_quota_limit > 0 ? a.user_quota_limit : null
+            const left = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
+            const used = cap != null && left != null ? Math.max(0, cap - left) : null
+            const share = used != null ? Math.min(100, Math.round((used / cap) * 100)) : 0
             windows.push({
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
-              used: 0,
+              used: share,
               resetsAt: a.free_until * 1000,
-              display: left == null ? "免费使用中（不限量）" : `免费使用中，剩 ${left}`,
-              ...(left == null ? {} : { amount: 0, limit: left, unit: "次" }),
+              display: left == null ? "免费使用中（不限量）" : cap == null ? `免费使用中，还剩 ${left}` : `免费使用中，已用 ${used} / ${cap}`,
+              ...(used != null ? { amount: used, limit: cap } : {}),
               aside: true,
               ...(ids.length ? { models: ids } : {}),
             })
@@ -459,9 +577,14 @@ export async function CodarPlugin(input) {
         const token = tokenOf(auth)
         if (!token || expired(token)) return given
         try {
-          const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ua: UA_SIDECAR })
+          // 目录是 App 的 Electron 主进程去读的（main.cjs 的 auth-request
+          // 白名单里有 /v1/codar/models），走 Node 的默认 UA；Go UA 只用在
+          // 对话上（侧车发的）。
+          const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl })
           const list = catalogOf(body)
           if (!list) return Object.assign(given, { [Symbol.for("magpie.fellBack")]: true })
+          // 厂商哪天在目录里说了并发数，就按它排队（见上面 vendorConcurrency）
+          vendorConcurrency = publishedConcurrency(body)
           // 厂商的目录对自家的模型说了算；用户自己往这个供应商里加的条目
           // （内嵌目录里没有的 id）在刷新后留着，config 钩子也是这么合并的。
           const known = new Set(CATALOG.map((m) => m.id))
@@ -503,6 +626,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, humanSecs, request, appToken }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, humanSecs, request, appToken, configPath }
 
 export default CodarPlugin
