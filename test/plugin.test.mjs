@@ -258,7 +258,12 @@ test("activities that are still running become windows; a failed read does not s
   assert.match(u2.balance, /500/)
 })
 
-test("a free activity that ended is not drawn, whatever the list still says", async () => {
+test("a free activity is drawn by the vendor app's own rule, and no other", async () => {
+  // The desktop app decides with free_until and remaining_quota alone (its
+  // own filter, read out of app.asar): a status it does not read decides
+  // nothing, while a quota it does read that says "spent" means these
+  // models are not free anymore.
+  const now = Math.floor(Date.now() / 1000)
   const p = await CodarPlugin()
   const u = await withFetch(
     {
@@ -268,15 +273,20 @@ test("a free activity that ended is not drawn, whatever the list still says", as
         body: {
           code: 200,
           data: [
-            { status: "ended", free_until: Math.floor(Date.now() / 1000) + 3600, remaining_quota: null, model_ids: ["a"] },
-            { status: "active", free_until: Math.floor(Date.now() / 1000) - 3600, remaining_quota: null, model_ids: ["b"] },
+            { status: "ended", free_until: now + 3600, remaining_quota: null, model_ids: ["a"] },
+            { status: "active", free_until: now - 3600, remaining_quota: null, model_ids: ["b"] },
+            { status: "active", free_until: now + 3600, remaining_quota: 0, model_ids: ["c"] },
+            { status: "active", free_until: now + 3600, remaining_quota: null, model_ids: ["d"] },
           ],
         },
       },
     },
     async () => p.auth.usage(auth),
   )
-  assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0)
+  const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
+  assert.equal(free.length, 2, "the ended one and the spent one are not drawn")
+  assert.ok(free.some((w) => w.models.includes("a")), "a status the app doesn't read does not hide a running activity")
+  assert.ok(free.some((w) => w.models.includes("d")))
 })
 
 test("the usage reads go out together, and a dead balance still reads the rest", async () => {
@@ -835,6 +845,10 @@ test("usage with no token is an error, not a zero", async () => {
   const nameless = mkToken({ exp: Math.floor(Date.now() / 1000) + 60 })
   const u2 = await p.auth.usage(async () => ({ type: "api", key: nameless }))
   assert.match(u2.error, /没有账号名/)
+  // a key that is there but cannot go in a header says so, as check-in does:
+  // "sign in again" would send the user to the wrong place
+  const broken = await p.auth.usage(async () => ({ type: "api", key: "eyJ​abc" }))
+  assert.match(broken.error, /无法识别/)
 })
 
 test("an answer that is not JSON is a failure with its reason, not a crash", async () => {

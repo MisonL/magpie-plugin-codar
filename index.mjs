@@ -302,14 +302,21 @@ function catalogOf(body) {
 }
 
 // runningActivities are the free-model activities on right now, as the
-// vendor's own list says (status and free_until): one that ended the while
-// a reading was kept is no longer free.
+// vendor's own clients say (free_until in the future, and not exhausted):
+// one whose quota was spent is not free anymore. We follow the vendor app's
+// own filter: ignore status, use only free_until and remaining_quota (the
+// live data shows status "active" and ended_at null; the catalog shows
+// status "active" too).
 const runningActivities = (body) => {
   const list = Array.isArray(body?.data) ? body.data : []
   const now = Date.now() / 1000
-  return list.filter(
-    (a) => a && typeof a === "object" && a.status === "active" && typeof a.free_until === "number" && a.free_until > now,
-  )
+  return list.filter((a) => {
+    if (!a || typeof a !== "object") return false
+    if (typeof a.free_until !== "number" || a.free_until <= now) return false
+    // a quota that says it's exhausted means these models aren't free
+    if (a.remaining_quota != null && (typeof a.remaining_quota !== "number" || a.remaining_quota <= 0)) return false
+    return true
+  })
 }
 
 // publishedConcurrency is the concurrency a vendor's catalog states, when it
@@ -468,7 +475,8 @@ export async function CodarPlugin(input) {
         } catch (e) {
           return { error: scrub(whyOf(e), token) || "用量查询失败", signIn: signedOut(e) ? "expired" : "" }
         }
-        if (!token) return { error: "没有登录信息，请先登录" }
+        if (!token)
+          return { error: unusableKey(auth) ? "令牌内容无法识别（含空格、换行或非 ASCII 字符），请重新登录" : "没有登录信息，请先登录" }
         const username = usernameOf(token)
         if (!username) return { error: "令牌里没有账号名，请重新登录" }
         if (expired(token)) return { error: "登录已过期，请重新登录", signIn: "expired" }

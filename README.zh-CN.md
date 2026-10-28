@@ -57,7 +57,7 @@ magpie plugin login codar     # 选「读取本机科搭令牌」，或「科搭
 - 科搭的免费模型对每个模型限定 3 个并发请求（实测：同时发 4 个，第 4 个收到 429 `concurrent_limit_exceeded`，「Too many concurrent requests」）。插件的 auth 钩子声明了 3，magpie 会把每个账号超过 3 个的请求排队，而不是让它们撞上厂商的限流；供应商设置里可以调高。
   厂商目前哪个接口都不公布这个数——`/v1/codar/models` 没有、`/api/pricing` 没有、429 的响应体里只有 `retry-after`——所以 3 是量出来的。哪天目录里带上 `max_concurrency`，模型钩子会读到它，下次建供应商信息时就用新数，不用等插件发版。
 - 点数同时作为一扇带 `balance` 的窗口报出（magpie #3950）：只有 `aside` 行的卡片对路由什么都没说，magpie 就在账号旁边写「剩余额度未知」。钱包读数让它变成已知，直接给出还剩多少，也不编造百分比。读不懂窗口 `balance` 的旧版 magpie 只把它当文字行显示、照旧说未知；两种版本都不会出错。
-- 免费模型活动只在厂商说它还在跑时画出（`status: "active"` 且 `free_until` 未到）。它是 `aside`——用完了只是这些模型回到按点数计费，账号不停——只有厂商给了总额（`user_quota_limit`）时才带 `amount`/`limit`；不限量的活动显示为它的文字。
+- 免费模型活动按厂商 App 自己的判据画——`free_until` 未到、`remaining_quota` 没花光——不看它不读的 `status` 字段。它是 `aside`——用完了只是这些模型回到按点数计费，账号不停——只有厂商给了总额（`user_quota_limit`）时才带 `amount`/`limit`；不限量的活动显示为它的文字。
 - 每日签到是一行文字，不是百分比：签到不是会用完的额度，插件不报 `used`，magpie 就照文字显示。
 - 「读取本机科搭令牌」认 `CODAR_HOME`：App 认它（`codar config path` 会答 `$CODAR_HOME/config.json`），所以插件读的就是 App 写的那份文件；没设时用上面的主目录。
 - 科搭自己的网关出过短时故障（模型目录对所有客户端都 500，桌面端也一样）；这种情况下插件保留卡片上的点数，只丢掉读不到的部分。

@@ -61,8 +61,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   is a one-time campaign claim, not a daily check-in, and the plugin only
   reports the activities that are running.
 - **It does not read or write the desktop app's config file**, except for the
-  "read from this machine" sign-in, which reads `~/.codar/config.json` once
-  (read only) and keeps the token in magpie's own `plugin-auth.json`.
+  "read from this machine" sign-in, which reads the app's config once
+  (read only, `~/.codar/config.json` or `$CODAR_HOME/config.json`) and keeps
+  the token in magpie's own `plugin-auth.json`.
 - **It does not convert prices.** Codar lists prices in CNY per million
   tokens and magpie's cost column is US dollars, so the plugin hands over no
   price of its own rather than inventing an exchange rate. magpie still
@@ -106,10 +107,11 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   known, with the figure left and no share invented. magpie versions before
   the one that reads a window's `balance` show this row as plain text and
   keep saying the account is unknown; the plugin is safe either way.
-- A free-model activity is drawn only while the vendor says it is running
-  (`status: "active"` and `free_until` in the future). It is `aside` — using
-  it up only sends those models back to points, it doesn't stop the account —
-  and carries `amount`/`limit` only when the vendor states a total
+- A free-model activity is drawn by the vendor app's own rule — `free_until`
+  in the future, and a `remaining_quota` that isn't spent — not by its
+  `status` field, which the app doesn't read. It is `aside` — using it up
+  only sends those models back to points, it doesn't stop the account — and
+  carries `amount`/`limit` only when the vendor states a total
   (`user_quota_limit`); an unlimited activity shows as its text.
 - The daily check-in is a text row, not a percentage: a check-in is not an
   allowance that runs out, so the plugin sends no `used` and magpie shows
