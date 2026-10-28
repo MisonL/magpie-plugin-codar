@@ -87,6 +87,7 @@ test("check-in claims, reports the points it added, and reads the balance after"
 
 test("already claimed today is `done`, with when to come back", async () => {
   const p = await CodarPlugin()
+  const before = Date.now()
   const r = await withFetch(
     {
       "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
@@ -96,6 +97,20 @@ test("already claimed today is `done`, with when to come back", async () => {
   )
   assert.equal(r.outcome, "done")
   assert.match(r.message, /1 小时/)
+  // until is magpie 0.1.1862's field: when this answer stops holding. Codar's
+  // day is a rolling 24 hours, so it is exactly retry_after from now — said,
+  // magpie stops re-asking a done account every 30 minutes before noon.
+  assert.ok(r.until >= before + 3600 * 1000 && r.until <= Date.now() + 3600 * 1000, "the answer holds until the vendor's own next claim time")
+
+  const noWait = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(noWait.outcome, "done")
+  assert.equal(noWait.until, undefined, "a vendor that names no time gets no invented until")
 })
 
 test("a 401 from the sign-in endpoint is said as an expired sign-in", async () => {

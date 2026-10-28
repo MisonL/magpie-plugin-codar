@@ -8,7 +8,7 @@
 |---|---|
 | `config` / `provider` | 增加一个 `codar` 供应商，带科搭的模型表（16 个：DeepSeek、GLM、GPT、Claude 各系）。表是从 App 自己的目录里取的，登录后还会从 `GET /v1/codar/models` 刷新。 |
 | `auth.methods` | 两种登录：「读取本机科搭令牌」（keyless，插件自己去读 `~/.codar/config.json`，只读）和「科搭访问令牌」粘贴。 |
-| `auth.checkin` | 每天 `POST /v1/daily-sign` 一次。返回能区分「本次领到」和「今天已经领过」，并给出距下次可领的时间。 |
+| `auth.checkin` | 每天 `POST /v1/daily-sign` 一次。返回能区分「本次领到」和「今天已经领过」，并给出距下次可领的时间——含 `until`（magpie ≥ 0.1.1862）：科搭是滚动 24 小时，magpie 便正好到点再问，而不是中午前每 30 分钟重问一遍。 |
 | `auth.usage` | 点数（`/v1/gettoken`：通用点数 + Agent 点数）、今天签到状态、还在进行中的免费模型活动及其到期时间。三处读取并行发出。点数同时作为钱包读数报出，路由页便有这个账号的数目可看，而不是「剩余额度未知」。 |
 | `chat.headers` | 只对 `codar` 自己的请求发和桌面端一样的 `User-Agent`（这个钩子对所有供应商的请求都会被调用，插件按供应商 id 自筛）。 |
 

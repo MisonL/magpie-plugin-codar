@@ -459,8 +459,17 @@ export async function CodarPlugin(input) {
           return { outcome: "claimed", credit, message: signMessage(r, token) || "签到成功" }
         }
         if (code === 400 && /24\s*小时|仅可领取一次/.test(signMessage(r, token))) {
-          const wait = humanSecs(r?.data?.retry_after)
-          return { outcome: "done", message: `今天已领过${r?.data?.retry_after ? `，${wait}后可再领` : ""}` }
+          const retry = Number(r?.data?.retry_after)
+          const wait = humanSecs(retry)
+          // until 是 magpie 0.1.1862 起的契约：签到答案什么时候失效、下次
+          // 何时该再问。科搭是滚动 24 小时，retry_after 正好就是那一刻；
+          // 报上去以后 magpie 不会在中午前每 30 分钟重问一遍（每次都是
+          // 一次签到 + 两次点数读取）。旧宿主不读这个字段，多给无碍。
+          return {
+            outcome: "done",
+            message: `今天已领过${retry > 0 ? `，${wait}后可再领` : ""}`,
+            ...(Number.isFinite(retry) && retry > 0 ? { until: Date.now() + retry * 1000 } : {}),
+          }
         }
         if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
         return { outcome: "failed", message: signMessage(r, token) || `签到失败（code ${code || "?"}）` }
