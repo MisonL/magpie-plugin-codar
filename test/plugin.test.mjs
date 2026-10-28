@@ -862,7 +862,7 @@ test("usage with no token is an error, not a zero", async () => {
   assert.match(u2.error, /没有账号名/)
   // a key that is there but cannot go in a header says so, as check-in does:
   // "sign in again" would send the user to the wrong place
-  const broken = await p.auth.usage(async () => ({ type: "api", key: "eyJ​abc" }))
+  const broken = await p.auth.usage(async () => ({ type: "api", key: "eyJ\u200Babc" }))
   assert.match(broken.error, /无法识别/)
 })
 
