@@ -9,9 +9,9 @@ the usage card.
 
 | Hook | What it does |
 |---|---|
-| `config` / `provider` | Adds a `codar` provider with Codar's model list (16 models: DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
+| `config` / `provider` | Adds a `codar` provider with Codar's model list (16 models: the `auto` router plus DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
 | `auth.methods` | Two ways to sign in: "读取本机科搭令牌" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the "科搭访问令牌". |
-| `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1862), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. |
+| `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1795), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. |
 | `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". |
 | `chat.headers` | Sends the desktop client's `User-Agent` on Codar's own requests, so the gateway sees the app's traffic shape. The hook runs for every provider's requests, so it filters by provider id and leaves the others alone. |
 
@@ -25,7 +25,7 @@ desktop app uses.
 Codar signs in with a JWT and keeps it in its own config file:
 
 - macOS / Linux: `~/.codar/config.json`
-- Windows: `%USERPROFILE%\.codar\config.json`
+- Windows: `%USERPROFILE%\.codar\config.json` (inferred from the app's platform convention; only measured on macOS)
 - or `$CODAR_HOME/config.json`, when `CODAR_HOME` is set: the app honours it
   (`codar config path` says where its file is), and so does this plugin
 
@@ -48,7 +48,8 @@ Codar once to refresh it there, then sign in again.
 ## Install
 
 ```bash
-magpie plugin add github:MisonL/magpie-plugin-codar
+magpie plugin add "$PWD"       # not published yet; install from this folder
+# magpie plugin add github:MisonL/magpie-plugin-codar   # once it is
 magpie plugin login codar     # pick "读取本机科搭令牌", or paste the token
 ```
 
@@ -67,9 +68,10 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 - **It does not convert prices.** Codar lists prices in CNY per million
   tokens and magpie's cost column is US dollars, so the plugin hands over no
   price of its own rather than inventing an exchange rate. magpie still
-  prices some models by what models.dev says their makers charge; vendor-
-  suffixed ids such as `claude-opus-5-kiro` do not. Set a per-model price
-  in magpie to override any of them.
+  prices models by what models.dev says their makers charge; a vendor-suffixed
+  id such as `claude-opus-5-kiro` is not in models.dev, but magpie prices it
+  by the `served` model the vendor's answer names (`claude-opus-5`). Set a
+  per-model price in magpie to override any of them.
 
 ## Notes
 
@@ -81,9 +83,15 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 - magpie runs every plugin's `chat.headers` hook for every provider's
   requests, not just the plugin's own; this one checks the provider id and
   only touches `codar` requests, leaving other providers' traffic alone.
-- The provider is named 科搭 Codar only while it has no name of its own: the
-  `config` hook fills that name in when it is missing and never writes it over
-  one you set in magpie, so a rename survives restarts.
+- The provider is named 科搭 Codar only while it has no name of its own, and
+  the provider-level `api`/`npm` default to Codar's gateway the same way: the
+  `config` hook fills each in only when it is missing and never writes over a
+  value you set — a rename, or an `api` pointed at your own proxy, survives
+  restarts. A single model's own settings work the same way.
+- When the token has run out the plugin asks the vendor nothing: the model
+  list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
+  back — magpie marks that only after it really tried and failed. The card
+  says to sign in again.
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
   embedded in `catalog.mjs` and magpie marks the list as fallen back. Claude
   models keep the Anthropic protocol on that list too: each model carries its
@@ -99,8 +107,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   The vendor publishes no concurrency number anywhere today — not in
   `/v1/codar/models`, not in `/api/pricing`, and the 429's own body carries
   only `retry-after` — so 3 is what was measured. If the catalog ever
-  carries a `max_concurrency`, the models hook picks it up and the declared
-  value follows on the next provider build, without a plugin release.
+  carries a `max_concurrency` (an integer; a fractional one is ignored), the
+  models hook picks it up and the declared value follows on the next provider
+  build, without a plugin release.
 - The points are also reported as one window with a `balance` (magpie #3950):
   a card with only `aside` rows tells routing nothing, so magpie wrote
   "what's left not known yet" beside the account. A wallet reading makes it

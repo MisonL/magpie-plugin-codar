@@ -1,7 +1,9 @@
 // catalog is Codar's model list as its own client keeps it: the answer to
-// GET /v1/codar/models, reduced to what magpie needs, kept as the list the
-// provider has before the vendor is asked (and when it cannot be reached).
-// Regenerate it when Codar adds models; `provider.models` refreshes it live.
+// GET /v1/codar/models, reduced to what magpie reads (id, name, context,
+// modalities, protocol, reasoning) — the vendor's prices stay out of it, as
+// the plugin reports none (see README). Kept as the list the provider has
+// before the vendor is asked (and when it cannot be reached). Regenerate it
+// when Codar adds models; `provider.models` refreshes it live.
 export const CATALOG = [
   {
     "id": "auto",
@@ -15,15 +17,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.20x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 2.0,
-      "output": 8.0,
-      "cached_input": 0.04
-    }
+    "reasoning": true
   },
   {
     "id": "claude-opus-5",
@@ -36,15 +30,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "anthropic_messages",
-    "reasoning": true,
-    "rate": "1.50x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 12.5,
-      "output": 62.5,
-      "cached_input": 1.25
-    }
+    "reasoning": true
   },
   {
     "id": "claude-opus-5-5",
@@ -57,15 +43,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "anthropic_messages",
-    "reasoning": true,
-    "rate": "1.20x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 10.0,
-      "output": 50.0,
-      "cached_input": 0.5
-    }
+    "reasoning": true
   },
   {
     "id": "claude-opus-5-5-kiro",
@@ -78,15 +56,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "anthropic_messages",
-    "reasoning": true,
-    "rate": "0.48x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 4.0,
-      "output": 20.0,
-      "cached_input": 0.2
-    }
+    "reasoning": true
   },
   {
     "id": "claude-opus-5-kiro",
@@ -99,15 +69,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "anthropic_messages",
-    "reasoning": true,
-    "rate": "0.60x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 5.0,
-      "output": 25.0,
-      "cached_input": 0.5
-    }
+    "reasoning": true
   },
   {
     "id": "claude-sonnet-5",
@@ -120,15 +82,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "anthropic_messages",
-    "reasoning": true,
-    "rate": "0.60x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 5.0,
-      "output": 25.0,
-      "cached_input": 0.5
-    }
+    "reasoning": true
   },
   {
     "id": "claude-sonnet-5-kiro",
@@ -141,15 +95,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "anthropic_messages",
-    "reasoning": true,
-    "rate": "0.24x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 2.0,
-      "output": 10.0,
-      "cached_input": 0.2
-    }
+    "reasoning": true
   },
   {
     "id": "deepseek-v4-flash",
@@ -163,15 +109,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.20x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 2.0,
-      "output": 8.0,
-      "cached_input": 0.04
-    }
+    "reasoning": true
   },
   {
     "id": "deepseek-v4-pro",
@@ -184,15 +122,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.72x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 9.0,
-      "output": 27.0,
-      "cached_input": 0.3
-    }
+    "reasoning": true
   },
   {
     "id": "deepseek-v4.1-flash",
@@ -206,15 +136,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.20x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 2.0,
-      "output": 8.0,
-      "cached_input": 0.04
-    }
+    "reasoning": true
   },
   {
     "id": "glm-5.2",
@@ -227,15 +149,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.72x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 8.0,
-      "output": 28.0,
-      "cached_input": 2.0
-    }
+    "reasoning": true
   },
   {
     "id": "glm-5.3",
@@ -248,15 +162,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.72x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 8.0,
-      "output": 28.0,
-      "cached_input": 2.0
-    }
+    "reasoning": true
   },
   {
     "id": "glm-5.3-flash",
@@ -270,15 +176,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.07x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 0.8,
-      "output": 2.8,
-      "cached_input": 0.23
-    }
+    "reasoning": true
   },
   {
     "id": "gpt-5.6-sol",
@@ -291,15 +189,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.56x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 4.0,
-      "output": 24.0,
-      "cached_input": 0.4
-    }
+    "reasoning": true
   },
   {
     "id": "gpt-6-astra",
@@ -312,15 +202,7 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.74x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 6.2,
-      "output": 31.0,
-      "cached_input": 0.62
-    }
+    "reasoning": true
   },
   {
     "id": "gpt-6-sol",
@@ -333,14 +215,6 @@ export const CATALOG = [
       "text"
     ],
     "protocol": "openai_chat_completions",
-    "reasoning": true,
-    "rate": "0.19x",
-    "pricing": {
-      "currency": "CNY",
-      "unit": "per_million_tokens",
-      "input": 1.6,
-      "output": 8.0,
-      "cached_input": 0.16
-    }
+    "reasoning": true
   }
 ]
