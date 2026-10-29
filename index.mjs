@@ -52,12 +52,20 @@ const TIMEOUT_MS = 8000
 const CHECKIN_BUDGET_MS = 25 * 1000
 const USAGE_BUDGET_MS = 18 * 1000
 
-// MAX_TIME_MS is the largest time a host can turn into an ISO string: past
-// Date's own limit toISOString() throws "Invalid time value", and a vendor's
-// retry_after is a number nothing bounds. A time past it is clamped, not
-// dropped: the answer still holds (it just holds longer than any calendar).
-const MAX_TIME_MS = 8.64e15
-const safeTime = (ms) => Math.min(Math.max(0, Number(ms) || 0), MAX_TIME_MS)
+// MAX_TIME_MS is the largest time that survives the whole trip to magpie.
+// Two ceilings matter, and the lower one wins: JS's Date.toISOString() throws
+// past 8.64e15 ("Invalid time value"), and magpie's own side parses the ISO
+// string with Go's RFC3339 layout, which has four year digits — a "+275760-…"
+// string parses to zero and the time is dropped in silence. 253402300799999
+// is 9999-12-31T23:59:59.999Z, the last instant both accept. A vendor's
+// retry_after is a number nothing bounds, so a time past it is clamped here
+// rather than dropped downstream.
+const MAX_TIME_MS = 253402300799999
+const safeTime = (ms) => {
+  const n = Number(ms)
+  if (!isFinite(n) || n <= 0) return 0
+  return Math.min(n, MAX_TIME_MS)
+}
 
 // MAX_MODELS is how many models one vendor catalog may bring back. The host
 // passes a hook's answer to Go as a single JSON line and kills the whole
@@ -155,7 +163,7 @@ const cleanText = (s) => String(s).replace(controlChars, " ").replace(/\s{2,}/g,
 // requires two dots; we allow 0–2 extra segments for safety. Prose beginning
 // with eyJ would also be cut, but that's acceptable in an error message where
 // failing closed (removing more rather than less) matters.
-const jwtShape = /eyJ[\w-]*(?:\s[\w-]+)*(?:\s*\.\s*[\w-]+(?:\s[\w-]+)*){0,2}/g
+const jwtShape = /eyJ[\w-]*(?:\s+[\w-]+)*(?:\s*\.\s*[\w-]+(?:\s+[\w-]+)*){0,2}/g
 
 // configPath is where the Codar app keeps its own config. The app takes
 // CODAR_HOME over the home directory when it is set (its sidecar's
@@ -230,9 +238,13 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
   }
 }
 
-// humanSecs says a number of seconds the way a card wants it.
+// humanSecs says a number of seconds the way a card wants it. A number no
+// calendar can say (a vendor's Infinity, a NaN) is said as nothing rather
+// than as "Infinity 天": the caller leaves it out.
 function humanSecs(secs) {
-  const n = Math.max(0, Math.round(Number(secs) || 0))
+  const raw = Number(secs)
+  if (!isFinite(raw)) return ""
+  const n = Math.max(0, Math.round(raw))
   if (n < 60) return `${n} 秒`
   const m = Math.round(n / 60)
   if (m < 60) return `${m} 分钟`
@@ -272,6 +284,14 @@ const pointsOf = async (token, username, opts) => {
   return { general, agent }
 }
 
+// contextOf is a vendor's context window as a non-negative whole number.
+// A negative or an infinite one is not a size anyone can plan with, and it
+// would reach magpie's list as written, so it becomes "not stated".
+function contextOf(v) {
+  const n = Number(v)
+  return isFinite(n) && n > 0 ? Math.floor(n) : 0
+}
+
 // modelOf is one catalog record as magpie's provider list has it.
 function modelOf(m) {
   const anthropic = m?.protocol === "anthropic_messages"
@@ -291,7 +311,7 @@ function modelOf(m) {
     // be fetched.
     provider: { npm },
     api: { id: m.id, url: `${API}/v1`, npm },
-    limit: { context: Number(m.context) || 0, output: 0 },
+    limit: { context: contextOf(m.context), output: 0 },
     // The vendor prices in CNY per million tokens; magpie's cost column is
     // US dollars, and inventing an exchange rate here would put a wrong
     // number on the Usage page. Left at 0, which magpie shows as unpriced
@@ -333,7 +353,7 @@ function catalogOf(body) {
     out.push({
       id,
       name: said || id,
-      context: Number(m.context_window) || 0,
+      context: contextOf(m.context_window),
       input: Array.isArray(m.input_modalities) ? m.input_modalities : ["text"],
       output: Array.isArray(m.output_modalities) ? m.output_modalities : ["text"],
       protocol: m.protocol?.type === "anthropic_messages" ? "anthropic_messages" : "openai_chat_completions",
@@ -369,7 +389,10 @@ const runningActivities = (body) => {
 const publishedConcurrency = (body) => {
   const nums = []
   const take = (v) => {
-    const n = Number(v)
+    // a number, or a string that says one: Number(true) is 1 and Number([5])
+    // is 5, and a vendor field of the wrong type would otherwise silently
+    // pin the whole account to one request at a time.
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN
     if (Number.isInteger(n) && n > 0 && n <= 1000) nums.push(n)
   }
   const list = body?.catalog?.data ?? body?.data
@@ -529,7 +552,7 @@ export async function CodarPlugin(input) {
           const hold = Number.isFinite(retry) && retry > 0 ? safeTime(Date.now() + retry * 1000) : safeTime(Date.now() + 30 * 60 * 1000)
           return {
             outcome: "done",
-            message: `今天已领过${retry > 0 ? `，${wait}后可再领` : ""}`,
+            message: `今天已领过${wait ? `，${wait}后可再领` : ""}`,
             ...(hold ? { until: hold } : {}),
           }
         }
@@ -628,10 +651,12 @@ export async function CodarPlugin(input) {
           // 报太多活动时只取前几个，不能让数据把宿主的 32 MiB 行撑爆。
           for (const a of running.slice(0, MAX_ACTIVITY_WINDOWS)) {
             const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string" && x).map(cleanText) : []
-            const cap = typeof a.user_quota_limit === "number" && a.user_quota_limit > 0 ? a.user_quota_limit : null
+            // 两个数都要有限：1e999 是合法的 JSON，读出来却是 Infinity，
+            // 拿去算份额会得到 NaN，卡片上就写「已用 Infinity / Infinity」。
+            const cap = typeof a.user_quota_limit === "number" && isFinite(a.user_quota_limit) && a.user_quota_limit > 0 ? a.user_quota_limit : null
             const left = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
             const used = cap != null && left != null ? Math.max(0, cap - left) : null
-            const share = used != null ? Math.min(100, Math.round((used / cap) * 100)) : 0
+            const share = used != null && cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0
             windows.push({
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
               used: share,
@@ -703,16 +728,25 @@ export async function CodarPlugin(input) {
     // 悄悄撤销。供应商级的 npm/api 同理：用户可能把它们指向自己的代理，覆盖
     // 掉等于每次启动都把人家的设置改回去。值不是对象时当作没有，其余字段照旧
     // 原样带过。
+    //
+    // models 按 id 逐条合并，不是整条替换：用户只改一个模型的某个字段时，
+    // 剩下的字段（尤其是 provider.npm）还得在——少了它，宿主给这个模型解析
+    // 出供应商级的 openai-compatible，Claude 模型就按 Chat 协议发了。
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] && typeof config.provider[ID] === "object" ? config.provider[ID] : {}
       const models = modelsOf(CATALOG)
+      const own = was.models && typeof was.models === "object" ? was.models : {}
+      const merged = { ...models }
+      for (const [id, m] of Object.entries(own)) {
+        merged[id] = m && typeof m === "object" && models[id] ? { ...models[id], ...m } : m
+      }
       config.provider[ID] = {
         ...was,
         name: typeof was.name === "string" && was.name ? was.name : "科搭 Codar",
         npm: typeof was.npm === "string" && was.npm ? was.npm : OPENAI,
         api: typeof was.api === "string" && was.api ? was.api : `${API}/v1`,
-        models: { ...models, ...(was.models ?? {}) },
+        models: merged,
       }
     },
   }

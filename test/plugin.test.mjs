@@ -10,7 +10,7 @@ import { join } from "node:path"
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 
-const { usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf, request, appToken, configPath } = testables
+const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf, request, appToken, configPath } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -63,6 +63,19 @@ test("a token's claims give the account name and the expiry", () => {
   assert.ok(expiresAt(TOKEN) > Date.now())
   assert.equal(payloadOf("not a jwt"), null)
   assert.equal(usernameOf("garbage"), "")
+})
+
+// A key with anything but visible ASCII would make fetch throw with the whole
+// value in the message ("…is an invalid header value"), which magpie logs and
+// shows on the card. tokenOf refuses it before it can be echoed.
+test("only a key made of visible ASCII is one we can send", () => {
+  assert.equal(tokenOf({ type: "api", key: "  eyJabc.def.ghi  " }), "eyJabc.def.ghi")
+  assert.equal(tokenOf({ type: "api", key: "eyJ\u200babc" }), "")
+  assert.equal(tokenOf({ type: "api", key: "a\nb" }), "")
+  assert.equal(tokenOf({ type: "api", key: "a\u00e9b" }), "")
+  assert.equal(tokenOf({ type: "api", key: "   " }), "")
+  assert.equal(tokenOf({ type: "oauth", key: "eyJabc.def.ghi" }), "")
+  assert.equal(tokenOf(null), "")
 })
 
 test("an expired token is not sent, and says to sign in", async () => {
@@ -131,10 +144,12 @@ test("already claimed today is `done`, with when to come back", async () => {
   assert.ok(noWait.until > Date.now() && noWait.until <= Date.now() + 31 * 60 * 1000, "a vendor that names no time gets a bounded hold, not the whole day")
 })
 
-test("a vendor number past Date's range is clamped, not handed to the host", async () => {
-  // host.js's checkinOf does new Date(t).toISOString(), which throws
-  // RangeError for t past 8.64e15 — the whole answer would be a host-side
-  // exception instead of "already claimed".
+test("a vendor number past the range magpie can read is clamped, not handed on", async () => {
+  // Two ceilings: host.js's checkinOf does new Date(t).toISOString(), which
+  // throws RangeError past 8.64e15; and magpie's Go side parses the ISO
+  // string with RFC3339's four-digit year, so a "+275760-…" string parses to
+  // zero and the time is dropped — "done with no until" then settles the
+  // whole day. The clamp has to sit under both.
   const p = await CodarPlugin()
   for (const retry_after of [1e13, 1e15, Number.MAX_SAFE_INTEGER]) {
     const r = await withFetch(
@@ -146,9 +161,26 @@ test("a vendor number past Date's range is clamped, not handed to the host", asy
     )
     assert.equal(r.outcome, "done")
     assert.ok(Number.isFinite(r.until), `retry_after ${retry_after} still gives a finite until`)
+    const iso = new Date(r.until).toISOString()
     assert.doesNotThrow(() => new Date(r.until).toISOString(), "and one the host can turn into an ISO string")
-    assert.ok(new Date(r.until).toISOString().startsWith("+"), "clamped to the end of what a date can say")
+    assert.match(iso, /^\d{4}-\d{2}-\d{2}T/, "a four-digit year, as Go's RFC3339 parse needs")
+    assert.ok(r.until <= 253402300799999, "clamped under the last instant both ends can read")
   }
+
+  // a vendor number that is not finite at all still yields a usable answer
+  const inf = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      // 1e999 is valid JSON and parses to Infinity: withFetch would re-encode
+      // it as null, so the answer is handed over as raw text
+      "/v1/daily-sign": () => new Response('{"code":400,"message":"24小时内仅可领取一次","data":{"retry_after":1e999}}', { status: 200, headers: { "Content-Type": "application/json" } }),
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(inf.outcome, "done")
+  assert.match(inf.message, /今天已领过/, "no \"Infinity 天\" on the card")
+  assert.doesNotMatch(inf.message, /Infinity/)
+  assert.ok(Number.isFinite(inf.until), "and a usable until")
 })
 
 test("a 401 from the sign-in endpoint is said as an expired sign-in", async () => {
@@ -1213,8 +1245,8 @@ test("a payload-only or space-split echo of the token is still cut", async () =>
 test("a vendor string with a bidi override or a zero-width space is cleaned", () => {
   const list = catalogOf({
     data: [
-      { id: "ok", display_name: "Fine‮Name​", protocol: { type: "openai_chat_completions" } },
-      { id: "bad‮id", display_name: "Bad", protocol: { type: "openai_chat_completions" } },
+      { id: "ok", display_name: "Fine\u202eName\u200b", protocol: { type: "openai_chat_completions" } },
+      { id: "bad\u202eid", display_name: "Bad", protocol: { type: "openai_chat_completions" } },
     ],
   })
   assert.deepEqual(list.map((m) => m.id), ["ok"], "an id with a bidi override in it is not an id a request can ask for")
@@ -1223,7 +1255,7 @@ test("a vendor string with a bidi override or a zero-width space is cleaned", ()
 
 test("the usage account name is cleaned like every other vendor string", async () => {
   const p = await CodarPlugin()
-  const odd = mkToken({ username: "user‮_1", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const odd = mkToken({ username: "user\u202e_1", exp: Math.floor(Date.now() / 1000) + 3600 })
   const u = await withFetch(
     {
       "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
@@ -1272,4 +1304,97 @@ test("a vendor answering with a pile of activities is cut to what a card holds",
   const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
   assert.equal(free.length, 20, "twenty windows, not five hundred")
   assert.ok(Buffer.byteLength(JSON.stringify(u)) < 32 * 1024 * 1024)
+})
+
+test("a token split by two spaces or a CRLF is cut like any other", async () => {
+  // The shape used to allow one whitespace character between chunks, so a
+  // double space — or a CRLF, which controlChars turns into exactly two
+  // spaces — left the payload tail and the whole signature on the card.
+  const jwt = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const [, payload, sig] = jwt.split(".")
+  const p = await CodarPlugin()
+  for (const echoed of [`${jwt.slice(0, 45)}  ${jwt.slice(45)}`, `${jwt.slice(0, 30)}\r\n${jwt.slice(30)}`]) {
+    const r = await p.auth.checkin(async () => {
+      throw new Error(`bad key ${echoed}`)
+    })
+    assert.doesNotMatch(r.message, new RegExp(payload.slice(0, 12)), "no payload tail reaches the card")
+    assert.doesNotMatch(r.message, new RegExp(`${sig.slice(0, 3)}`), "and no signature")
+    assert.match(r.message, /…/)
+  }
+})
+
+test("a check-in wait no number can say is left out, not said as Infinity", async () => {
+  // retry_after: 1e999 is valid JSON and parses to Infinity; "Infinity 天后
+  // 可再领" is not a thing a card should say.
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": () => new Response('{"code":400,"message":"24小时内仅可领取一次","data":{"retry_after":1e999}}', { status: 200, headers: { "Content-Type": "application/json" } }),
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "done")
+  assert.doesNotMatch(r.message, /Infinity|NaN/)
+  assert.equal(r.message, "今天已领过", "the wait is left out, the claim is still said")
+})
+
+test("an activity whose numbers are not finite says no share, not Infinity", async () => {
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": () => new Response(JSON.stringify({ code: 200, data: [{ status: "active", free_until: until, remaining_quota: 10, user_quota_limit: Infinity, model_ids: ["a"] }] }).replace("null", "1e999"), { status: 200, headers: { "Content-Type": "application/json" } }),
+    },
+    async () => p.auth.usage(auth),
+  )
+  const free = u.windows.find((w) => w.name.startsWith("免费模型"))
+  assert.ok(free, "the activity is still drawn")
+  assert.doesNotMatch(free.display, /Infinity|NaN/, "the card says a usable thing")
+  assert.equal(free.used, 0, "no share invented from numbers nobody can use")
+})
+
+test("a max_concurrency of the wrong type does not pin the account to one at a time", async () => {
+  const p = await CodarPlugin()
+  await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: [{ id: "x", max_concurrency: true }] } } },
+    async () => p.provider.models({ models: {} }, { auth: await auth() }),
+  )
+  assert.equal(p.auth.maxConcurrency, 3, "a boolean is not a number of requests")
+  const q = await CodarPlugin()
+  await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: [{ id: "x", max_concurrency: 7 }] } } },
+    async () => q.provider.models({ models: {} }, { auth: await auth() }),
+  )
+  assert.equal(q.auth.maxConcurrency, 7, "a real number still is")
+})
+
+test("a context window that is not a positive number is read as not stated", () => {
+  const list = catalogOf({
+    data: [
+      { id: "neg", context_window: -5, protocol: { type: "openai_chat_completions" } },
+      { id: "inf", context_window: 1e999, protocol: { type: "openai_chat_completions" } },
+      { id: "ok", context_window: 200000, protocol: { type: "openai_chat_completions" } },
+    ],
+  })
+  const by = (id) => list.find((m) => m.id === id)
+  assert.equal(by("neg").context, 0, "a negative window is not a size")
+  assert.equal(by("inf").context, 0, "nor is an infinite one")
+  assert.equal(by("ok").context, 200000)
+  assert.equal(modelOf({ id: "neg", context: -5 }).limit.context, 0, "and the same on the model path")
+})
+
+test("the config hook merges a user's model override field by field", async () => {
+  // A shallow merge replaced the whole entry: a user who only set a model's
+  // name lost provider.npm with it, and a Claude model went out over the
+  // chat protocol.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: { models: { "claude-opus-5": { name: "我的名字" } } } } }
+  await p.config(config)
+  const m = config.provider.codar.models["claude-opus-5"]
+  assert.equal(m.name, "我的名字", "the user's field wins")
+  assert.equal(m.provider?.npm, "@ai-sdk/anthropic", "and the catalog's own fields stay")
+  assert.ok(m.api?.url, "including the api entry")
 })
