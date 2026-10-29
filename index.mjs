@@ -67,6 +67,21 @@ const safeTime = (ms) => {
   return Math.min(n, MAX_TIME_MS)
 }
 
+// MAX_WAIT_SECS is the longest wait a card can say: a wait past the last
+// time magpie can read (year 9999) would be clamped to it anyway, and
+// "1.1574074074074072e+303 天后" is not a thing a card says.
+const MAX_WAIT_SECS = MAX_TIME_MS / 1000
+
+// sayableSecs is a vendor's number of seconds when it is one a card can say:
+// finite, positive, and inside the calendar. Anything else is 0 — "not
+// stated" — so callers can decide with one check whether they have a time at
+// all. The bound is what keeps `secs * 1000` from overflowing to Infinity,
+// which safeTime would turn into 0 and a host would draw as 1970-01-01.
+const sayableSecs = (v) => {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 && n <= MAX_WAIT_SECS ? n : 0
+}
+
 // MAX_MODELS is how many models one vendor catalog may bring back. The host
 // passes a hook's answer to Go as a single JSON line and kills the whole
 // plugin host — every plugin in it — when that line passes 32 MiB
@@ -239,11 +254,12 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
 }
 
 // humanSecs says a number of seconds the way a card wants it. A number no
-// calendar can say (a vendor's Infinity, a NaN) is said as nothing rather
-// than as "Infinity 天": the caller leaves it out.
+// calendar can say (a vendor's Infinity, a NaN, a wait past year 9999) is
+// said as nothing rather than as "Infinity 天" or "1.15e+303 天": the caller
+// leaves it out.
 function humanSecs(secs) {
   const raw = Number(secs)
-  if (!isFinite(raw)) return ""
+  if (!isFinite(raw) || raw > MAX_WAIT_SECS) return ""
   const n = Math.max(0, Math.round(raw))
   if (n < 60) return `${n} 秒`
   const m = Math.round(n / 60)
@@ -292,8 +308,25 @@ function contextOf(v) {
   return isFinite(n) && n > 0 ? Math.floor(n) : 0
 }
 
-// modelOf is one catalog record as magpie's provider list has it.
-function modelOf(m) {
+// apiBase is where this provider's requests go: the address the host already
+// resolved for it — the user's own setting when they made one, else the
+// vendor's gateway. host.js builds a config model's api.url as
+// `m.provider?.api ?? cfg.api ?? …`, so a provider handed to the models hook
+// already carries the user's choice on its own api and on each model's; the
+// hook has to keep it, because magpie picks the base as
+// `firstOf(o.BaseURL, m.URL, pp.API, …)` — a model-level URL wins over the
+// provider's, so a hard-coded gateway on every model sends a user's own
+// proxy nowhere the moment a live refresh succeeds.
+const apiBase = (provider, id) => {
+  const perModel = id ? provider?.models?.[id]?.api?.url : ""
+  const said = typeof perModel === "string" && perModel.trim() ? perModel : provider?.api
+  return typeof said === "string" && said.trim() ? said.trim().replace(/\/+$/, "") : `${API}/v1`
+}
+
+// modelOf is one catalog record as magpie's provider list has it. `base` is
+// where its requests go (apiBase), the vendor's gateway when nothing else
+// says otherwise.
+function modelOf(m, base = `${API}/v1`) {
   const anthropic = m?.protocol === "anthropic_messages"
   const npm = anthropic ? CLAUDE : OPENAI
   const reasons = Boolean(m?.reasoning)
@@ -310,7 +343,7 @@ function modelOf(m) {
     // lost the anthropic protocol whenever the vendor's catalog could not
     // be fetched.
     provider: { npm },
-    api: { id: m.id, url: `${API}/v1`, npm },
+    api: { id: m.id, url: base, npm },
     limit: { context: contextOf(m.context), output: 0 },
     // The vendor prices in CNY per million tokens; magpie's cost column is
     // US dollars, and inventing an exchange rate here would put a wrong
@@ -333,7 +366,7 @@ function modelOf(m) {
   }
 }
 
-const modelsOf = (list) => Object.fromEntries(list.map((m) => [m.id, modelOf(m)]))
+const modelsOf = (list, base) => Object.fromEntries(list.map((m) => [m.id, modelOf(m, typeof base === "function" ? base(m.id) : base)]))
 
 // catalogOf is the vendor's answer as our catalog records: the same fields
 // catalog.mjs keeps, so both paths build the same entries. Vendor text is
@@ -549,10 +582,18 @@ export async function CodarPlugin(input) {
           // 漏掉下一次可领。给一个 30 分钟的保质期：这只是「这个答案我们
           // 信多久」，不是替厂商编一个可领时刻；最坏也就是回到 until 之前
           // 的每 30 分钟问一次。
-          const hold = Number.isFinite(retry) && retry > 0 ? safeTime(Date.now() + retry * 1000) : safeTime(Date.now() + 30 * 60 * 1000)
+          // 秒数先说得出、再说信多久：一个日历说不出的数（1e308 有限、
+          // 大于 0，乘 1000 却溢出成 Infinity）不是「可信的时刻」，和厂商
+          // 没说一样，落到 30 分钟的保质期；夹到年 9999 会把这一天永远
+          // 结清，比 30 分钟糟得多。
+          const waitSecs = sayableSecs(retry) || 30 * 60
+          const hold = safeTime(Date.now() + waitSecs * 1000)
           return {
             outcome: "done",
             message: `今天已领过${wait ? `，${wait}后可再领` : ""}`,
+            // hold 恒为非零（上面已夹过），留着这个条件是给读的人看：这条
+            // 路径上「没有 until」是不可接受的，真出现就不带，而不是报 0
+            // 让宿主画成 1970 年。
             ...(hold ? { until: hold } : {}),
           }
         }
@@ -605,11 +646,15 @@ export async function CodarPlugin(input) {
           // 只认真正的 true：厂商哪天把它写成字符串 "false"，Boolean("false")
           // 是 true，卡片会把没领的说成已领。
           const signed = st.data.isSigned === true
-          const retry = Number(st.data.retry_after)
-          const wait = Number.isFinite(retry) && retry > 0 ? humanSecs(retry) : ""
+          // 秒数先说得出：说不出的（没给、给了 0、或大到日历写不出——
+          // retry_after 1e308 乘 1000 溢出成 Infinity，safeTime 给 0）就
+          // 没有可报的时刻，文案和 resetsAt 一起省掉。宿主的 when(0) 会把
+          // 0 画成 1970-01-01，而不是当成「没说」。
+          const secs = sayableSecs(st.data.retry_after)
+          const wait = secs ? humanSecs(secs) : ""
           windows.push({
             name: "每日签到",
-            ...(wait ? { resetsAt: safeTime(Date.now() + retry * 1000) } : {}),
+            ...(secs ? { resetsAt: safeTime(Date.now() + secs * 1000) } : {}),
             display: signed ? (wait ? `今天已领，${wait}后可再领` : "今天已领") : wait ? `今天还没领，${wait}后可以领` : "今天还没领，现在可以领",
             aside: true,
           })
@@ -657,10 +702,13 @@ export async function CodarPlugin(input) {
             const left = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
             const used = cap != null && left != null ? Math.max(0, cap - left) : null
             const share = used != null && cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0
+            // 活动的结束时间（也是秒数）读不出来就不带 resetsAt：活动
+            // 本身照报——它确实在跑，只是没说何时结束。见 sayableSecs。
+            const freeUntil = safeTime(sayableSecs(a.free_until) * 1000)
             windows.push({
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
               used: share,
-              resetsAt: safeTime(a.free_until * 1000),
+              ...(freeUntil ? { resetsAt: freeUntil } : {}),
               display: left == null ? "免费使用中（不限量）" : cap == null ? `免费使用中，还剩 ${left}` : `免费使用中，已用 ${used} / ${cap}`,
               ...(used != null ? { amount: used, limit: cap } : {}),
               aside: true,
@@ -702,9 +750,11 @@ export async function CodarPlugin(input) {
           vendorConcurrency = publishedConcurrency(body)
           // 厂商的目录对自家的模型说了算；用户自己往这个供应商里加的条目
           // （内嵌目录里没有的 id）在刷新后留着，config 钩子也是这么合并的。
+          // 每个模型去哪发，沿用宿主已经解析好的地址（用户设过的 api，可能是
+          // 自建代理），见 apiBase。
           const known = new Set(CATALOG.map((m) => m.id))
           const own = Object.fromEntries(Object.entries(given).filter(([id]) => !known.has(id)))
-          return { ...own, ...modelsOf(list) }
+          return { ...own, ...modelsOf(list, (id) => apiBase(provider, id)) }
         } catch {
           return Object.assign(given, { [Symbol.for("magpie.fellBack")]: true })
         }
@@ -735,7 +785,12 @@ export async function CodarPlugin(input) {
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] && typeof config.provider[ID] === "object" ? config.provider[ID] : {}
-      const models = modelsOf(CATALOG)
+      // 每条的 api.url 写用户设过的那个地址（他自己可能指着自建代理），
+      // 否则写厂商网关：写进 config 的就是真话——宿主在那条路径上本来
+      // 也取 cfg.api（见 apiBase 的注释），这里只是不让文件里留一个与
+      // 供应商级 api 不一致的地址。
+      const api = typeof was.api === "string" && was.api ? was.api : `${API}/v1`
+      const models = modelsOf(CATALOG, api)
       const own = was.models && typeof was.models === "object" ? was.models : {}
       const merged = { ...models }
       for (const [id, m] of Object.entries(own)) {
@@ -745,7 +800,7 @@ export async function CodarPlugin(input) {
         ...was,
         name: typeof was.name === "string" && was.name ? was.name : "科搭 Codar",
         npm: typeof was.npm === "string" && was.npm ? was.npm : OPENAI,
-        api: typeof was.api === "string" && was.api ? was.api : `${API}/v1`,
+        api,
         models: merged,
       }
     },

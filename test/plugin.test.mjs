@@ -144,14 +144,20 @@ test("already claimed today is `done`, with when to come back", async () => {
   assert.ok(noWait.until > Date.now() && noWait.until <= Date.now() + 31 * 60 * 1000, "a vendor that names no time gets a bounded hold, not the whole day")
 })
 
-test("a vendor number past the range magpie can read is clamped, not handed on", async () => {
-  // Two ceilings: host.js's checkinOf does new Date(t).toISOString(), which
-  // throws RangeError past 8.64e15; and magpie's Go side parses the ISO
-  // string with RFC3339's four-digit year, so a "+275760-…" string parses to
-  // zero and the time is dropped — "done with no until" then settles the
-  // whole day. The clamp has to sit under both.
+test("a vendor wait no calendar can state gets the trust floor, not a time handed on", async () => {
+  // Two ceilings a time handed on has to sit under: host.js's checkinOf does
+  // new Date(t).toISOString(), which throws RangeError past 8.64e15; and
+  // magpie's Go side parses the ISO string with RFC3339's four-digit year, so
+  // a "+275760-…" string parses to zero and the time is dropped — "done with
+  // no until" then settles the whole day. A wait past year 9999 is one no
+  // card can say and nothing downstream can read, and 1e308 seconds is
+  // finite but overflows to Infinity once multiplied by 1000. Such a number
+  // is not a time this answer can hold on: it gets the same 30-minute trust
+  // floor as a vendor that named none, rather than a clamp to year 9999 that
+  // would settle the day forever — a rolling 24-hour window would then lose
+  // every later claim.
   const p = await CodarPlugin()
-  for (const retry_after of [1e13, 1e15, Number.MAX_SAFE_INTEGER]) {
+  for (const retry_after of [1e13, 1e15, Number.MAX_SAFE_INTEGER, 1e308]) {
     const r = await withFetch(
       {
         "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
@@ -164,8 +170,19 @@ test("a vendor number past the range magpie can read is clamped, not handed on",
     const iso = new Date(r.until).toISOString()
     assert.doesNotThrow(() => new Date(r.until).toISOString(), "and one the host can turn into an ISO string")
     assert.match(iso, /^\d{4}-\d{2}-\d{2}T/, "a four-digit year, as Go's RFC3339 parse needs")
-    assert.ok(r.until <= 253402300799999, "clamped under the last instant both ends can read")
+    assert.ok(r.until > Date.now() && r.until <= Date.now() + 31 * 60 * 1000, "the floor, not a day settled for good")
   }
+
+  // a wait that is sayable but lands past the last instant both ends read is
+  // clamped to it, not dropped
+  const near = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 253402300000 } } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(near.until, 253402300799999, "9999-12-31T23:59:59.999Z, the last instant both accept")
 
   // a vendor number that is not finite at all still yields a usable answer
   const inf = await withFetch(
@@ -462,6 +479,42 @@ test("the live list keeps models the user added, and follows the vendor for its 
   assert.equal(fresh["deepseek-v4.1-flash"], undefined, "a model the vendor dropped is gone")
 })
 
+test("the live hook keeps the base the user set, model by model", async () => {
+  // magpie picks a model's base as firstOf(o.BaseURL, m.URL, pp.API, …) — a
+  // URL written on the model wins over the provider's. The list used to carry
+  // the vendor's gateway on every model, so a provider pointed at the user's
+  // own proxy went through the vendor the moment a live refresh succeeded;
+  // the proxy held only while the config list was the one in use.
+  const p = await CodarPlugin()
+  const given = {
+    id: "codar",
+    api: "https://proxy.example/v1",
+    models: { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash" }, "https://only-this-one.example/v1") },
+  }
+  const fresh = await withFetch(
+    {
+      "/v1/codar/models": {
+        body: {
+          catalog: {
+            data: [
+              { id: "deepseek-v4.1-flash", protocol: { type: "openai_chat_completions" } },
+              { id: "new-model", protocol: { type: "openai_chat_completions" } },
+            ],
+          },
+        },
+      },
+    },
+    async () => p.provider.models(given, { auth: await auth() }),
+  )
+  assert.equal(fresh["deepseek-v4.1-flash"].api.url, "https://only-this-one.example/v1", "a model's own base wins over the provider's")
+  assert.equal(fresh["new-model"].api.url, "https://proxy.example/v1", "one without takes the provider's, not the vendor's")
+  const bare = await withFetch(
+    { "/v1/codar/models": { body: { catalog: { data: [{ id: "solo", protocol: { type: "openai_chat_completions" } }] } } } },
+    async () => p.provider.models({ id: "codar", models: {} }, { auth: await auth() }),
+  )
+  assert.equal(bare["solo"].api.url, "https://api.claw.speedai.com/v1", "with nothing set anywhere, the vendor's gateway")
+})
+
 test("the models hook hands back the list, never the provider around it", async () => {
   // host.js: `out.models = Object.fromEntries(Object.entries(next ?? {})…)` —
   // the answer is used as the model list itself. Handing back the provider
@@ -486,6 +539,20 @@ test("the config hook names the provider and lists the catalog", async () => {
   assert.equal(config.provider.codar.api, "https://api.claw.speedai.com/v1")
   assert.ok(config.provider.codar.models["deepseek-v4.1-flash"])
   assert.ok(config.provider.codar.models["claude-opus-5"], "the anthropic models are listed too")
+})
+
+test("the config hook writes the user's own base onto each model", async () => {
+  // host.js reads a config model's base as m.provider?.api ?? cfg.api — not
+  // the model's own api.url — so the proxy held on that path either way. The
+  // models the hook stores still say the address their requests will go to:
+  // a file that names the vendor's gateway under a provider pointed
+  // elsewhere is a file that lies about the next start.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: { api: "https://proxy.example/v1" } } }
+  await p.config(config)
+  assert.equal(config.provider.codar.api, "https://proxy.example/v1", "the provider keeps the user's api")
+  assert.equal(config.provider.codar.models["deepseek-v4.1-flash"].api.url, "https://proxy.example/v1", "and each model is written at it, not at the vendor's gateway")
+  assert.equal(config.provider.codar.models["claude-opus-5"].api.npm, "@ai-sdk/anthropic", "the per-model SDK is unaffected")
 })
 
 test("a model the config hook lists keeps its reasoning and its eyes", async () => {
@@ -616,6 +683,14 @@ test("humanSecs says seconds, minutes, hours and days", () => {
   assert.equal(humanSecs(3600), "1 小时")
   assert.equal(humanSecs(3600 + 1800), "1 小时 30 分钟")
   assert.equal(humanSecs(86400 * 2 + 3600), "2 天 1 小时")
+})
+
+test("a number of seconds no calendar can say is said as nothing", () => {
+  // 1e308 is finite, so every "> 0" check passed it, while ×1000 overflows to
+  // Infinity — "1.15e+303 天后可再领" is not a thing a card says.
+  assert.equal(humanSecs(Infinity), "", "an infinity is not \"Infinity 天\"")
+  assert.equal(humanSecs(1e308), "", "nor is 1e308 \"1.15e+303 天\"")
+  assert.match(humanSecs(1e11), /天/, "a long wait a calendar can still say is said")
 })
 
 test("every request carries the User-Agent the desktop app sends on that host", async () => {
@@ -1354,6 +1429,46 @@ test("an activity whose numbers are not finite says no share, not Infinity", asy
   assert.ok(free, "the activity is still drawn")
   assert.doesNotMatch(free.display, /Infinity|NaN/, "the card says a usable thing")
   assert.equal(free.used, 0, "no share invented from numbers nobody can use")
+})
+
+test("a claim row whose time no calendar can state carries no resetsAt, not 1970", async () => {
+  // host.js's when(0) is "1970-01-01T00:00:00.000Z", not "not said": a window
+  // that computes its time as 0 draws the epoch on the card. retry_after
+  // 1e308 is finite, so every "> 0" check passed it, while ×1000 overflowed
+  // to Infinity — and safeTime turns that into 0.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": () => new Response('{"code":200,"data":{"isSigned":true,"retry_after":1e308}}', { status: 200, headers: { "Content-Type": "application/json" } }),
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const sign = u.windows.find((w) => w.name === "每日签到")
+  assert.ok(sign, "the claim row is still there")
+  assert.equal("resetsAt" in sign, false, "with no time, rather than the epoch")
+  assert.equal(sign.display, "今天已领", "and a text a card can show")
+})
+
+test("an activity whose end no calendar can state carries no resetsAt, not 1970", async () => {
+  // free_until: 1e999 is valid JSON that reads as Infinity, so the activity
+  // passes the vendor app's own rule (a future free_until) but its end time
+  // cannot be written down. The row is still reported; the epoch is not.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
+      "/api/codar/activities/mine": () =>
+        new Response('{"code":200,"data":[{"status":"active","free_until":1e999,"remaining_quota":null,"model_ids":["a"]}]}', { status: 200, headers: { "Content-Type": "application/json" } }),
+    },
+    async () => p.auth.usage(auth),
+  )
+  const free = u.windows.find((w) => w.name.startsWith("免费模型"))
+  assert.ok(free, "the activity is still reported: it is running")
+  assert.equal("resetsAt" in free, false, "without a reset time the host would draw as 1970")
+  assert.equal(free.display, "免费使用中（不限量）")
 })
 
 test("a max_concurrency of the wrong type does not pin the account to one at a time", async () => {
