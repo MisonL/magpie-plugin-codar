@@ -20,19 +20,34 @@ const mkToken = (claims) => {
 const TOKEN = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 86400 })
 const auth = async () => ({ type: "api", key: TOKEN })
 
-// withFetch stubs global fetch for the duration of fn, answering by URL.
+// withFetch stubs global fetch for the duration of fn, answering by URL. A
+// route key is "METHOD /path" or just "/path": requests are routed on the
+// method and the whole URL, so a test can tell a POST to one host from a GET
+// to another — the plugin's core design divides the two hosts and the two
+// verbs, and a stub that matched on a path substring alone could not see
+// either go wrong (nor tell /v1/daily-sign from /v1/daily-sign/status).
+// A key with no method matches any method; a key starting with "http" is
+// the whole URL (host included).
 async function withFetch(routes, fn) {
   const real = globalThis.fetch
   const calls = []
+  const routesAt = Object.entries(routes).map(([key, answer]) => {
+    const cut = key.indexOf(" ")
+    const named = cut > 0 && /^[A-Z]+$/.test(key.slice(0, cut))
+    return { method: named ? key.slice(0, cut) : "", url: named ? key.slice(cut + 1) : key, answer }
+  })
   globalThis.fetch = async (url, init) => {
     const u = String(url)
-    calls.push({ url: u, init })
-    for (const [match, answer] of Object.entries(routes)) {
-      if (u.includes(match)) {
-        if (typeof answer === "function") return answer(u, init)
-        if (answer instanceof Response) return answer
-        return new Response(JSON.stringify(answer.body ?? answer), { status: answer.status ?? 200, headers: { "Content-Type": "application/json" } })
-      }
+    const parsed = new URL(u)
+    const method = String(init?.method ?? "GET").toUpperCase()
+    calls.push({ url: u, method, init })
+    for (const r of routesAt) {
+      if (r.method && r.method !== method) continue
+      const hit = r.url.startsWith("http") ? u === r.url : parsed.pathname === r.url
+      if (!hit) continue
+      if (typeof r.answer === "function") return r.answer(u, init)
+      if (r.answer instanceof Response) return r.answer
+      return new Response(JSON.stringify(r.answer.body ?? r.answer), { status: r.answer.status ?? 200, headers: { "Content-Type": "application/json" } })
     }
     return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 })
   }
@@ -97,7 +112,7 @@ test("already claimed today is `done`, with when to come back", async () => {
   )
   assert.equal(r.outcome, "done")
   assert.match(r.message, /1 小时/)
-  // until is magpie 0.1.1862's field: when this answer stops holding. Codar's
+  // until is magpie 0.1.1795's field: when this answer stops holding. Codar's
   // day is a rolling 24 hours, so it is exactly retry_after from now — said,
   // magpie stops re-asking a done account every 30 minutes before noon.
   assert.ok(r.until >= before + 3600 * 1000 && r.until <= Date.now() + 3600 * 1000, "the answer holds until the vendor's own next claim time")
@@ -110,7 +125,30 @@ test("already claimed today is `done`, with when to come back", async () => {
     async () => p.auth.checkin(auth),
   )
   assert.equal(noWait.outcome, "done")
-  assert.equal(noWait.until, undefined, "a vendor that names no time gets no invented until")
+  // A done with no until is settled for the whole day by magpie — and a
+  // rolling 24-hour window would then lose the next claim. The floor is
+  // "how long this answer is trusted", not an invented claim time.
+  assert.ok(noWait.until > Date.now() && noWait.until <= Date.now() + 31 * 60 * 1000, "a vendor that names no time gets a bounded hold, not the whole day")
+})
+
+test("a vendor number past Date's range is clamped, not handed to the host", async () => {
+  // host.js's checkinOf does new Date(t).toISOString(), which throws
+  // RangeError for t past 8.64e15 — the whole answer would be a host-side
+  // exception instead of "already claimed".
+  const p = await CodarPlugin()
+  for (const retry_after of [1e13, 1e15, Number.MAX_SAFE_INTEGER]) {
+    const r = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after } } },
+      },
+      async () => p.auth.checkin(auth),
+    )
+    assert.equal(r.outcome, "done")
+    assert.ok(Number.isFinite(r.until), `retry_after ${retry_after} still gives a finite until`)
+    assert.doesNotThrow(() => new Date(r.until).toISOString(), "and one the host can turn into an ISO string")
+    assert.ok(new Date(r.until).toISOString().startsWith("+"), "clamped to the end of what a date can say")
+  }
 })
 
 test("a 401 from the sign-in endpoint is said as an expired sign-in", async () => {
@@ -242,7 +280,11 @@ test("activities that are still running become windows; a failed read does not s
   assert.equal(free.length, 1, "only the one still running")
   assert.equal(free[0].resetsAt, until * 1000, "ms, as magpie's when() reads a number past 1e11")
   assert.equal(free[0].aside, true, "using the activity up does not stop the account")
-  assert.deepEqual(free[0].models, ["a", "b"], "the window counts the activity's own models")
+  assert.match(free[0].name, /a、b/, "the window names the activity's own models")
+  // The window must not carry `models`: it is aside, so routing never reads
+  // it and the GUI has no field for it — while any window with `models` keeps
+  // the whole card out of quotas.json (quota_last.go keepLast).
+  assert.equal(free[0].models, undefined, "no models on the window: it would cost the card its last reading on disk")
   assert.equal(free[0].used, 0, "an unlimited activity has no share to tell")
   assert.equal(free[0].amount, undefined, "and no invented count")
 
@@ -300,8 +342,8 @@ test("a free activity is drawn by the vendor app's own rule, and no other", asyn
   )
   const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
   assert.equal(free.length, 2, "the ended one and the spent one are not drawn")
-  assert.ok(free.some((w) => w.models.includes("a")), "a status the app doesn't read does not hide a running activity")
-  assert.ok(free.some((w) => w.models.includes("d")))
+  assert.ok(free.some((w) => w.name.includes("a")), "a status the app doesn't read does not hide a running activity")
+  assert.ok(free.some((w) => w.name.includes("d")))
 })
 
 test("the usage reads go out together, and a dead balance still reads the rest", async () => {
@@ -636,18 +678,30 @@ test("the read-from-this-machine sign-in hands magpie a key, and says why when i
     assert.match(appToken(file).error, /已过期/, "a lapsed token is caught before magpie saves it")
 
     // the method as magpie calls it: authorize() answers in the host's own
-    // shape. inputs.file is this plugin's own test seam — Bun's homedir()
-    // ignores $HOME, so the real file must never be the one read here.
-    const none = await read.authorize({ file: join(dir, "nope.json") })
-    assert.equal(none.type, "failed", "no file is a refusal with words")
-    assert.match(none.error, /没找到/)
+    // shape, reading the one file the app writes (CODAR_HOME points it at
+    // this temp dir, as it points the app). It takes no path from the
+    // caller: magpie's sign-in API must not become a JSON-file reader.
+    const had = process.env.CODAR_HOME
+    process.env.CODAR_HOME = dir
+    try {
+      rmSync(file, { force: true })
+      const none = await read.authorize()
+      assert.equal(none.type, "failed", "no file is a refusal with words")
+      assert.match(none.error, /没找到/)
 
-    const lapsed = await read.authorize({ file })
-    assert.equal(lapsed.type, "failed", "the lapsed token is refused, not handed to magpie")
-    assert.match(lapsed.error, /已过期/)
+      const old = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 60 })
+      writeFileSync(file, JSON.stringify({ provider: { speedai: { token: old } } }))
+      const lapsed = await read.authorize()
+      assert.equal(lapsed.type, "failed", "the lapsed token is refused, not handed to magpie")
+      assert.match(lapsed.error, /已过期/)
 
-    writeFileSync(file, JSON.stringify({ provider: { speedai: { token } } }))
-    assert.deepEqual(await read.authorize({ file }), { type: "success", key: token }, "the app's own token, handed over")
+      writeFileSync(file, JSON.stringify({ provider: { speedai: { token } } }))
+      assert.deepEqual(await read.authorize(), { type: "success", key: token }, "the app's own token, handed over")
+      assert.deepEqual(await read.authorize({ file: join(dir, "other.json") }), { type: "success", key: token }, "an argument names no other file: the path is the app's own")
+    } finally {
+      if (had === undefined) delete process.env.CODAR_HOME
+      else process.env.CODAR_HOME = had
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -903,4 +957,319 @@ test("a claim whose point reads fail still claims, with no made-up credit", asyn
   assert.equal(n, 2, "both point reads were tried")
   assert.equal(r.outcome, "claimed")
   assert.equal(r.credit, 0)
+})
+
+test("each endpoint is asked with its own method, host, body and credential", async () => {
+  // The plugin's core design is the split: chat and the catalog on the claw
+  // gateway, the account, check-in and points on kuaipaper — and each read
+  // is a POST with a JSON body or a GET without one. A stub that matched on
+  // a path substring saw none of it; a regression here is every request
+  // 401/404 in production while the suite stays green.
+  const p = await CodarPlugin()
+  const calls = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 60 } } },
+      "/v1/codar/models": { body: { object: "list", data: [{ id: "x" }] } },
+    },
+    async (calls) => {
+      await p.auth.usage(auth)
+      await p.auth.checkin(auth)
+      await p.provider.models({ models: {} }, { auth: await auth() })
+      return calls
+    },
+  )
+  const seen = calls.map((c) => {
+    const u = new URL(c.url)
+    return {
+      method: c.method,
+      host: u.host,
+      path: u.pathname,
+      auth: c.init.headers.Authorization,
+      ua: c.init.headers["User-Agent"],
+      type: c.init.headers["Content-Type"],
+      body: c.init.body,
+    }
+  })
+  const one = (path, method) => {
+    const hit = seen.filter((s) => s.path === path && s.method === method)
+    assert.ok(hit.length > 0, `${method} ${path} was made`)
+    return hit[0]
+  }
+
+  const points = one("/v1/gettoken", "POST")
+  assert.equal(points.host, "api.kuaipaper.com", "points are the account host's")
+  assert.equal(points.auth, `Bearer ${TOKEN}`, "with the account's own bearer token")
+  assert.deepEqual(JSON.parse(points.body), { username: "user_1", token: 0 }, "and the account name in the body")
+
+  const status = one("/v1/daily-sign/status", "POST")
+  assert.equal(status.host, "api.kuaipaper.com")
+  assert.deepEqual(JSON.parse(status.body), { username: "user_1" })
+
+  const sign = one("/v1/daily-sign", "POST")
+  assert.equal(sign.host, "api.kuaipaper.com")
+  assert.equal(sign.auth, `Bearer ${TOKEN}`)
+  assert.deepEqual(JSON.parse(sign.body), { username: "user_1" })
+
+  const acts = one("/api/codar/activities/mine", "GET")
+  assert.equal(acts.host, "api.claw.speedai.com", "activities are the gateway host's")
+  assert.equal(acts.auth, `Bearer ${TOKEN}`)
+  assert.equal(acts.body, undefined, "a GET carries no body")
+
+  const cat = one("/v1/codar/models", "GET")
+  assert.equal(cat.host, "api.claw.speedai.com")
+  assert.equal(cat.body, undefined)
+
+  for (const s of seen) {
+    assert.equal(s.type, "application/json", "every request says it is JSON")
+    assert.equal(s.ua, "node", "and goes out as the desktop's own fetch does")
+  }
+})
+
+test("a 200 whose body says the token is invalid marks the account expired", async () => {
+  // Measured: /v1/daily-sign answers HTTP 200 with {"code":401,"message":
+  // "Invalid token"} for a token it will not take. Read as an HTTP error
+  // this branch never runs, and the card keeps showing a stale balance.
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 401, message: "Invalid token" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "failed")
+  assert.match(r.message, /登录已过期/)
+})
+
+test("a usage read with a locally expired token never reaches the vendor", async () => {
+  // The token says when it runs out; past that every call would be a 401.
+  // Said here as expired, the card marks the account and no request goes out
+  // — a read that asked anyway showed "点数查询失败" instead of "sign in".
+  const old = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 60 })
+  const p = await CodarPlugin()
+  await withFetch({}, async (calls) => {
+    const u = await p.auth.usage(async () => ({ type: "api", key: old }))
+    assert.equal(u.signIn, "expired", "the account is marked for magpie")
+    assert.match(u.error, /登录已过期/)
+    assert.equal(calls.length, 0, "and nothing was sent")
+  })
+})
+
+test("the vendor's catalog shape, as it answers today, is read field for field", () => {
+  // Measured 2026-10-29: top-level {object:"list", data:[…]}, reasoning an
+  // OBJECT ({default, levels}) rather than a boolean, modalities arrays,
+  // protocol an object with a type. A catalog read through a shape we only
+  // imagine loses context, images, or the protocol without a word.
+  const live = {
+    object: "list",
+    schema_version: 1,
+    config_version: 7,
+    data: [
+      {
+        id: "claude-opus-5",
+        display_name: "claude-opus-5",
+        context_window: 1000000,
+        input_modalities: ["text"],
+        output_modalities: ["text"],
+        protocol: { type: "anthropic_messages", method: "POST", path: "/v1/messages", authentication: "x-api-key" },
+        reasoning: { default: "high", levels: [{ id: "off" }, { id: "low" }] },
+        rate_badge: "1.50x",
+      },
+      {
+        id: "auto",
+        display_name: "auto",
+        context_window: 1000000,
+        input_modalities: ["text", "image"],
+        output_modalities: ["text"],
+        protocol: { type: "openai_chat_completions" },
+        reasoning: { default: "high", levels: [] },
+      },
+    ],
+  }
+  const list = catalogOf(live)
+  assert.equal(list.length, 2, "the top-level data array is the list")
+  const opus = list.find((m) => m.id === "claude-opus-5")
+  assert.equal(opus.context, 1000000)
+  assert.deepEqual(opus.input, ["text"])
+  assert.equal(opus.protocol, "anthropic_messages")
+  assert.equal(opus.reasoning, true, "a reasoning object is reasoning: the vendor states levels, not a boolean")
+  const auto = list.find((m) => m.id === "auto")
+  assert.deepEqual(auto.input, ["text", "image"], "images survive")
+  assert.equal(auto.protocol, "openai_chat_completions")
+
+  // and the same list builds the same models through the provider path
+  const m = modelOf(opus)
+  assert.equal(m.provider.npm, "@ai-sdk/anthropic", "the anthropic model keeps its own SDK")
+  assert.equal(m.attachment, false, "no image modality, no attachment")
+  assert.equal(modelOf(auto).attachment, true)
+})
+
+test("the models hook is handed and answers the top-level catalog shape", async () => {
+  // The host hands the hook the whole provider; the vendor answers with a
+  // top-level {object:"list", data:[…]} (measured 2026-10-29). Fixtures in
+  // the nested {catalog:{data}} shape would let a parser that only reads the
+  // nested one pass while production falls back to the embedded list.
+  const p = await CodarPlugin()
+  const given = { id: "codar", models: { "deepseek-v4.1-flash": modelOf({ id: "deepseek-v4.1-flash" }) } }
+  const fresh = await withFetch(
+    {
+      "/v1/codar/models": {
+        body: { object: "list", schema_version: 1, config_version: 7, data: [{ id: "new-model", display_name: "New", context_window: 2000, input_modalities: ["text"], output_modalities: ["text"], protocol: { type: "openai_chat_completions" } }] },
+      },
+    },
+    async () => p.provider.models(given, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(fresh), ["new-model"], "the live list replaces the embedded one")
+  assert.equal(fresh[Symbol.for("magpie.fellBack")], undefined, "and is not marked as a fallback")
+})
+
+test("a catalog larger than the wire allows is cut, not handed to the host", async () => {
+  // The host passes a hook's answer to Go as one JSON line and kills the
+  // whole plugin host past 32 MiB (host.go maxWireLine) — every plugin in
+  // it, not just this one. A vendor answering with an unbounded list must
+  // not be able to take the host down with data.
+  const many = Array.from({ length: 5000 }, (_, i) => ({ id: `m${i}`, display_name: `M${i}`, protocol: { type: "openai_chat_completions" } }))
+  const list = catalogOf({ object: "list", data: many })
+  assert.equal(list.length, 2000, "the list is capped")
+  const p = await CodarPlugin()
+  const fresh = await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: many } } },
+    async () => p.provider.models({ models: {} }, { auth: await auth() }),
+  )
+  assert.equal(Object.keys(fresh).length, 2000)
+  assert.ok(Buffer.byteLength(JSON.stringify(fresh)) < 32 * 1024 * 1024, "and the answer fits the host's line")
+})
+
+test("a balance that is not a number fails the read instead of becoming 0", async () => {
+  // Number(" ") is 0, Number([]) is 0, Number(true) is 1. A fabricated 0 is
+  // a balance the account does not have, and routing reads it as spent.
+  const p = await CodarPlugin()
+  for (const bad of [{ code: 200, token: " ", agent_token: null }, { code: 200 }, { code: 200, token: [], agent_token: null }]) {
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body: bad },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+    assert.ok(u.error, `a body of ${JSON.stringify(bad)} is a read that failed, not a balance of 0`)
+  }
+  // and a numeric string still reads as the number it says
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: "2348", agent_token: "0" } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.balance, /2348/)
+})
+
+test("isSigned as the string \"false\" is not read as signed", async () => {
+  // Boolean("false") is true: a vendor that switches to string flags would
+  // show an unclaimed day as claimed, and the claim window would say the
+  // user already has it.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: "false", retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const win = u.windows.find((w) => w.name === "每日签到")
+  assert.match(win.display, /还没领/)
+})
+
+test("a payload-only or space-split echo of the token is still cut", async () => {
+  // A server that quotes back part of the credential — the payload alone,
+  // or the token with a space spliced in (even inside a segment, where the
+  // shape alone would leave the halves behind) — used to leave it on the
+  // card.
+  const jwt = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const [header, payload, sig] = jwt.split(".")
+  const boom = (msg) => Object.assign(new Error(msg), {})
+  const p = await CodarPlugin()
+  for (const echoed of [
+    `${header}.${payload}`,
+    `${header} ${payload}.${sig}`,
+    `${header.slice(0, 4)} ${header.slice(4)}.${payload}.${sig}`,
+    jwt.slice(0, 40),
+  ]) {
+    const r = await p.auth.checkin(async () => {
+      throw boom(`bad key ${echoed}`)
+    })
+    assert.doesNotMatch(r.message, /eyJ[\w-]{10,}|eqJ|yJh|\s{2}/, `"${echoed.slice(0, 20)}…" does not reach the card`)
+    assert.match(r.message, /…/)
+  }
+})
+
+test("a vendor string with a bidi override or a zero-width space is cleaned", () => {
+  const list = catalogOf({
+    data: [
+      { id: "ok", display_name: "Fine‮Name​", protocol: { type: "openai_chat_completions" } },
+      { id: "bad‮id", display_name: "Bad", protocol: { type: "openai_chat_completions" } },
+    ],
+  })
+  assert.deepEqual(list.map((m) => m.id), ["ok"], "an id with a bidi override in it is not an id a request can ask for")
+  assert.equal(list[0].name, "Fine Name", "the name is one clean line")
+})
+
+test("the usage account name is cleaned like every other vendor string", async () => {
+  const p = await CodarPlugin()
+  const odd = mkToken({ username: "user‮_1", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(async () => ({ type: "api", key: odd })),
+  )
+  assert.equal(u.user, "user _1", "a bidi override never reaches the card")
+})
+
+test("the config hook keeps a provider-level api and npm the user set", async () => {
+  // The config hook runs on every start. Writing ours over the user's
+  // proxy address would silently undo it — the same rule the name follows.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: { api: "https://my-proxy.example/v1", npm: "@ai-sdk/custom" } } }
+  await p.config(config)
+  assert.equal(config.provider.codar.api, "https://my-proxy.example/v1", "the user's api is left alone")
+  assert.equal(config.provider.codar.npm, "@ai-sdk/custom", "and so is the user's npm")
+  assert.equal(config.provider.codar.name, "科搭 Codar", "the default name still fills in when none was set")
+})
+
+test("the config hook fills in api and npm when the user set none", async () => {
+  const p = await CodarPlugin()
+  const config = {}
+  await p.config(config)
+  assert.equal(config.provider.codar.api, "https://api.claw.speedai.com/v1")
+  assert.equal(config.provider.codar.npm, "@ai-sdk/openai-compatible")
+})
+
+test("a vendor answering with a pile of activities is cut to what a card holds", async () => {
+  // Each running activity becomes a window in the one JSON line the host
+  // passes to Go; an unbounded pile is the usage-side of the same 32 MiB
+  // limit the catalog has to respect.
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const many = Array.from({ length: 500 }, (_, i) => ({ status: "active", free_until: until, remaining_quota: null, model_ids: [`m${i}`] }))
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: many } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
+  assert.equal(free.length, 20, "twenty windows, not five hundred")
+  assert.ok(Buffer.byteLength(JSON.stringify(u)) < 32 * 1024 * 1024)
 })

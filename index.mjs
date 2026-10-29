@@ -52,6 +52,25 @@ const TIMEOUT_MS = 8000
 const CHECKIN_BUDGET_MS = 25 * 1000
 const USAGE_BUDGET_MS = 18 * 1000
 
+// MAX_TIME_MS is the largest time a host can turn into an ISO string: past
+// Date's own limit toISOString() throws "Invalid time value", and a vendor's
+// retry_after is a number nothing bounds. A time past it is clamped, not
+// dropped: the answer still holds (it just holds longer than any calendar).
+const MAX_TIME_MS = 8.64e15
+const safeTime = (ms) => Math.min(Math.max(0, Number(ms) || 0), MAX_TIME_MS)
+
+// MAX_MODELS is how many models one vendor catalog may bring back. The host
+// passes a hook's answer to Go as a single JSON line and kills the whole
+// plugin host — every plugin in it — when that line passes 32 MiB
+// (host.go's maxWireLine); an unbounded list is a way for a vendor to take
+// the host down with data rather than with a bug. Codar lists 16.
+const MAX_MODELS = 2000
+
+// MAX_ACTIVITY_WINDOWS is how many free-model activities go on the card.
+// The same wire limit applies to the usage answer, and the card has room for
+// a handful of rows; Codar has run at most two activities at a time.
+const MAX_ACTIVITY_WINDOWS = 20
+
 const CLAUDE = "@ai-sdk/anthropic"
 const OPENAI = "@ai-sdk/openai-compatible"
 
@@ -114,19 +133,29 @@ const signedOut = (e) => e?.status === 401 || e?.status === 403
 // whyOf is the message to show for an error, without the token it might name.
 const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
 
-// controlChars would break a card's line or ride along invisibly: a vendor
-// string is shown as one line, never as a control sequence.
-const controlChars = /[\u0000-\u001f\u007f]/g
+// controlChars would break a card's line, reorder what follows it, or ride
+// along invisibly: a vendor string is shown as one line, never as a control
+// sequence. C0 and C1 controls, the zero-width marks, the bidi overrides and
+// isolates (a right-to-left override reverses the text after it), the line
+// and paragraph separators, a byte-order mark.
+const controlChars =
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\ufff9-\ufffb]/g
 
 // cleanText is a vendor string as a card can show it: control characters
 // out, one line (runs of spaces folded), and never longer than a card reads.
 const cleanText = (s) => String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim().slice(0, 120)
 
-// jwtShape is a credential as a server might quote it back: three
-// dot-joined base64url runs, as every Codar token is. Matched by shape, so
-// it is cut from a message even when no token is in hand (a getAuth that
-// threw leaves nothing to cut by).
-const jwtShape = /eyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]*/g
+// jwtShape is a credential as a server might quote it back. Every Codar token
+// is a JWT, and every JWT segment is base64url. A server can wrap the token
+// at any column or insert whitespace anywhere in the message; the shape must
+// match both intact tokens and the same token split with spaces/newlines.
+// The pattern matches an eyJ-started segment, then dot-separated segments.
+// Whitespace between chunks of base64url inside a segment is allowed, so the
+// whole token cuts regardless of where lines were inserted. A real JWT
+// requires two dots; we allow 0–2 extra segments for safety. Prose beginning
+// with eyJ would also be cut, but that's acceptable in an error message where
+// failing closed (removing more rather than less) matters.
+const jwtShape = /eyJ[\w-]*(?:\s[\w-]+)*(?:\s*\.\s*[\w-]+(?:\s[\w-]+)*){0,2}/g
 
 // configPath is where the Codar app keeps its own config. The app takes
 // CODAR_HOME over the home directory when it is set (its sidecar's
@@ -227,8 +256,20 @@ const pointsOf = async (token, username, opts) => {
     const said = typeof r?.message === "string" ? r.message.trim() : ""
     throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
   }
-  const num = (v) => (typeof v === "number" && isFinite(v) ? v : Number.isFinite(Number(v)) && v !== null && v !== "" ? Number(v) : null)
-  return { general: num(r.token), agent: num(r.agent_token) }
+  const num = (v) => {
+    // a number, or a string that says one: Number(" ") is 0, Number([]) is 0
+    // and Number(true) is 1, and a made-up 0 is a balance the account does
+    // not have — routing would read the account as spent.
+    if (typeof v === "number") return isFinite(v) ? v : null
+    if (typeof v === "string" && v.trim() !== "" && isFinite(Number(v))) return Number(v)
+    return null
+  }
+  const general = num(r.token)
+  const agent = num(r.agent_token)
+  // a 200 whose body names no balance at all is a read we cannot use: said
+  // as an error, the card says why, instead of drawing nothing
+  if (general == null && agent == null) throw new ApiError("点数查询没有返回余额", 0)
+  return { general, agent }
 }
 
 // modelOf is one catalog record as magpie's provider list has it.
@@ -284,6 +325,7 @@ function catalogOf(body) {
   if (!Array.isArray(list)) return null
   const out = []
   for (const m of list) {
+    if (out.length >= MAX_MODELS) break
     const rawId = typeof m?.id === "string" ? m.id.trim() : ""
     const id = cleanText(rawId)
     if (!id || id !== rawId) continue
@@ -337,17 +379,27 @@ const publishedConcurrency = (body) => {
   return nums.length ? Math.min(...nums) : 0
 }
 
+// scrubLine is said as one line with no credential in it: the key itself
+// where it is known, then anything credential-shaped where it is not (a
+// getAuth that threw leaves no key to cut by). A token a server spliced a
+// space or newline into is still cut — jwtShape lets whitespace fall anywhere
+// inside a segment, and every Codar token is a JWT.
+const scrubLine = (said, key) => {
+  let text = typeof said === "string" ? said : ""
+  if (key) text = text.split(key).join("…")
+  return text
+    .replace(controlChars, " ")
+    .replace(jwtShape, "…")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+}
+
 // signMessage says what the check-in answered, in the user's words, with the
 // token scrubbed: a server that quotes the credential back would otherwise
 // put it on the card and in magpie's log. The token itself is cut where it
 // is known; a credential-shaped string is cut by its shape, which covers the
 // path where the sign-in threw and there is no token to cut by.
-const scrub = (said, token) => {
-  let text = typeof said === "string" ? said.replace(controlChars, " ") : ""
-  const key = String(token ?? "")
-  if (key) text = text.split(key).join("…")
-  return text.replace(jwtShape, "…").replace(/\s{2,}/g, " ").trim().slice(0, 400)
-}
+const scrub = (said, token) => scrubLine(said, String(token ?? "")).slice(0, 400)
 const signMessage = (r, token) => scrub(typeof r?.message === "string" ? r.message : "", token)
 
 export async function CodarPlugin(input) {
@@ -384,11 +436,14 @@ export async function CodarPlugin(input) {
           type: "api",
           keyless: true,
           label: "读取本机科搭令牌",
-          // inputs.file is not a magpie prompt (this method asks nothing); it
-          // lets a test name the file instead of reading the real one, which
-          // Bun's os.homedir() would not redirect through $HOME.
-          async authorize(inputs = {}) {
-            const got = appToken(inputs?.file)
+          // magpie calls this with no prompts and no inputs (host.js's apiKey
+          // passes `inputs ?? {}`), so the file is always the app's own — one
+          // path, taken from CODAR_HOME or the home directory. It takes no
+          // path from the caller: magpie's local sign-in API is reachable by
+          // anything that can reach magpie, and reading an arbitrary JSON
+          // file for its token is not a thing that API should be able to do.
+          async authorize() {
+            const got = appToken()
             if (got.error) return { type: "failed", error: got.error }
             return { type: "success", key: got.token }
           },
@@ -402,7 +457,7 @@ export async function CodarPlugin(input) {
 
       // 签到：POST /v1/daily-sign。服务端用业务码区分「领到了」与「今天已领
       // 过」——HTTP 状态都是 200，所以看 body 的 code。返回里不带 signIn：
-      // 宿主只把 outcome/credit/streak/message 交给 magpie（host.js 的
+      // 宿主只把 outcome/credit/streak/message/until 交给 magpie（host.js 的
       // checkinOf），标账号过期是 usage 的活（usage 的 signIn 会被读走）。
       async checkin(getAuth) {
         let auth, token
@@ -461,14 +516,21 @@ export async function CodarPlugin(input) {
         if (code === 400 && /24\s*小时|仅可领取一次/.test(signMessage(r, token))) {
           const retry = Number(r?.data?.retry_after)
           const wait = humanSecs(retry)
-          // until 是 magpie 0.1.1862 起的契约：签到答案什么时候失效、下次
-          // 何时该再问。科搭是滚动 24 小时，retry_after 正好就是那一刻；
-          // 报上去以后 magpie 不会在中午前每 30 分钟重问一遍（每次都是
-          // 一次签到 + 两次点数读取）。旧宿主不读这个字段，多给无碍。
+          // until 是 magpie 0.1.1795 起的契约（"a plugin's until is when its
+          // answer stops holding"，v0.1.1795 首发；README 里早先写的 0.1.1862
+          // 是首次核对时看错的版本）：签到答案什么时候失效、下次何时该再问。
+          // 科搭是滚动 24 小时，retry_after 正好就是那一刻；报上去以后 magpie
+          // 不会在中午前每 30 分钟重问一遍（每次都是一次签到 + 两次点数读取）。
+          // 厂商没给秒数（或给了 0）时不能不给 until：宿主把「done 且没有
+          // until」当成当天已结算，一整天不再问——滚动 24 小时的窗口就会
+          // 漏掉下一次可领。给一个 30 分钟的保质期：这只是「这个答案我们
+          // 信多久」，不是替厂商编一个可领时刻；最坏也就是回到 until 之前
+          // 的每 30 分钟问一次。
+          const hold = Number.isFinite(retry) && retry > 0 ? safeTime(Date.now() + retry * 1000) : safeTime(Date.now() + 30 * 60 * 1000)
           return {
             outcome: "done",
             message: `今天已领过${retry > 0 ? `，${wait}后可再领` : ""}`,
-            ...(Number.isFinite(retry) && retry > 0 ? { until: Date.now() + retry * 1000 } : {}),
+            ...(hold ? { until: hold } : {}),
           }
         }
         if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
@@ -512,17 +574,19 @@ export async function CodarPlugin(input) {
 
         // 今日签到：明天这个时候能再领一次。等待结束时（retry_after 0）这
         // 一行也要在——那正是"现在可以领"的时刻，旧写法 retry > 0 会让它消失。
-        // 不带 used：签到不是一份会用完的额度，宿主把没有份额的 aside 行当
-        // 文字行显示（host.js 的 Text，magpie 自己的注释也拿「每日签到」当
-        // 例子），不会画成一个 100% 的进度条。
+        // 不带 used：签到不是一份会用完的额度，magpie 的 plugin_usage.go 把
+        // 没有份额的 aside 行标成 Text（它自己的注释也拿「每日签到」当例子），
+        // 不会画成一个 100% 的进度条。
         if (statusR.status === "fulfilled" && statusR.value?.data && typeof statusR.value.data === "object") {
           const st = statusR.value
-          const signed = Boolean(st.data.isSigned)
+          // 只认真正的 true：厂商哪天把它写成字符串 "false"，Boolean("false")
+          // 是 true，卡片会把没领的说成已领。
+          const signed = st.data.isSigned === true
           const retry = Number(st.data.retry_after)
           const wait = Number.isFinite(retry) && retry > 0 ? humanSecs(retry) : ""
           windows.push({
             name: "每日签到",
-            ...(wait ? { resetsAt: Date.now() + retry * 1000 } : {}),
+            ...(wait ? { resetsAt: safeTime(Date.now() + retry * 1000) } : {}),
             display: signed ? (wait ? `今天已领，${wait}后可再领` : "今天已领") : wait ? `今天还没领，${wait}后可以领` : "今天还没领，现在可以领",
             aside: true,
           })
@@ -534,8 +598,9 @@ export async function CodarPlugin(input) {
         // 页会直接说还剩多少点，而不是把账号排到已知的之后。它不按模型划范围
         // ——活动期的免费模型眼下不花点数，活动一结束就花，而点数归零时
         // magpie 只是把账号排到最后（spent），不是拒绝它。
-        // 窗口上的 balance 要宿主和 magpie 都认（0.1.1822 起，magpie #3950）；
-        // 旧版（如 0.1.1788）只把它当文字行显示，读数不丢，路由暂仍未知。
+        // 窗口上的 balance 要宿主和 magpie 都认（magpie 0.1.1790 起，issue
+        // #3950；早期注释里的 0.1.1822 是核对时记错的版本）；旧版（如
+        // 0.1.1788）只把它当文字行显示，读数不丢，路由暂仍未知。
         if (points.general != null) {
           windows.push({
             name: "点数余额",
@@ -551,8 +616,17 @@ export async function CodarPlugin(input) {
         // 的总额，有总额时 amount/limit 才是「已用 / 总额」两个真数，而不是
         // 拿剩余数当总额报。aside 表示「用完了也不停账号」：活动用完只是回到
         // 按点数计费，账号照常可用。
+        //
+        // 窗口上不发 models：aside 窗口不进路由（magpie 的 allowanceOf 先跳过
+        // aside/text），GUI 也没有这个字段可画；而宿主一旦在任一窗口上看到
+        // models，就把整张卡排除在 quotas.json 之外（quota_last.go 的
+        // keepLast，"a pool that can't be written down isn't kept"），账号就
+        // 失去了跨重启的「上次读数」。模型名已经在窗口名里了。
         if (actsR.status === "fulfilled") {
-          for (const a of runningActivities(actsR.value)) {
+          const running = runningActivities(actsR.value)
+          // 卡片只画得下几行，而这段答案要变成宿主的一行 JSON：厂商一次
+          // 报太多活动时只取前几个，不能让数据把宿主的 32 MiB 行撑爆。
+          for (const a of running.slice(0, MAX_ACTIVITY_WINDOWS)) {
             const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string" && x).map(cleanText) : []
             const cap = typeof a.user_quota_limit === "number" && a.user_quota_limit > 0 ? a.user_quota_limit : null
             const left = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
@@ -561,11 +635,10 @@ export async function CodarPlugin(input) {
             windows.push({
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
               used: share,
-              resetsAt: a.free_until * 1000,
+              resetsAt: safeTime(a.free_until * 1000),
               display: left == null ? "免费使用中（不限量）" : cap == null ? `免费使用中，还剩 ${left}` : `免费使用中，已用 ${used} / ${cap}`,
               ...(used != null ? { amount: used, limit: cap } : {}),
               aside: true,
-              ...(ids.length ? { models: ids } : {}),
             })
           }
         }
@@ -574,7 +647,7 @@ export async function CodarPlugin(input) {
         if (points.general != null) parts.push(`${points.general} 点`)
         if (points.agent != null) parts.push(`Agent ${points.agent} 点`)
         return {
-          user: username,
+          user: cleanText(username),
           balance: parts.length ? `${parts.join(" · ")} 可用` : "",
           windows,
         }
@@ -627,7 +700,9 @@ export async function CodarPlugin(input) {
 
     // 用户自己改过的名字留着：magpie 把 provider 的名字存在 providers.json
     // 里，而 config 钩子在每次启动时都跑——无条件写回默认值会把 UI 里的改名
-    // 悄悄撤销。值不是对象时当作没有，其余字段照旧原样带过。
+    // 悄悄撤销。供应商级的 npm/api 同理：用户可能把它们指向自己的代理，覆盖
+    // 掉等于每次启动都把人家的设置改回去。值不是对象时当作没有，其余字段照旧
+    // 原样带过。
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] && typeof config.provider[ID] === "object" ? config.provider[ID] : {}
@@ -635,8 +710,8 @@ export async function CodarPlugin(input) {
       config.provider[ID] = {
         ...was,
         name: typeof was.name === "string" && was.name ? was.name : "科搭 Codar",
-        npm: OPENAI,
-        api: `${API}/v1`,
+        npm: typeof was.npm === "string" && was.npm ? was.npm : OPENAI,
+        api: typeof was.api === "string" && was.api ? was.api : `${API}/v1`,
         models: { ...models, ...(was.models ?? {}) },
       }
     },
