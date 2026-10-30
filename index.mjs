@@ -348,7 +348,10 @@ const pointsOf = async (token, username, opts) => {
   // card said the account was spent.
   const code = Number(r?.code)
   if (Number.isFinite(code) && code !== 200) {
-    const said = typeof r?.message === "string" ? r.message.trim() : ""
+    // 拒绝的话按厂商客户端的读法（app.asar 的 Vg）取：message/msg/error/detail
+    // 与 data 下同样四个字段里第一个有字的——只读 message 会丢掉 msg 或 data 里
+    // 厂商的话，卡片于是只报一个干巴巴的码。
+    const said = saidBy(r).trim()
     throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
   }
   // …and the balances come from `data` when that is an object, as its client
@@ -462,10 +465,21 @@ const modelsOf = (list, base) => Object.fromEntries(list.map((m) => [m.id, model
 // same loss hit `limit` (an entry saying only `{ output: 4096 }` dropped the
 // context window). Values that are not maps (a name, a number, a list such as
 // variants or modalities.input) are taken as the user wrote them.
+//
+// Keys that name properties of every object (`__proto__`, `constructor`,
+// `prototype`) are never folded in: writing out["__proto__"] = … sets the
+// merged entry's prototype instead of a field, so a hand-written entry could
+// put inherited getters under m.name/m.provider; the rest would ride along
+// as own keys the host copies into the model it builds. No model has a field
+// by those names, so dropping them loses nothing.
+const MAGIC_KEYS = new Set(["__proto__", "constructor", "prototype"])
 const mergeModel = (ours, theirs) => {
   if (!plain(ours) || !plain(theirs)) return theirs
   const out = { ...ours }
-  for (const [k, v] of Object.entries(theirs)) out[k] = k in ours ? mergeModel(ours[k], v) : v
+  for (const [k, v] of Object.entries(theirs)) {
+    if (MAGIC_KEYS.has(k)) continue
+    out[k] = Object.hasOwn(ours, k) ? mergeModel(ours[k], v) : v
+  }
   return out
 }
 
@@ -540,20 +554,27 @@ const runningActivities = (body) => {
 // smallest it names. 0 when it says nothing — which is every reading so far
 // (measured 2026-10-27: no such field in /v1/codar/models, none in
 // /api/pricing, and the 429's own body carries only retry-after).
+//
+// The walk goes over the vendor's whole list (catalogOf's MAX_MODELS cap is
+// about the answer we hand the host, not this reading), so the minimum is
+// folded as it comes instead of Math.min(...nums): a spread passes one
+// argument per entry, and a catalog of ~125k entries throws "Maximum call
+// stack size exceeded" inside the models hook — where the catch turns it into
+// a fallback, so a perfectly good live list would be dropped for its size.
 const publishedConcurrency = (body) => {
-  const nums = []
+  let min = 0
   const take = (v) => {
     // a number, or a string that says one (numOf): a boolean or an array is
     // not a count, and a vendor field of the wrong type would otherwise
     // silently pin the whole account to one request at a time.
     const n = numOf(v)
-    if (Number.isInteger(n) && n > 0 && n <= 1000) nums.push(n)
+    if (Number.isInteger(n) && n > 0 && n <= 1000 && (min === 0 || n < min)) min = n
   }
   const list = body?.catalog?.data ?? body?.data
   take(body?.max_concurrency)
   take(body?.catalog?.max_concurrency)
   if (Array.isArray(list)) for (const m of list) take(m?.max_concurrency)
-  return nums.length ? Math.min(...nums) : 0
+  return min
 }
 
 // signedIn is whether the account has claimed today, read the way the
@@ -705,28 +726,23 @@ export async function CodarPlugin(input) {
         // 签到哪天也这样省掉，只认 200 会把「领到了」报成失败。
         //
         // 只有一处不听它的客户端：应答自己说 `success: false`（厂商在活动接口
-        // 上用的就是这个旗标）时算失败。这一处是有代价的——把一次失败读成
-        // claimed，magpie 就把这一天结清、不再重试，用户白丢一次签到；而读成
-        // failed 最坏只是照旧每 30 分钟再问一次。
-        const refused = Number.isFinite(code) ? code !== 200 : r?.success === false
-        // 「今天已领过」：厂商用 400 加这句话说这件事；没带 code 的应答里，
-        // 同一句话同样说明这次没有领到新的——照成功报会让 magpie 把这一天
-        // 结清，而 credit 的两次读数之间根本没有增量。
-        const already = ALREADY_CLAIMED.test(signMessage(r, token)) && (code === 400 || !Number.isFinite(code))
-        if (!refused && !already) {
-          let credit = 0
-          try {
-            const after = await pointsOf(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
-            // 两处余额都算：厂商只说过「签到领取点数奖励」，没说奖励落在通用
-            // 点数还是 Agent 点数——只算前者会把落在后者上的奖励报成 0。每一
-            // 处只在不减时计入（减少是花掉，不是这次领到），两处之和才是这次
-            // 签到真给账号加上的数。任一处读不到就不报，credit 留 0。
-            credit = gain(before?.general, after?.general) + gain(before?.agent, after?.agent)
-          } catch {
-            // 差额读不到就不报，credit 留 0
-          }
-          return { outcome: "claimed", credit, message: signMessage(r, token) || "签到成功" }
-        }
+        // 上用的就是这个旗标）时算失败，无论带没带 code。这一处是有代价的——
+        // 把一次失败读成 claimed，magpie 就把这一天结清、不再重试，用户白丢
+        // 一次签到；而读成 failed 最坏只是照旧每 30 分钟再问一次。所以这个
+        // 旗标是拒绝的充分条件：它比 code 更可信，因为 code:200 + success:false
+        // 正是「HTTP 层说好、业务层说不」。拒绝时不读余额算 credit——那是给
+        // 一次真领到算的。
+        const said = signMessage(r, token)
+        if (r?.success === false) return { outcome: "failed", message: said || `签到失败（code ${code || "?"}）` }
+        // 401/403 是登录过期，说给用户看的是「重新登录」，而不是一个码。
+        if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
+        // 「今天已领过」：厂商用这句话说这一天已经领了。它说的是「今天」，
+        // 不是「这一次」，所以未必带 code：带 400 是它今天的写法，不带 code
+        //（活动接口就是这种形状）也是同一句话。文案按客户端的读法（saidBy，
+        // 8 拼写）取；success:false 的应答走不到这里（上面已算失败）。
+        const already = ALREADY_CLAIMED.test(said) && (code === 400 || !Number.isFinite(code))
+        // 码说的拒绝，且消息不是「已领过」：厂商客户端只把非 200 的数当失败。
+        if (Number.isFinite(code) && code !== 200 && !already) return { outcome: "failed", message: said || `签到失败（code ${code}）` }
         if (already) {
           // until 是 magpie 0.1.1795 起的契约（"a plugin's until is when its
           // answer stops holding"，v0.1.1795 首发；README 里早先写的 0.1.1862
@@ -755,8 +771,21 @@ export async function CodarPlugin(input) {
             ...(hold ? { until: hold } : {}),
           }
         }
-        if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
-        return { outcome: "failed", message: signMessage(r, token) || `签到失败（code ${code || "?"}）` }
+        // 到这里只有两种形状：code:200，或干脆没给 code（厂商的客户端把后者
+        // 也算成功）。两者都是一次真领到：读余额算 credit（两处之差，只算不减
+        // 的部分）。活着读到多少报多少，读不到就不报，不要编 0。
+        let credit = 0
+        try {
+          const after = await pointsOf(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
+          // 两处余额都算：厂商只说过「签到领取点数奖励」，没说奖励落在通用
+          // 点数还是 Agent 点数——只算前者会把落在后者上的奖励报成 0。每一
+          // 处只在不减时计入（减少是花掉，不是这次领到），两处之和才是这次
+          // 签到真给账号加上的数。任一处读不到就不报，credit 留 0。
+          credit = gain(before?.general, after?.general) + gain(before?.agent, after?.agent)
+        } catch {
+          // 差额读不到就不报，credit 留 0
+        }
+        return { outcome: "claimed", credit, message: signMessage(r, token) || "签到成功" }
       },
 
       // 用量：点数余额 + 今日签到状态 + 免费模型活动（拿不到就不报）。
@@ -983,6 +1012,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, humanSecs, request, appToken, configPath }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, request, appToken, configPath }
 
 export default CodarPlugin

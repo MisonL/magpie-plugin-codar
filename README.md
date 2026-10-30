@@ -97,11 +97,16 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   restarts. A single model's own settings work the same way, field by field
   at every depth: an entry that sets only `provider.api` keeps the catalog's
   `provider.npm`, and one that sets only `limit.output` keeps the context
-  window. The live list follows the same address: every model the vendor's
+  window. Keys that are properties of every object (`__proto__`,
+  `constructor`, `prototype`) are never merged in — a model has no field by
+  those names. The live list follows the same address: every model the vendor's
   catalog brings back is written at your provider's `api` (or the model's
   own, if you set one), never at Codar's gateway — magpie prefers a model's
   URL over the provider's, so a hard-coded gateway there would send your
-  proxy nowhere on the first successful refresh.
+  proxy nowhere on the first successful refresh. The vendor's own entries
+  follow the vendor on a refresh; per-model names, prices and reasoning tiers
+  you set in magpie's UI live in magpie's own settings, outside this plugin's
+  list, so they survive it.
 - A time that cannot be written down is left out rather than rounded to
   something wrong: a window's `resetsAt` and the "N 后可再领" text are omitted
   when the vendor's number is missing, zero, non-finite (`1e999` reads as
@@ -127,14 +132,17 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   gate: an answer that names no code is not a refusal — the vendor's client
   passes it (its activity API already answers without one), so a claim answer
   without a code counts as the claim it says it is, unless the answer itself
-  says `success: false`. The check-in's words — including the "already
-  claimed" note that tells a claim from a repeat — are read from the first of
-  `message`/`msg`/`error`/`detail` and the same four under `data`, as that
-  client reads them. The balances also come from `data` when the vendor wraps
-  them in one, as that client unwraps it. The check-in's credit is the sum of
-  both balances' increases between its two reads — the vendor says a claim
-  grants "点数奖励" without saying which balance holds it — and a balance that
-  fell (the app spending) is not subtracted from it.
+  says `success: false` — and `success: false` is consulted however the code
+  sits, a `code: 200` body that says the flag included: that is an HTTP layer
+  saying yes and the vendor saying no, so the flag decides. The check-in's
+  words — including the "already claimed" note that tells a claim from a
+  repeat — are read from the first of `message`/`msg`/`error`/`detail` and the
+  same four under `data`, as that client reads them. The balances also come
+  from `data` when the vendor wraps them in one, as that client unwraps it;
+  and a points refusal is said in those same words. The check-in's credit is
+  the sum of both balances' increases between its two reads — the vendor says
+  a claim grants "点数奖励" without saying which balance holds it — and a
+  balance that fell (the app spending) is not subtracted from it.
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card
@@ -174,7 +182,10 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   "what's left not known yet" beside the account. A wallet reading makes it
   known, with the figure left and no share invented. magpie versions before
   the one that reads a window's `balance` show this row as plain text and
-  keep saying the account is unknown; the plugin is safe either way.
+  keep saying the account is unknown; the plugin is safe either way. The
+  wallet carries the general points; an account whose answer names only
+  `agent_token` (today's names both) shows the agent figure in the card's
+  text, but has no wallet reading for routing to go on.
 - A free-model activity is drawn by the vendor app's own rule — `free_until`
   in the future, and a `remaining_quota` that isn't spent — not by its
   `status` field, which the app doesn't read. It is `aside` — using it up

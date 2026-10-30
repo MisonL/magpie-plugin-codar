@@ -10,7 +10,7 @@ import { join } from "node:path"
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 
-const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, humanSecs, payloadOf, request, appToken, configPath } = testables
+const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, payloadOf, request, appToken, configPath } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -172,6 +172,22 @@ test("a claim the vendor confirmed without a code is a claim, not a failure", as
   )
   assert.equal(no.outcome, "failed")
   assert.match(no.message, /系统繁忙/)
+
+  // …and it is a sufficient condition: a code:200 body that says success:false
+  // is the HTTP layer saying yes and the vendor saying no — "HTTP 层说好、
+  // 业务层说不" — so the flag decides, not the code. It used to be consulted
+  // only when the body named no code at all, so this exact shape was read as
+  // a claim (and settled the day in magpie).
+  const noWithCode = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 200, success: false, message: "签到失败，请稍后重试" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(noWithCode.outcome, "failed", "success:false with a code is a refusal too")
+  assert.match(noWithCode.message, /签到失败/)
+  assert.equal(noWithCode.credit, undefined, "and no balance is read for a claim that did not happen")
 })
 
 test("an already-claimed answer is read in every spelling the vendor's client reads", async () => {
@@ -508,6 +524,20 @@ test("a token the vendor turns away is an error on the card, not an empty one", 
   )
   assert.match(busy.error, /系统繁忙/, "another body code is its own error, not an empty card")
   assert.equal(busy.signIn, "", "and is not mistaken for an expired sign-in")
+
+  // The vendor's words are read the way its client reads them (Vg): any of
+  // message/msg/error/detail, or the same four under `data`. Read as
+  // `message` alone, a refusal spelled `msg` came back as a bare code.
+  const spelled = await withFetch(
+    { "/v1/gettoken": { body: { code: 500, msg: "点数服务繁忙" } } },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(spelled.error, /点数服务繁忙/, "a msg-spelled refusal keeps its words")
+  const wrapped = await withFetch(
+    { "/v1/gettoken": { body: { code: 500, data: { message: "点数服务繁忙" } } } },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(wrapped.error, /点数服务繁忙/, "and so does one under data")
 })
 
 test("the claim window is on the card the moment it opens", async () => {
@@ -1779,6 +1809,31 @@ test("a max_concurrency of the wrong type does not pin the account to one at a t
   assert.equal(q.auth.maxConcurrency, 7, "a real number still is")
 })
 
+test("a catalog big enough to overflow a spread argument still yields its concurrency", async () => {
+  // publishedConcurrency walks the vendor's whole list (the 2000-entry cap is
+  // on the answer given the host, not on this reading) and used to fold it
+  // with Math.min(...nums). A spread passes one argument per entry, and past
+  // ~125k entries on Node (~640k on Bun) that throws "Maximum call stack size
+  // exceeded" — inside the models hook, where the catch turns it into a
+  // fallback, so a catalog that is merely enormous would cost the live list
+  // and the vendor's concurrency. The fold is now a running minimum.
+  const shared = { max_concurrency: 9 }
+  const many = new Array(700000).fill(shared)
+  many[699999] = { max_concurrency: 2 }
+  assert.equal(publishedConcurrency({ data: many }), 2, "the smallest the catalog names, however long the list is")
+
+  // the same shape through the models hook: no fallback, the number applied
+  const entries = []
+  for (let i = 0; i < 130000; i++) entries.push(i === 129999 ? { id: "m-last", max_concurrency: 2 } : { id: `m${i}`, max_concurrency: 9 })
+  const p = await CodarPlugin()
+  const out = await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: entries } } },
+    async () => p.provider.models({ models: {} }, { auth: await auth() }),
+  )
+  assert.equal(out[Symbol.for("magpie.fellBack")], undefined, "no fallback: the size alone is not a failure")
+  assert.equal(p.auth.maxConcurrency, 2, "and the catalog's number reaches the account")
+})
+
 test("a context window that is not a positive number is read as not stated", () => {
   const list = catalogOf({
     data: [
@@ -1844,6 +1899,24 @@ test("a value that is not a map is taken as the user wrote it", () => {
   assert.equal(merged.name, "b")
   assert.deepEqual(merged.variants, [], "an empty list is the user's answer, not a missing one")
   assert.equal(ours.name, "a", "the catalog's own entry is not changed")
+})
+
+test("a model override never writes the magic keys every object shares", () => {
+  // A hand-written plugins.json entry is parsed from JSON, which can carry
+  // keys that do not belong to a model: `__proto__` written onto an object
+  // sets its prototype instead of a field — so a hostile or fat-fingered
+  // entry would put inherited getters under m.name/m.provider through the
+  // share from Object.prototype — and `constructor`/`toString` would ride
+  // along as own keys the host copies into the model it lists. No model has
+  // a field by any of those names, so each is simply dropped.
+  const ours = { name: "ours", provider: { npm: "@ai-sdk/anthropic" } }
+  const entry = JSON.parse('{"__proto__": {"name": "hijacked", "provider": {"npm": "evil"}}, "constructor": {"polluted": true}, "name": "x"}')
+  const merged = mergeModel(ours, entry)
+  assert.equal(Object.getPrototypeOf(merged), Object.prototype, "the merged entry's prototype is untouched")
+  assert.equal(merged.constructor, Object, "the constructor key is not spliced in as an own key")
+  assert.equal(merged.name, "x", "the real name the user wrote wins")
+  assert.equal(merged.provider.npm, "@ai-sdk/anthropic", "and the catalog's provider survives")
+  assert.equal(({}).name, undefined, "not a single object in the process is affected")
 })
 
 test("a model entry that is not an object is dropped, not handed to the host", async () => {
