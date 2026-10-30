@@ -1177,6 +1177,42 @@ test("a claim whose point reads fail still claims, with no made-up credit", asyn
   assert.equal(r.credit, 0)
 })
 
+test("a reward that lands on the agent points is reported, and a fall is not a reward", async () => {
+  // The vendor only says a claim gives "点数奖励" — it does not say which
+  // balance holds it, and the agent balance has moved (3978 → 4000 across a
+  // day) while the general one stayed put. Read from the general balance
+  // alone, that reward was a 0.
+  let n = 0
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        n += 1
+        return new Response(JSON.stringify(n === 1 ? { code: 200, token: 500, agent_token: 3978 } : { code: 200, token: 500, agent_token: 4000 }), { status: 200 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.credit, 22, "the agent balance's gain is this claim's reward")
+
+  // a balance that fell between the reads is the app spending, not this
+  // claim: the reward on the other balance still stands
+  let m = 0
+  const q = await CodarPlugin()
+  const s = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        m += 1
+        return new Response(JSON.stringify(m === 1 ? { code: 200, token: 500, agent_token: 3978 } : { code: 200, token: 480, agent_token: 4000 }), { status: 200 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => q.auth.checkin(auth),
+  )
+  assert.equal(s.credit, 22, "a fall is not subtracted from the reward")
+})
+
 test("each endpoint is asked with its own method, host, body and credential", async () => {
   // The plugin's core design is the split: chat and the catalog on the claw
   // gateway, the account, check-in and points on kuaipaper — and each read
@@ -1623,4 +1659,168 @@ test("the config hook merges a user's model override field by field", async () =
   assert.equal(m.name, "我的名字", "the user's field wins")
   assert.equal(m.provider?.npm, "@ai-sdk/anthropic", "and the catalog's own fields stay")
   assert.ok(m.api?.url, "including the api entry")
+})
+
+test("a model entry that is not an object is dropped, not handed to the host", async () => {
+  // host.js's info() reads every config model's own id and provider while it
+  // builds the provider's row; a null entry throws inside the Promise.all
+  // that builds every provider, so one broken line took the whole provider
+  // list down — not just that model. A model is a plain object; null, a
+  // string, a number or an array is not one, and an array is not a map.
+  const p = await CodarPlugin()
+  const config = {
+    provider: {
+      codar: {
+        models: {
+          "claude-opus-5": null,
+          "deepseek-v4-pro": "not a model",
+          "glm-5.2": 7,
+          "glm-5.3": ["not", "a", "model"],
+          "my-own": { id: "my-own", name: "Mine" },
+        },
+      },
+    },
+  }
+  await p.config(config)
+  const models = config.provider.codar.models
+  for (const id of ["claude-opus-5", "deepseek-v4-pro", "glm-5.2", "glm-5.3"]) {
+    assert.equal(models[id]?.id, id, `${id} is the catalog's own entry, not the broken one`)
+    assert.ok(models[id].provider?.npm, `${id} still carries the fields the host reads`)
+  }
+  assert.equal(models["my-own"].name, "Mine", "a model of the user's own is kept")
+  assert.equal(Object.keys(models).length, 17, "16 catalog models and the user's one")
+
+  const other = { provider: { codar: { models: [{ id: "x" }] } } }
+  await p.config(other)
+  assert.equal(Object.keys(other.provider.codar.models).length, 16, "an array of models is no model map")
+})
+
+test("a points answer whose code is not 200 is a refusal, not a balance of 0", async () => {
+  // The vendor's own client refuses any answer whose code is a number other
+  // than 200 before it reads the balances (app.asar's Jo: Number(e.code),
+  // finite and not 200, throws). Read only as ">= 400 is an error", a
+  // refusal spelled {code: 1, token: 0} came out as "0 点", and routing took
+  // the account for spent.
+  const p = await CodarPlugin()
+  for (const bad of [{ code: 1, token: 0 }, { code: 0, token: 0 }]) {
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body: bad },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+    assert.ok(u.error, `a body of ${JSON.stringify(bad)} is a read that failed, not a balance of 0`)
+    assert.equal(u.windows, undefined, "and no card is drawn from it")
+  }
+  // the check-in still claims; an unreadable balance is no credit, not a zero
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 1, token: 0 } },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "claimed")
+  assert.equal(r.credit, 0)
+})
+
+test("the balances are read from data when the vendor wraps them, as its client does", async () => {
+  // The vendor's client unwraps `data` when it is an object (app.asar's Fc)
+  // before reading the balances. The live body is flat, but a wrapped one
+  // used to read as "no balance at all" — an error card over a real account.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, data: { token: 7, agent_token: 3 } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const wallet = u.windows.find((w) => w.name === "点数余额")
+  assert.equal(wallet.balance, 7, "the wrapped figure is the balance")
+  assert.match(u.balance, /7 点/)
+  assert.match(u.balance, /Agent 3 点/)
+})
+
+test("a claim state the vendor refused is not drawn as claimable", async () => {
+  // The vendor's client refuses a status answer with a numeric code other
+  // than 200 (app.asar's tRe: Jo before ayt) and reads nothing from it.
+  // Drawn from data alone, {code: 500, data: {isSigned: false}} said "现在
+  // 可以领" — an offer the vendor would have refused.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 500, message: "获取签到状态失败，请稍后重试", data: { isSigned: false, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.windows.find((w) => w.name === "每日签到"), undefined, "a refused answer draws no claim row")
+  assert.ok(u.windows.find((w) => w.name === "点数余额"), "the points still show")
+})
+
+test("a wait the vendor spelled as a boolean or an array is not a wait", async () => {
+  // Number(true) is 1 and Number([3600]) is 3600, so a boolean retry_after
+  // was said as "1 秒后可再领" and an array as an hour. The vendor's own
+  // client takes a number or a string that says one (app.asar's B0).
+  assert.equal(humanSecs(true), "", "a boolean is not a number of seconds")
+  assert.equal(humanSecs([3600]), "")
+  assert.equal(humanSecs("3600"), "1 小时", "a numeric string still is")
+
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: true } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const sign = u.windows.find((w) => w.name === "每日签到")
+  assert.equal(sign.display, "今天已领", "the claim is said, the made-up wait is not")
+  assert.equal("resetsAt" in sign, false)
+
+  // and the check-in's own wait: an array is not a next-claim time
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: [3600] } } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "done")
+  assert.equal(r.message, "今天已领过", "no hour the vendor never stated")
+  assert.ok(r.until <= Date.now() + 31 * 60 * 1000, "the trust floor, not a time it never said")
+})
+
+test("the reply ceiling the vendor states is on the model", () => {
+  // The vendor's request schema states max_tokens.maximum per model, and
+  // magpie lowers a request asking for more to the model's limit.output
+  // (gateway's maxoutput.go): without it, an agent asking past the ceiling
+  // got the vendor's refusal instead of a lowered request.
+  const list = catalogOf({
+    data: [
+      { id: "stated", request_schema: { properties: { max_tokens: { maximum: 131072 } } }, protocol: { type: "openai_chat_completions" } },
+      { id: "unstated", protocol: { type: "openai_chat_completions" } },
+      { id: "odd", request_schema: { properties: { max_tokens: { maximum: true } } }, protocol: { type: "openai_chat_completions" } },
+    ],
+  })
+  const by = (id) => list.find((m) => m.id === id)
+  assert.equal(by("stated").maxOutput, 131072, "the stated ceiling is read")
+  assert.equal(by("unstated").maxOutput, 0, "none stated is not a ceiling")
+  assert.equal(by("odd").maxOutput, 0, "a boolean is not a ceiling")
+  assert.equal(modelOf(by("stated")).limit.output, 131072, "and it reaches the model magpie builds")
+  assert.equal(modelOf(by("unstated")).limit.output, 0)
+})
+
+test("a catalog record that is not an object is skipped, not handed on", () => {
+  // The same Promise.all trap as the config hook: the models hook answers
+  // with this list, and one null in it would throw while the host builds its
+  // rows. A record with no id has nothing to serve either.
+  const list = catalogOf({ data: [null, true, 7, "x", ["also", "not", "a", "record"], { id: "ok", protocol: { type: "openai_chat_completions" } }] })
+  assert.deepEqual(list.map((m) => m.id), ["ok"])
 })

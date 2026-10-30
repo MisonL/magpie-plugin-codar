@@ -72,13 +72,19 @@ const safeTime = (ms) => {
 // "1.1574074074074072e+303 天后" is not a thing a card says.
 const MAX_WAIT_SECS = MAX_TIME_MS / 1000
 
+// numOf is a vendor field as a number, read the way its own client reads one
+// (app.asar's B0): a number, or a string that says one. A boolean, an array
+// or an object is not one — Number(true) is 1 and Number([3600]) is 3600, and
+// a made-up second is a made-up wait. NaN when there is no number.
+const numOf = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN)
+
 // sayableSecs is a vendor's number of seconds when it is one a card can say:
 // finite, positive, and inside the calendar. Anything else is 0 — "not
 // stated" — so callers can decide with one check whether they have a time at
 // all. The bound is what keeps `secs * 1000` from overflowing to Infinity,
 // which safeTime would turn into 0 and a host would draw as 1970-01-01.
 const sayableSecs = (v) => {
-  const n = Number(v)
+  const n = numOf(v)
   return Number.isFinite(n) && n > 0 && n <= MAX_WAIT_SECS ? n : 0
 }
 
@@ -271,9 +277,10 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
 // humanSecs says a number of seconds the way a card wants it. A number no
 // calendar can say (a vendor's Infinity, a NaN, a wait past year 9999) is
 // said as nothing rather than as "Infinity 天" or "1.15e+303 天": the caller
-// leaves it out.
+// leaves it out. Neither is a value that is not a number at all (see numOf):
+// Number(true) would be said as "1 秒", and the vendor said no such thing.
 function humanSecs(secs) {
-  const raw = Number(secs)
+  const raw = numOf(secs)
   if (!isFinite(raw) || raw > MAX_WAIT_SECS) return ""
   const n = Math.max(0, Math.round(raw))
   if (n < 60) return `${n} 秒`
@@ -294,27 +301,36 @@ function humanSecs(secs) {
 // came out blank with no error and no expired mark.
 const pointsOf = async (token, username, opts) => {
   const r = await request(`${ACCOUNT}${POINTS_PATH}`, { method: "POST", body: { username, token: 0 }, token, ...opts })
+  // the vendor's own client (app.asar's Jo) refuses any answer whose code is
+  // a number other than 200 — Number(e.code) as it reads it — and only then
+  // reads the balances. Only `>= 400` was refused here, so a refusal spelled
+  // with a smaller code ({code: 1, token: 0}) read as a balance of 0 and the
+  // card said the account was spent.
   const code = Number(r?.code)
-  if (Number.isFinite(code) && code >= 400) {
+  if (Number.isFinite(code) && code !== 200) {
     const said = typeof r?.message === "string" ? r.message.trim() : ""
     throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
   }
-  const num = (v) => {
-    // a number, or a string that says one: Number(" ") is 0, Number([]) is 0
-    // and Number(true) is 1, and a made-up 0 is a balance the account does
-    // not have — routing would read the account as spent. A negative is not
-    // a balance either: the host clamps a wallet reading to 0, so passing one
-    // on would put "-5 点" on the card beside a routing figure of 0.
-    if (typeof v === "number") return isFinite(v) && v >= 0 ? v : null
-    if (typeof v === "string" && v.trim() !== "" && isFinite(Number(v)) && Number(v) >= 0) return Number(v)
-    return null
+  // …and the balances come from `data` when that is an object, as its client
+  // unwraps it (Fc): the live body is flat ({code, token, agent_token,
+  // rewrite_token}), and a wrapped one is what that client prefers if the
+  // vendor starts sending it.
+  const body = r?.data && typeof r.data === "object" ? r.data : r
+  const balance = (v) => {
+    // a number, or a string that says one (numOf): a made-up 0 is a balance
+    // the account does not have — routing would read the account as spent.
+    // A negative is not a balance either: the host clamps a wallet reading
+    // to 0, so passing one on would put "-5 点" on the card beside a routing
+    // figure of 0.
+    const n = numOf(v)
+    return Number.isFinite(n) && n >= 0 ? n : null
   }
   // the vendor's own client reads each balance by trying these names in this
   // order (app.asar's Xbt → hd(n, […])); the live body says `token` and
   // `agent_token`, and the rest are the spellings that client hedges on.
   const pick = (names) => {
     for (const name of names) {
-      const n = num(r?.[name])
+      const n = balance(body?.[name])
       if (n != null) return n
     }
     return null
@@ -327,12 +343,14 @@ const pointsOf = async (token, username, opts) => {
   return { general, agent }
 }
 
-// contextOf is a vendor's context window as a non-negative whole number.
-// A negative or an infinite one is not a size anyone can plan with, and it
-// would reach magpie's list as written, so it becomes "not stated".
-function contextOf(v) {
-  const n = Number(v)
-  return isFinite(n) && n > 0 ? Math.floor(n) : 0
+// tokensOf is a vendor's token count — a context window, a reply ceiling —
+// as a non-negative whole number. A negative or an infinite one is not a
+// size anyone can plan with, and it would reach magpie's list as written, so
+// it becomes "not stated" (0). Neither is a value that is not a number at
+// all (see numOf).
+function tokensOf(v) {
+  const n = numOf(v)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
 }
 
 // apiBase is where this provider's requests go: the address the host already
@@ -371,7 +389,7 @@ function modelOf(m, base = `${API}/v1`) {
     // be fetched.
     provider: { npm },
     api: { id: m.id, url: base, npm },
-    limit: { context: contextOf(m.context), output: 0 },
+    limit: { context: tokensOf(m.context), output: tokensOf(m.maxOutput) },
     // The vendor prices in CNY per million tokens; magpie's cost column is
     // US dollars, and inventing an exchange rate here would put a wrong
     // number on the Usage page. Left at 0, which magpie shows as unpriced
@@ -399,21 +417,35 @@ const modelsOf = (list, base) => Object.fromEntries(list.map((m) => [m.id, model
 // catalog.mjs keeps, so both paths build the same entries. Vendor text is
 // cleaned: a control character would break the card it lands on, and an id
 // that has to be cleaned is not an id a request can ask for, so that record
-// is left out rather than renamed.
+// is left out rather than renamed. A record that is not a plain object is
+// left out too.
 function catalogOf(body) {
   const list = body?.catalog?.data ?? body?.data ?? null
   if (!Array.isArray(list)) return null
   const out = []
   for (const m of list) {
     if (out.length >= MAX_MODELS) break
-    const rawId = typeof m?.id === "string" ? m.id.trim() : ""
+    // a record that is not a plain object (the list held a null, a boolean,
+    // a bare number, an array) is left out: it has no id to serve, and the
+    // host reads the list this hook answers with while it builds every
+    // provider's row in one Promise.all — one such record would throw there
+    // and take the whole provider list down, not just that row.
+    if (!m || typeof m !== "object" || Array.isArray(m)) continue
+    const rawId = typeof m.id === "string" ? m.id.trim() : ""
     const id = cleanText(rawId)
     if (!id || id !== rawId) continue
     const said = typeof m.display_name === "string" ? cleanText(m.display_name) : ""
     out.push({
       id,
       name: said || id,
-      context: contextOf(m.context_window),
+      context: tokensOf(m.context_window),
+      // the most tokens a reply may hold, as the vendor's own request schema
+      // states it (request_schema.properties.max_tokens.maximum): magpie
+      // lowers a request asking for more to it (gateway's maxoutput.go),
+      // which is what keeps a client's over-asking from reaching the vendor
+      // as a refusal. 0 where the vendor states none (gpt-5.6-sol, gpt-6-sol
+      // and gpt-6-astra state none today).
+      maxOutput: tokensOf(m.request_schema?.properties?.max_tokens?.maximum),
       input: Array.isArray(m.input_modalities) ? m.input_modalities : ["text"],
       output: Array.isArray(m.output_modalities) ? m.output_modalities : ["text"],
       protocol: m.protocol?.type === "anthropic_messages" ? "anthropic_messages" : "openai_chat_completions",
@@ -449,10 +481,10 @@ const runningActivities = (body) => {
 const publishedConcurrency = (body) => {
   const nums = []
   const take = (v) => {
-    // a number, or a string that says one: Number(true) is 1 and Number([5])
-    // is 5, and a vendor field of the wrong type would otherwise silently
-    // pin the whole account to one request at a time.
-    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN
+    // a number, or a string that says one (numOf): a boolean or an array is
+    // not a count, and a vendor field of the wrong type would otherwise
+    // silently pin the whole account to one request at a time.
+    const n = numOf(v)
     if (Number.isInteger(n) && n > 0 && n <= 1000) nums.push(n)
   }
   const list = body?.catalog?.data ?? body?.data
@@ -475,6 +507,11 @@ const signedIn = (data) => {
   for (const name of ["isSigned", "signed", "hasSigned", "has_signed"]) if (typeof data[name] === "boolean") return data[name]
   return false
 }
+
+// gain is how much one balance grew between the claim's two reads: the
+// difference when both are known and it did not fall — a fall is the app
+// spending, not this claim — else 0.
+const gain = (was, now) => (was != null && now != null && now >= was ? now - was : 0)
 
 // scrubLine is said as one line with no credential in it: the key itself
 // where it is known, then anything credential-shaped where it is not (a
@@ -604,7 +641,11 @@ export async function CodarPlugin(input) {
           let credit = 0
           try {
             const after = await pointsOf(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
-            if (before?.general != null && after?.general != null && after.general >= before.general) credit = after.general - before.general
+            // 两处余额都算：厂商只说过「签到领取点数奖励」，没说奖励落在通用
+            // 点数还是 Agent 点数——只算前者会把落在后者上的奖励报成 0。每一
+            // 处只在不减时计入（减少是花掉，不是这次领到），两处之和才是这次
+            // 签到真给账号加上的数。任一处读不到就不报，credit 留 0。
+            credit = gain(before?.general, after?.general) + gain(before?.agent, after?.agent)
           } catch {
             // 差额读不到就不报，credit 留 0
           }
@@ -685,8 +726,13 @@ export async function CodarPlugin(input) {
         //
         // 状态按厂商 App 自己的读法（app.asar 的 ayt）：data 可以是那个布尔，
         // 也可以是写着它的对象（四种写法）；两种形状都画这一行，其余形状不画。
+        // 先过它的 code 关：厂商调状态接口时也是先 Jo（数字码不是 200 就当
+        // 失败），再 ayt 读应答。只认 data 的话，{code: 500, data:{isSigned:
+        // false}} 会被画成「现在可以领」——厂商自己这时只会说查询失败。
+        // 这一行是附加信息，画不出来就不画，卡片照报点数。
         const status = statusR.status === "fulfilled" ? statusR.value : null
-        const data = status?.data
+        const statusCode = Number(status?.code)
+        const data = Number.isFinite(statusCode) && statusCode !== 200 ? undefined : status?.data
         if (typeof data === "boolean" || (data && typeof data === "object")) {
           const signed = signedIn(data)
           // 秒数先说得出、再在签到说得出的范围内：说不出的（没给、给了 0、
@@ -838,10 +884,16 @@ export async function CodarPlugin(input) {
       // 供应商级 api 不一致的地址。
       const api = typeof was.api === "string" && was.api ? was.api : `${API}/v1`
       const models = modelsOf(CATALOG, api)
-      const own = was.models && typeof was.models === "object" ? was.models : {}
+      // models 本身不是对象（数组也是「对象」，但按 id 读不出模型）时当作没有。
+      const own = was.models && typeof was.models === "object" && !Array.isArray(was.models) ? was.models : {}
       const merged = { ...models }
       for (const [id, m] of Object.entries(own)) {
-        merged[id] = m && typeof m === "object" && models[id] ? { ...models[id], ...m } : m
+        // 不是对象的条目不是模型：宿主建供应商信息时把所有模型逐条展开
+        // （host.js 的 info，读 m.id/m.provider），其中一个 null 就抛异常，
+        // 整个 RPC 失败——所有供应商都从列表里消失，而不只是丢掉这一条。
+        // 数组也是对象，但同样不是模型，一并丢掉。
+        if (!m || typeof m !== "object" || Array.isArray(m)) continue
+        merged[id] = models[id] ? { ...models[id], ...m } : m
       }
       config.provider[ID] = {
         ...was,

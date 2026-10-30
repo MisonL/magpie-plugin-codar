@@ -72,6 +72,13 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   id such as `claude-opus-5-kiro` is not in models.dev, but magpie prices it
   by the `served` model the vendor's answer names (`claude-opus-5`). Set a
   per-model price in magpie to override any of them.
+- **It does not map the vendor's reasoning levels onto magpie's effort
+  variants.** The catalog states each model's levels (`reasoning.levels`), but
+  a level's meaning is a script of request-body fields (`set`/`omit`) the
+  desktop app applies itself; magpie's variants only name levels and pass the
+  client's own effort through. A plugin has no way to say what a level does to
+  the request, so listing them would promise levels magpie cannot apply the
+  vendor's way — the models carry `reasoning: true` and no variants.
 
 ## Notes
 
@@ -107,7 +114,15 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   `token`/`remaining_points`/`points`/`balance` and `agent_token`/`agentToken`/
   `agent_points`/`agentPoints`, and a negative reading is treated as not
   stated (the host clamps a wallet figure to 0, so passing one on would put
-  two answers on the card).
+  two answers on the card). An answer whose body `code` is a number other
+  than 200 is a refusal, as that client reads it: the points read fails with
+  the code instead of reporting a balance of 0, and a refused claim state
+  draws no row rather than "you can claim now". The balances also come from
+  `data` when the vendor wraps them in one, as that client unwraps it. The
+  check-in's credit is the sum of both balances' increases between its two
+  reads — the vendor says a claim grants "点数奖励" without saying which
+  balance holds it — and a balance that fell (the app spending) is not
+  subtracted from it.
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card
@@ -118,7 +133,16 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   own SDK, not just the provider's default.
 - Models you add to this provider yourself (ids the embedded catalog does not
   have) are kept when the vendor's list refreshes; the vendor's own entries
-  follow the vendor.
+  follow the vendor. A config model entry that is not a plain object (a null,
+  a string, an array) is dropped rather than passed on: the host builds every
+  provider's row from that map in one Promise.all, and one such entry throws —
+  taking the whole provider list down, not just that entry.
+- A model's reply ceiling is the vendor's own: the catalog states
+  `max_tokens.maximum` per model (13 of 16 today; `gpt-5.6-sol`, `gpt-6-astra`
+  and `gpt-6-sol` state none, and 0 means "not stated"), and it goes out as
+  the model's `limit.output`. magpie lowers a request that asks for more to it
+  (its gateway's `maxoutput.go`), so an agent asking past the ceiling gets a
+  lowered request instead of the vendor's refusal.
 - Codar's free models allow 3 requests per model at a time (measured: with
   four in flight, the fourth answers 429 `concurrent_limit_exceeded`, "Too
   many concurrent requests"). The auth hook declares 3, so magpie queues
