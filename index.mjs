@@ -82,6 +82,18 @@ const sayableSecs = (v) => {
   return Number.isFinite(n) && n > 0 && n <= MAX_WAIT_SECS ? n : 0
 }
 
+// MAX_CHECKIN_WAIT_SECS is the longest wait the daily check-in can name.
+// Codar's day is a rolling 24 hours (measured retry_after ≈ 23 h), so a wait
+// past a week is not a next-claim time that window can produce. Trusting it
+// would settle the check-in for as long as the vendor's number says — 1e9
+// seconds is 31 years, and magpie would not ask again until 2058 — so such a
+// number is treated as one we cannot use, like a missing one.
+const MAX_CHECKIN_WAIT_SECS = 7 * 24 * 3600
+const checkinWaitSecs = (v) => {
+  const n = sayableSecs(v)
+  return n > 0 && n <= MAX_CHECKIN_WAIT_SECS ? n : 0
+}
+
 // MAX_MODELS is how many models one vendor catalog may bring back. The host
 // passes a hook's answer to Go as a single JSON line and kills the whole
 // plugin host — every plugin in it — when that line passes 32 MiB
@@ -199,8 +211,11 @@ function appToken(file = configPath()) {
   let text
   try {
     text = readFileSync(file, "utf8")
-  } catch {
-    return { error: `没找到 ${file}，先在这台机器上登录一次科搭，或改用「科搭访问令牌」粘贴` }
+  } catch (e) {
+    // 不存在和读不了是两回事：让人「先登录一次科搭」修不好权限问题，指过去
+    // 只会白跑一趟。
+    if (e?.code === "ENOENT") return { error: `没找到 ${file}，先在这台机器上登录一次科搭，或改用「科搭访问令牌」粘贴` }
+    return { error: `读不了 ${file}（${e?.code ?? whyOf(e)}），检查文件权限后重试，或改用「科搭访问令牌」粘贴` }
   }
   let token = ""
   try {
@@ -287,13 +302,25 @@ const pointsOf = async (token, username, opts) => {
   const num = (v) => {
     // a number, or a string that says one: Number(" ") is 0, Number([]) is 0
     // and Number(true) is 1, and a made-up 0 is a balance the account does
-    // not have — routing would read the account as spent.
-    if (typeof v === "number") return isFinite(v) ? v : null
-    if (typeof v === "string" && v.trim() !== "" && isFinite(Number(v))) return Number(v)
+    // not have — routing would read the account as spent. A negative is not
+    // a balance either: the host clamps a wallet reading to 0, so passing one
+    // on would put "-5 点" on the card beside a routing figure of 0.
+    if (typeof v === "number") return isFinite(v) && v >= 0 ? v : null
+    if (typeof v === "string" && v.trim() !== "" && isFinite(Number(v)) && Number(v) >= 0) return Number(v)
     return null
   }
-  const general = num(r.token)
-  const agent = num(r.agent_token)
+  // the vendor's own client reads each balance by trying these names in this
+  // order (app.asar's Xbt → hd(n, […])); the live body says `token` and
+  // `agent_token`, and the rest are the spellings that client hedges on.
+  const pick = (names) => {
+    for (const name of names) {
+      const n = num(r?.[name])
+      if (n != null) return n
+    }
+    return null
+  }
+  const general = pick(["token", "remaining_points", "points", "balance"])
+  const agent = pick(["agent_token", "agentToken", "agent_points", "agentPoints"])
   // a 200 whose body names no balance at all is a read we cannot use: said
   // as an error, the card says why, instead of drawing nothing
   if (general == null && agent == null) throw new ApiError("点数查询没有返回余额", 0)
@@ -435,6 +462,20 @@ const publishedConcurrency = (body) => {
   return nums.length ? Math.min(...nums) : 0
 }
 
+// signedIn is whether the account has claimed today, read the way the
+// vendor's own client reads it (app.asar's ayt): the answer's data is either
+// the state itself (a boolean) or an object naming it, and the client accepts
+// any of four spellings, each only as a real boolean. A string "false" is not
+// one: Boolean("false") is true, and a card that claims the day when it is
+// not costs the user a claim. Anything else is "not signed", as that client
+// reads it — the card then offers the claim instead of hiding the row.
+const signedIn = (data) => {
+  if (typeof data === "boolean") return data
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false
+  for (const name of ["isSigned", "signed", "hasSigned", "has_signed"]) if (typeof data[name] === "boolean") return data[name]
+  return false
+}
+
 // scrubLine is said as one line with no credential in it: the key itself
 // where it is known, then anything credential-shaped where it is not (a
 // getAuth that threw leaves no key to cut by). A token a server spliced a
@@ -570,8 +611,6 @@ export async function CodarPlugin(input) {
           return { outcome: "claimed", credit, message: signMessage(r, token) || "签到成功" }
         }
         if (code === 400 && /24\s*小时|仅可领取一次/.test(signMessage(r, token))) {
-          const retry = Number(r?.data?.retry_after)
-          const wait = humanSecs(retry)
           // until 是 magpie 0.1.1795 起的契约（"a plugin's until is when its
           // answer stops holding"，v0.1.1795 首发；README 里早先写的 0.1.1862
           // 是首次核对时看错的版本）：签到答案什么时候失效、下次何时该再问。
@@ -582,11 +621,13 @@ export async function CodarPlugin(input) {
           // 漏掉下一次可领。给一个 30 分钟的保质期：这只是「这个答案我们
           // 信多久」，不是替厂商编一个可领时刻；最坏也就是回到 until 之前
           // 的每 30 分钟问一次。
-          // 秒数先说得出、再说信多久：一个日历说不出的数（1e308 有限、
-          // 大于 0，乘 1000 却溢出成 Infinity）不是「可信的时刻」，和厂商
-          // 没说一样，落到 30 分钟的保质期；夹到年 9999 会把这一天永远
-          // 结清，比 30 分钟糟得多。
-          const waitSecs = sayableSecs(retry) || 30 * 60
+          // 秒数先说得出、再说信多久：日历写不出的数（1e308 乘 1000 溢出成
+          // Infinity）和滚动 24 小时窗口产不出的数（1e9 秒是 31 年）都不是
+          // 「可信的时刻」，和厂商没说一样落到 30 分钟的保质期；照单全收会
+          // 把这一天结清到 2058 年。见 checkinWaitSecs。
+          const secs = checkinWaitSecs(r?.data?.retry_after)
+          const wait = secs ? humanSecs(secs) : ""
+          const waitSecs = secs || 30 * 60
           const hold = safeTime(Date.now() + waitSecs * 1000)
           return {
             outcome: "done",
@@ -641,16 +682,18 @@ export async function CodarPlugin(input) {
         // 不带 used：签到不是一份会用完的额度，magpie 的 plugin_usage.go 把
         // 没有份额的 aside 行标成 Text（它自己的注释也拿「每日签到」当例子），
         // 不会画成一个 100% 的进度条。
-        if (statusR.status === "fulfilled" && statusR.value?.data && typeof statusR.value.data === "object") {
-          const st = statusR.value
-          // 只认真正的 true：厂商哪天把它写成字符串 "false"，Boolean("false")
-          // 是 true，卡片会把没领的说成已领。
-          const signed = st.data.isSigned === true
-          // 秒数先说得出：说不出的（没给、给了 0、或大到日历写不出——
-          // retry_after 1e308 乘 1000 溢出成 Infinity，safeTime 给 0）就
-          // 没有可报的时刻，文案和 resetsAt 一起省掉。宿主的 when(0) 会把
-          // 0 画成 1970-01-01，而不是当成「没说」。
-          const secs = sayableSecs(st.data.retry_after)
+        //
+        // 状态按厂商 App 自己的读法（app.asar 的 ayt）：data 可以是那个布尔，
+        // 也可以是写着它的对象（四种写法）；两种形状都画这一行，其余形状不画。
+        const status = statusR.status === "fulfilled" ? statusR.value : null
+        const data = status?.data
+        if (typeof data === "boolean" || (data && typeof data === "object")) {
+          const signed = signedIn(data)
+          // 秒数先说得出、再在签到说得出的范围内：说不出的（没给、给了 0、
+          // 大到日历写不出——1e308 乘 1000 溢出成 Infinity，safeTime 给 0）
+          // 就没有可报的时刻，文案和 resetsAt 一起省掉。宿主的 when(0) 会把
+          // 0 画成 1970-01-01，而不是当成「没说」。见 checkinWaitSecs。
+          const secs = checkinWaitSecs(typeof data === "object" ? data.retry_after : undefined)
           const wait = secs ? humanSecs(secs) : ""
           windows.push({
             name: "每日签到",
@@ -783,7 +826,11 @@ export async function CodarPlugin(input) {
     // 剩下的字段（尤其是 provider.npm）还得在——少了它，宿主给这个模型解析
     // 出供应商级的 openai-compatible，Claude 模型就按 Chat 协议发了。
     async config(config) {
-      config.provider ??= {}
+      // 宿主给的 config 本该是 {provider:{…}}，但配错的文件里 provider 可能是
+      // 字符串或数字：往字符串上写属性会抛 TypeError，整个钩子失败、这个供应
+      // 商在启动时就不存在了。不是对象（含数组——数组上写具名属性
+      // JSON.stringify 会丢掉）就换一个空的，别的钩子照常拿到它们那份。
+      if (!config.provider || typeof config.provider !== "object" || Array.isArray(config.provider)) config.provider = {}
       const was = config.provider[ID] && typeof config.provider[ID] === "object" ? config.provider[ID] : {}
       // 每条的 api.url 写用户设过的那个地址（他自己可能指着自建代理），
       // 否则写厂商网关：写进 config 的就是真话——宿主在那条路径上本来

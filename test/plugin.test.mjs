@@ -144,20 +144,18 @@ test("already claimed today is `done`, with when to come back", async () => {
   assert.ok(noWait.until > Date.now() && noWait.until <= Date.now() + 31 * 60 * 1000, "a vendor that names no time gets a bounded hold, not the whole day")
 })
 
-test("a vendor wait no calendar can state gets the trust floor, not a time handed on", async () => {
-  // Two ceilings a time handed on has to sit under: host.js's checkinOf does
+test("a wait the daily window cannot produce gets the trust floor, not a time handed on", async () => {
+  // A time handed on has to sit under two ceilings: host.js's checkinOf does
   // new Date(t).toISOString(), which throws RangeError past 8.64e15; and
   // magpie's Go side parses the ISO string with RFC3339's four-digit year, so
   // a "+275760-…" string parses to zero and the time is dropped — "done with
-  // no until" then settles the whole day. A wait past year 9999 is one no
-  // card can say and nothing downstream can read, and 1e308 seconds is
-  // finite but overflows to Infinity once multiplied by 1000. Such a number
-  // is not a time this answer can hold on: it gets the same 30-minute trust
-  // floor as a vendor that named none, rather than a clamp to year 9999 that
-  // would settle the day forever — a rolling 24-hour window would then lose
-  // every later claim.
+  // no until" then settles the whole day. And a wait has to be one Codar's
+  // own day can produce: it rolls 24 hours (measured retry_after ≈ 23 h), so
+  // 1e9 seconds is 31 years and magpie would not ask again until 2058. Each
+  // of these is not a time this answer can hold on: it gets the same
+  // 30-minute trust floor as a vendor that named none.
   const p = await CodarPlugin()
-  for (const retry_after of [1e13, 1e15, Number.MAX_SAFE_INTEGER, 1e308]) {
+  for (const retry_after of [1e9, 1e13, 1e15, Number.MAX_SAFE_INTEGER, 1e308]) {
     const r = await withFetch(
       {
         "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
@@ -170,19 +168,21 @@ test("a vendor wait no calendar can state gets the trust floor, not a time hande
     const iso = new Date(r.until).toISOString()
     assert.doesNotThrow(() => new Date(r.until).toISOString(), "and one the host can turn into an ISO string")
     assert.match(iso, /^\d{4}-\d{2}-\d{2}T/, "a four-digit year, as Go's RFC3339 parse needs")
-    assert.ok(r.until > Date.now() && r.until <= Date.now() + 31 * 60 * 1000, "the floor, not a day settled for good")
+    assert.ok(r.until > Date.now() && r.until <= Date.now() + 31 * 60 * 1000, "the floor, not a day settled for decades")
+    assert.doesNotMatch(r.message, /年|2058|11574 天/, "and the card does not repeat the number it cannot use")
   }
 
-  // a wait that is sayable but lands past the last instant both ends read is
-  // clamped to it, not dropped
+  // a wait the window can produce — up to a week — is handed on as it is
+  const before = Date.now()
   const near = await withFetch(
     {
       "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
-      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 253402300000 } } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 6 * 24 * 3600 } } },
     },
     async () => p.auth.checkin(auth),
   )
-  assert.equal(near.until, 253402300799999, "9999-12-31T23:59:59.999Z, the last instant both accept")
+  assert.ok(near.until >= before + 6 * 24 * 3600 * 1000 && near.until <= Date.now() + 6 * 24 * 3600 * 1000, "six days is a wait a daily window can name")
+  assert.match(near.message, /6 天后可再领/)
 
   // a vendor number that is not finite at all still yields a usable answer
   const inf = await withFetch(
@@ -249,6 +249,93 @@ test("a balance that cannot be read fails the read, it does not become 0", async
   const p = await CodarPlugin()
   const u = await withFetch({ "/v1/gettoken": { status: 500, body: { detail: "boom" } } }, async () => p.auth.usage(auth))
   assert.ok(u.error, "an unreadable balance is an error, not an empty card")
+})
+
+test("the claim row reads the vendor client's own spellings", async () => {
+  // The vendor's client (app.asar's ayt) reads the state as the boolean data
+  // itself or from any of four field names, each only as a real boolean. A
+  // rename its client still handles must not turn a claimed day into "还没领".
+  const p = await CodarPlugin()
+  const row = async (statusData) => {
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign/status": { body: { code: 200, data: statusData } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+    return u.windows.find((w) => w.name === "每日签到")
+  }
+  assert.equal((await row({ signed: true })).display, "今天已领", "the client's `signed`")
+  assert.equal((await row({ hasSigned: true })).display, "今天已领", "and `hasSigned`")
+  assert.equal((await row({ has_signed: true })).display, "今天已领", "and `has_signed`")
+  assert.equal((await row(true)).display, "今天已领", "a boolean answer is the state itself")
+  assert.equal((await row(false)).display, "今天还没领，现在可以领")
+  assert.equal((await row({ isSigned: "true" })).display, "今天还没领，现在可以领", "a string is not a boolean: Boolean(\"false\") is true")
+})
+
+test("the balances are read by the vendor client's own names", async () => {
+  // app.asar's Xbt reads general points by token/remaining_points/points/
+  // balance and agent points by agent_token/agentToken/agent_points/
+  // agentPoints; a rename its client still handles must not fail the card.
+  const p = await CodarPlugin()
+  const read = async (body) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, ...body } },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+  assert.match((await read({ remaining_points: 500 })).balance, /500 点/)
+  assert.match((await read({ points: 500 })).balance, /500 点/)
+  assert.match((await read({ balance: 500 })).balance, /500 点/)
+  assert.match((await read({ agentToken: 7 })).balance, /Agent 7 点/)
+  assert.match((await read({ agent_points: 7 })).balance, /Agent 7 点/)
+  assert.match((await read({ agentPoints: 7 })).balance, /Agent 7 点/)
+})
+
+test("a negative reading is not a balance", async () => {
+  // The host clamps a wallet reading to 0, so passing a negative on would put
+  // "-5 点" on the card beside a routing figure of 0 — two answers, neither
+  // true. Nothing usable left is an error, as with any other unreadable read.
+  const p = await CodarPlugin()
+  const read = async (body) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, ...body } },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+  const neg = await read({ token: -5, agent_token: 3 })
+  assert.equal(neg.windows.find((w) => w.name === "点数余额"), undefined, "a negative is not a balance")
+  assert.doesNotMatch(neg.balance, /-5/)
+  assert.match(neg.balance, /Agent 3 点/)
+
+  const none = await read({ token: -5, agent_token: -1 })
+  assert.match(none.error, /没有返回余额/, "nothing usable is an error, not a made-up 0")
+})
+
+test("a claim row's wait past the daily window carries no time", async () => {
+  // The same week ceiling the check-in holds to: 1e9 seconds is 31 years, a
+  // next-claim time the rolling 24-hour window cannot produce.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 1e9 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const win = u.windows.find((w) => w.name === "每日签到")
+  assert.ok(win, "the row is still there")
+  assert.equal("resetsAt" in win, false, "and carries no time it cannot use")
+  assert.equal(win.display, "今天已领")
 })
 
 test("a token the vendor turns away is an error on the card, not an empty one", async () => {
@@ -593,6 +680,25 @@ test("the config hook keeps a provider name the user set", async () => {
   assert.ok(config.provider.codar.models["deepseek-v4.1-flash"], "the catalog is still filled in")
 })
 
+test("a config whose provider is not an object does not take the provider down", async () => {
+  // `config.provider ??= {}` leaves a string or a number in place, and writing
+  // a property onto one throws: the whole hook fails and the codar provider
+  // is not there at startup. An array keeps the write but loses it in
+  // JSON.stringify, so it is replaced too.
+  for (const bad of ["x", 5, [], true, "科搭"]) {
+    const p = await CodarPlugin()
+    const config = { provider: bad }
+    await p.config(config)
+    assert.equal(typeof config.provider, "object", `${JSON.stringify(bad)} becomes an object`)
+    assert.ok(!Array.isArray(config.provider), "and not an array, whose named fields would not be written")
+    assert.equal(config.provider.codar.name, "科搭 Codar")
+    assert.ok(config.provider.codar.models["deepseek-v4.1-flash"])
+  }
+  const missing = {}
+  await (await CodarPlugin()).config(missing)
+  assert.equal(missing.provider.codar.api, "https://api.claw.speedai.com/v1", "a config with no provider at all still gets ours")
+})
+
 test("the auth hook asks magpie for the vendor's three concurrent requests", async () => {
   // Codar turns away the 4th concurrent request of one model with 429
   // concurrent_limit_exceeded (measured 2026-10-27: 2 and 3 in flight pass,
@@ -770,6 +876,11 @@ test("the read-from-this-machine sign-in hands magpie a key, and says why when i
   try {
     assert.equal(appToken(file).token, token, "the token is handed over as it is")
     assert.match(appToken(join(dir, "nope.json")).error, /没找到/)
+    // a file that is there but cannot be read is not "not found": telling the
+    // user to sign in once on this machine would not fix a permission
+    const dirError = appToken(dir)
+    assert.match(dirError.error, /读不了/, "an unreadable path says so")
+    assert.doesNotMatch(dirError.error, /先在这台机器上登录/, "and does not send them to sign in again")
 
     writeFileSync(file, "{ not json")
     assert.match(appToken(file).error, /读不出 JSON/)

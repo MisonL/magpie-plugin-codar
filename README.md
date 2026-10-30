@@ -11,7 +11,7 @@ the usage card.
 |---|---|
 | `config` / `provider` | Adds a `codar` provider with Codar's model list (16 models: the `auto` router plus DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
 | `auth.methods` | Two ways to sign in: "读取本机科搭令牌" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the "科搭访问令牌". |
-| `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1795), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. A wait it cannot state — missing, zero, or past year 9999 — gets a 30-minute trust floor instead: "done with no `until`" would settle the whole day in magpie, and a rolling window would lose the next claim. |
+| `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1795), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. A wait it cannot use — missing, zero, past year 9999, or longer than a week (this day rolls every 24 hours, so 31 years is not a next-claim time) — gets a 30-minute trust floor instead: "done with no `until`" would settle the whole day in magpie, and a rolling window would lose the next claim. |
 | `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". |
 | `chat.headers` | Sends the desktop client's `User-Agent` on Codar's own requests, so the gateway sees the app's traffic shape. The hook runs for every provider's requests, so it filters by provider id and leaves the others alone. |
 
@@ -94,10 +94,20 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   so a hard-coded gateway there would send your proxy nowhere on the first
   successful refresh.
 - A time that cannot be written down is left out rather than rounded to
-  something wrong: a window's `resetsAt`, `until` and the "N 后可再领" text
-  are all omitted when the vendor's number is missing, zero, non-finite
-  (`1e999` reads as `Infinity`), or past year 9999 — magpie renders a time of
-  0 as 1970-01-01, not as "not said".
+  something wrong: a window's `resetsAt` and the "N 后可再领" text are omitted
+  when the vendor's number is missing, zero, non-finite (`1e999` reads as
+  `Infinity`), past year 9999, or longer than a week — magpie renders a time
+  of 0 as 1970-01-01, not as "not said". The check-in's `until` is the one
+  thing never omitted: a "done" with no `until` settles the whole day in
+  magpie, so an unusable wait falls back to the 30-minute trust floor
+  described above.
+- The state and balance reads follow the vendor's own client: the check-in
+  status is read from a boolean `data` or any of `isSigned`/`signed`/
+  `hasSigned`/`has_signed` (each only as a real boolean), the balances from
+  `token`/`remaining_points`/`points`/`balance` and `agent_token`/`agentToken`/
+  `agent_points`/`agentPoints`, and a negative reading is treated as not
+  stated (the host clamps a wallet figure to 0, so passing one on would put
+  two answers on the card).
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card
