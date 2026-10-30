@@ -2082,3 +2082,199 @@ test("a catalog record that is not an object is skipped, not handed on", () => {
   const list = catalogOf({ data: [null, true, 7, "x", ["also", "not", "a", "record"], { id: "ok", protocol: { type: "openai_chat_completions" } }] })
   assert.deepEqual(list.map((m) => m.id), ["ok"])
 })
+
+test("an already-claimed day is not turned into a failure by the success flag", async () => {
+  // The vendor's 400 for a day already claimed is both "this call did not
+  // claim" and "this day is claimed", and the success flag it added to its
+  // activity API says the first. Read as a failure, magpie retries the whole
+  // day every 30 minutes (workbuddy_checkin.go's wbCheckinRetry) while the
+  // card says the check-in failed over a day that was claimed — the flag
+  // decides a code:200 "say yes", never the vendor's own "today is in".
+  const p = await CodarPlugin()
+  const body = { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 3600 }, success: false }
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "done", "the vendor's own words about the day win over the flag")
+  assert.match(r.message, /1 小时/)
+  assert.ok(r.until > Date.now(), "and the wait the vendor stated still holds")
+
+  // and the flag still decides where it said something the words did not
+  const busy = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 200, success: false, message: "系统繁忙" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(busy.outcome, "failed", "a refusal with nothing about the day is still a refusal")
+
+  // The "already claimed" words are only the day's when the code can be the
+  // day's either: a 401 that happens to quote them is a lapsed sign-in, not a
+  // claimed day — reading it as done would settle the day off a real failure.
+  const lapsed = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 401, message: "24小时内仅可领取一次", success: false } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(lapsed.outcome, "failed", "a 401 is not a claimed day, whatever it quotes")
+})
+
+test("an activity with a stated total is not called unlimited", async () => {
+  // user_quota_limit is the vendor stating how much this activity gives.
+  // With remaining_quota unreadable, the card fell to "不限量" and dropped
+  // the total — the vendor said a number and the card said there is none.
+  // The total is now said; only with no total at all is it unlimited. And a
+  // remaining that exceeds the total is not a share: magpie would draw
+  // "已用 0 / 100" beside the vendor's "150 left".
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const p = await CodarPlugin()
+  const read = async (activity) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false } } },
+        "/api/codar/activities/mine": { body: { success: true, data: [{ free_until: until, model_ids: ["a"], ...activity }] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+  const capped = (await read({ user_quota_limit: 100, remaining_quota: null })).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.match(capped.display, /共 100/, "the total the vendor stated is said")
+  assert.doesNotMatch(capped.display, /不限量/, "not called unlimited over a stated total")
+  assert.equal(capped.amount, undefined, "no used is invented from one number")
+
+  const over = (await read({ user_quota_limit: 100, remaining_quota: 150 })).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.match(over.display, /还剩 150/, "a remaining past the total is said as it is")
+  assert.equal(over.amount, undefined, "and no share is made of two numbers that disagree")
+
+  const unlimited = (await read({ user_quota_limit: null, remaining_quota: null })).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.match(unlimited.display, /不限量/, "with no total, unlimited is the vendor's own shape")
+})
+
+test("the seven promises no test used to pin", async () => {
+  // Each of these is a guard the suite stayed green without (mutation-tested):
+  // dropping it changes what magpie draws, so each gets its own sentence.
+  //
+  // 1. cost stays 0: magpie reads any input/output price above it as USD
+  //    (plugins.go's pluginPrice), and the vendor prices in CNY.
+  assert.deepEqual(modelOf({ id: "m" }).cost, { input: 0, output: 0, cache: { read: 0, write: 0 } }, "no price of our own")
+  // 2. a real 0 balance is a balance: the account is spent, not unreadable.
+  const p = await CodarPlugin()
+  const zero = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 0, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(zero.balance, /0 点/, "a spent account reads as spent, not as unknown")
+  assert.equal(zero.windows.find((w) => w.name === "点数余额").balance, 0)
+  // 3. the week ceiling on a check-in wait: a week is sayable, a second past
+  //    it is not (a rolling 24-hour day cannot produce it).
+  const wait = async (secs) => {
+    const r = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: secs } } },
+      },
+      async () => p.auth.checkin(auth),
+    )
+    return r
+  }
+  const week = await wait(7 * 24 * 3600)
+  assert.match(week.message, /7 天后可再领/, "exactly a week is a wait the window can name")
+  assert.ok(week.until > Date.now() + 6 * 24 * 3600 * 1000, "and it is handed on")
+  const past = await wait(7 * 24 * 3600 + 1)
+  assert.doesNotMatch(past.message, /天后可再领/, "one second past the week is not a time this answer can hold on")
+  assert.ok(past.until <= Date.now() + 31 * 60 * 1000, "it falls to the trust floor")
+  // 4. a vendor name a card can hold: no longer than 120 characters.
+  const long = catalogOf({ data: [{ id: "m", display_name: "名".repeat(300), protocol: { type: "openai_chat_completions" } }] })
+  assert.equal(long[0].name.length, 120, "an endless vendor name is cut to what a card reads")
+  // 5. a vendor message a card can hold: at most 400 characters.
+  const shout = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 500, message: "x".repeat(600) } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(shout.message.length, 400, "an endless vendor message is cut too")
+  // 6. a base the user set keeps its path clean: one slash, so the URL magpie
+  //    builds is not "...//chat/completions".
+  const base = await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: [{ id: "solo", protocol: { type: "openai_chat_completions" } }] } } },
+    async () => p.provider.models({ id: "codar", api: "https://proxy.example/v1///", models: {} }, { auth: await auth() }),
+  )
+  assert.equal(base["solo"].api.url, "https://proxy.example/v1", "a trailing slash is taken off the user's own base")
+})
+
+test("a modality list that names no kind is not a model that takes nothing", () => {
+  // Every model here is a chat model. A modalities name this host does not
+  // know — an empty list, a case change, a rename — used to come out as
+  // "takes nothing", and magpie writes a stated image:false onto its catalog
+  // as a fact (host.js's imageSaid). A missing field read as text alone, so
+  // the same silence had two meanings; now both read as text alone.
+  for (const mods of [undefined, [], ["Text"], ["image_梗"]]) {
+    const m = modelOf(mods === undefined ? { id: "m" } : { id: "m", input: mods })
+    assert.deepEqual(m.modalities.input, ["text"], `${JSON.stringify(mods)} is "text alone", not "nothing"`)
+    assert.equal(m.capabilities.input.text, true, "and the model still takes text")
+    assert.equal(m.attachment, false, "with no eyes claimed")
+  }
+  assert.deepEqual(modelOf({ id: "m", input: ["text", "image"] }).modalities.input, ["text", "image"], "a list naming kinds the host knows is read as it is")
+})
+
+test("an empty catalog the vendor answered is an answer, not a fallback", async () => {
+  // The vendor answering 200 with no models is it saying this account is
+  // served none; a fallback is not being able to ask at all. Read as a
+  // failure, the fifteen stale entries stayed on the card and the requests
+  // failed at the gateway instead of the list being honestly empty. A list
+  // whose every record we had to drop is the other case — that is a list we
+  // could not read, and it still falls back.
+  const p = await CodarPlugin()
+  const empty = await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: [] } } },
+    async () => p.provider.models({ models: {} }, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(empty), [], "the empty list is the list")
+  assert.equal(empty[Symbol.for("magpie.fellBack")], undefined, "and nothing fell back")
+
+  const unreadable = await withFetch(
+    { "/v1/codar/models": { body: { object: "list", data: [{ noId: 1 }, null] } } },
+    async () => p.provider.models({ models: { x: { id: "x" } } }, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(unreadable), ["x"], "a list we could not read keeps the one we had")
+  assert.equal(unreadable[Symbol.for("magpie.fellBack")], true, "and says the vendor's list was not usable")
+})
+
+test("a model id that names an object property never writes the model map's prototype", async () => {
+  // The seventh round's magic-key guard covers the fields inside a model
+  // entry; this is the sibling door one level up, where the entry's own id is
+  // the key. A hand-written plugins.json parsed from JSON carries `__proto__`
+  // as an own key, and `merged["__proto__"] = m` on a plain object writes the
+  // map's prototype — so `models.name` read the planted entry.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: { models: JSON.parse('{"__proto__": {"name": "evil", "provider": {"npm": "evil"}}}') } } }
+  await p.config(config)
+  const models = config.provider.codar.models
+  assert.equal(Object.getPrototypeOf(models), Object.prototype, "the model map's prototype is untouched")
+  assert.equal(models.name, undefined, "and no planted field shows through it")
+  assert.equal(Object.keys(models).length, 16, "the catalog is what is listed")
+})
+
+test("a provider entry that is an array is replaced, not written into", async () => {
+  // An array is an object, so `was` used to keep it — and `{...was}` spilled
+  // its indices into the provider entry ("0", "1"…) on the user's own
+  // providers file. The provider slot takes an object or nothing.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: ["a", "b"] } }
+  await p.config(config)
+  assert.deepEqual(Object.keys(config.provider.codar), ["name", "npm", "api", "models"], "no index keys survive")
+  assert.equal(config.provider.codar.name, "科搭 Codar")
+})

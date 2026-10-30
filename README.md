@@ -99,7 +99,11 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   `provider.npm`, and one that sets only `limit.output` keeps the context
   window. Keys that are properties of every object (`__proto__`,
   `constructor`, `prototype`) are never merged in — a model has no field by
-  those names. The live list follows the same address: every model the vendor's
+  those names — and a model *named* one of them is dropped for the same
+  reason: writing `models["__proto__"]` would set the model map's prototype
+  instead of adding a model. A provider slot holding an array is treated as
+  empty rather than written into (its index keys would land in your config).
+  The live list follows the same address: every model the vendor's
   catalog brings back is written at your provider's `api` (or the model's
   own, if you set one), never at Codar's gateway — magpie prefers a model's
   URL over the provider's, so a hard-coded gateway there would send your
@@ -134,10 +138,14 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   without a code counts as the claim it says it is, unless the answer itself
   says `success: false` — and `success: false` is consulted however the code
   sits, a `code: 200` body that says the flag included: that is an HTTP layer
-  saying yes and the vendor saying no, so the flag decides. The check-in's
-  words — including the "already claimed" note that tells a claim from a
-  repeat — are read from the first of `message`/`msg`/`error`/`detail` and the
-  same four under `data`, as that client reads them. The balances also come
+  saying yes and the vendor saying no, so the flag decides. The one thing the
+  flag does not override is the vendor's own note that the day is already
+  claimed: a `400` naming "24小时内仅可领取一次" beside `success: false` is
+  that client's "today is in", and reading it as a failure would have magpie
+  retry the rest of the day every 30 minutes while the card said the check-in
+  failed. The check-in's words — including that "already claimed" note that
+  tells a claim from a repeat — are read from the first of `message`/`msg`/
+  `error`/`detail` and the same four under `data`, as that client reads them. The balances also come
   from `data` when the vendor wraps them in one, as that client unwraps it;
   and a points refusal is said in those same words. The check-in's credit is
   the sum of both balances' increases between its two reads — the vendor says
@@ -153,7 +161,11 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
   embedded in `catalog.mjs` and magpie marks the list as fallen back. Claude
   models keep the Anthropic protocol on that list too: each model carries its
-  own SDK, not just the provider's default.
+  own SDK, not just the provider's default. A list the vendor actually
+  answered is not a fallback even when it is empty: an account the vendor
+  serves no models gets no list, while one whose every record the plugin had
+  to leave out (no usable id) is a list it could not read and still falls
+  back.
 - Models you add to this provider yourself (ids the embedded catalog does not
   have) are kept when the vendor's list refreshes; the vendor's own entries
   follow the vendor. A config model entry that is not a plain object (a null,
@@ -190,8 +202,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   in the future, and a `remaining_quota` that isn't spent — not by its
   `status` field, which the app doesn't read. It is `aside` — using it up
   only sends those models back to points, it doesn't stop the account — and
-  carries `amount`/`limit` only when the vendor states a total
-  (`user_quota_limit`); an unlimited activity shows as its text.
+  carries `amount`/`limit` when the vendor states a total
+  (`user_quota_limit`) *and* what is left of it: only then is the share a
+  real pair of numbers. A stated total without a readable remainder says the
+  total ("免费使用中，共 N") rather than calling the activity unlimited, a
+  remainder past the total is said as it is, and only an activity with
+  neither number shows as "不限量".
 - The daily check-in is a text row, not a percentage: a check-in is not an
   allowance that runs out, so the plugin sends no `used` and magpie shows
   what the row says.

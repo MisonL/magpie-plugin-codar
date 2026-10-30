@@ -411,6 +411,22 @@ const apiBase = (provider, id) => {
   return typeof said === "string" && said.trim() ? said.trim().replace(/\/+$/, "") : `${API}/v1`
 }
 
+// KINDS are the modalities magpie knows, in the order a card lists them.
+const KINDS = ["text", "image", "audio", "video", "pdf"]
+
+// kindsOf is a vendor modality list as the kinds we know. An answer that
+// names none of them — an empty list, or names this host does not know
+// (a rename, a case change) — is read as "text alone", not as "takes
+// nothing": every model here is a chat model, and a model that takes no
+// text at all would be asserted onto magpie's catalog (host.js's imageSaid
+// turns a stated `image: false` into a fact), taking every input away over
+// a name we merely failed to translate. A missing field reads the same way,
+// so "not said" has one meaning everywhere.
+const kindsOf = (v) => {
+  const known = Array.isArray(v) ? KINDS.filter((k) => v.includes(k)) : []
+  return known.length ? known : ["text"]
+}
+
 // modelOf is one catalog record as magpie's provider list has it. `base` is
 // where its requests go (apiBase), the vendor's gateway when nothing else
 // says otherwise.
@@ -418,9 +434,9 @@ function modelOf(m, base = `${API}/v1`) {
   const anthropic = m?.protocol === "anthropic_messages"
   const npm = anthropic ? CLAUDE : OPENAI
   const reasons = Boolean(m?.reasoning)
-  const input = ["text", "image", "audio", "video", "pdf"].filter((k) => (m?.input ?? []).includes(k))
-  const output = ["text", "image", "audio", "video", "pdf"].filter((k) => (m?.output ?? []).includes(k))
-  const takes = (list) => Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, list.includes(k)]))
+  const input = kindsOf(m?.input)
+  const output = kindsOf(m?.output)
+  const takes = (list) => Object.fromEntries(KINDS.map((k) => [k, list.includes(k)]))
   return {
     id: m.id,
     name: m.name || m.id,
@@ -522,7 +538,13 @@ function catalogOf(body) {
       reasoning: Boolean(m.reasoning),
     })
   }
-  return out.length ? out : null
+  // an empty list is the vendor's answer too — "this account is served no
+  // models" — while a list whose every record we had to drop is a list we
+  // could not read. Only the latter is "no answer": read as an empty list it
+  // would take every model off the provider over records we merely failed to
+  // parse, and read as an answer an empty one keeps the card honest.
+  if (!out.length && list.length) return null
+  return out
 }
 
 // runningActivities are the free-model activities on right now, as the
@@ -725,22 +747,25 @@ export async function CodarPlugin(input) {
         // 但这个厂商的活动接口就是不带 code 的（只有 {data,message,success}），
         // 签到哪天也这样省掉，只认 200 会把「领到了」报成失败。
         //
-        // 只有一处不听它的客户端：应答自己说 `success: false`（厂商在活动接口
-        // 上用的就是这个旗标）时算失败，无论带没带 code。这一处是有代价的——
-        // 把一次失败读成 claimed，magpie 就把这一天结清、不再重试，用户白丢
-        // 一次签到；而读成 failed 最坏只是照旧每 30 分钟再问一次。所以这个
-        // 旗标是拒绝的充分条件：它比 code 更可信，因为 code:200 + success:false
-        // 正是「HTTP 层说好、业务层说不」。拒绝时不读余额算 credit——那是给
-        // 一次真领到算的。
-        const said = signMessage(r, token)
-        if (r?.success === false) return { outcome: "failed", message: said || `签到失败（code ${code || "?"}）` }
-        // 401/403 是登录过期，说给用户看的是「重新登录」，而不是一个码。
-        if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
         // 「今天已领过」：厂商用这句话说这一天已经领了。它说的是「今天」，
         // 不是「这一次」，所以未必带 code：带 400 是它今天的写法，不带 code
         //（活动接口就是这种形状）也是同一句话。文案按客户端的读法（saidBy，
-        // 8 拼写）取；success:false 的应答走不到这里（上面已算失败）。
+        // 8 拼写）取。这句要先算：它是对「这一天」的陈述，比下面任何一个
+        // 「这一次」的旗标都更能决定 outcome（见 success:false 那段）。
+        const said = signMessage(r, token)
         const already = ALREADY_CLAIMED.test(said) && (code === 400 || !Number.isFinite(code))
+        // 只有一处不听客户端的：应答自己说 `success: false`（厂商在活动接口
+        // 上用的就是这个旗标）时算失败，无论带没带 code——code:200 配
+        // success:false 正是「HTTP 层说好、业务层说不」。**但不压过「已领
+        // 过」**：厂商带 400、文案写着「24小时内仅可领取一次」、又顺手带个
+        // success:false 时，这一天确实是领到了，这一次调用也确实「没成」，
+        // 两句都对。读成 failed 的代价在这一侧更大——magpie 会把失败当天
+        // 每 30 分钟重问一遍（workbuddy_checkin.go 的 wbCheckinRetry），
+        // 卡片还一直写「签到失败」；而读成 done 只是把厂商说出的那个时刻
+        // 记下来。拒绝时不读余额算 credit——那是给一次真领到算的。
+        if (r?.success === false && !already) return { outcome: "failed", message: said || `签到失败（code ${code || "?"}）` }
+        // 401/403 是登录过期，说给用户看的是「重新登录」，而不是一个码。
+        if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
         // 码说的拒绝，且消息不是「已领过」：厂商客户端只把非 200 的数当失败。
         if (Number.isFinite(code) && code !== 200 && !already) return { outcome: "failed", message: said || `签到失败（code ${code}）` }
         if (already) {
@@ -894,7 +919,10 @@ export async function CodarPlugin(input) {
             // 拿去算份额会得到 NaN，卡片上就写「已用 Infinity / Infinity」。
             const cap = typeof a.user_quota_limit === "number" && isFinite(a.user_quota_limit) && a.user_quota_limit > 0 ? a.user_quota_limit : null
             const left = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
-            const used = cap != null && left != null ? Math.max(0, cap - left) : null
+            // 「已用」只在两个数都在、且互相说得通时才算得出来：剩下比总额还多，
+            // 是两个数在说两件事（厂商报的是池子，不是这次活动），相减只会造出
+            // 一个 0，卡片写「已用 0 / 100」而厂商说还剩 150——不如把剩下的照说。
+            const used = cap != null && left != null && left <= cap ? cap - left : null
             const share = used != null && cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0
             // 活动的结束时间（也是秒数）读不出来就不带 resetsAt：活动
             // 本身照报——它确实在跑，只是没说何时结束。见 sayableSecs。
@@ -903,7 +931,10 @@ export async function CodarPlugin(input) {
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
               used: share,
               ...(freeUntil ? { resetsAt: freeUntil } : {}),
-              display: left == null ? "免费使用中（不限量）" : cap == null ? `免费使用中，还剩 ${left}` : `免费使用中，已用 ${used} / ${cap}`,
+              // 说得出总额就说总额：remaining_quota 没给，不代表活动「不限量」
+              // ——厂商的 user_quota_limit 白纸黑字写了多少。只有两个数都没有
+              // 时才是「不限量」（今天的线上形状）。
+              display: left == null ? (cap == null ? "免费使用中（不限量）" : `免费使用中，共 ${cap}`) : used == null ? `免费使用中，还剩 ${left}` : `免费使用中，已用 ${used} / ${cap}`,
               ...(used != null ? { amount: used, limit: cap } : {}),
               aside: true,
             })
@@ -983,7 +1014,9 @@ export async function CodarPlugin(input) {
       // 商在启动时就不存在了。不是对象（含数组——数组上写具名属性
       // JSON.stringify 会丢掉）就换一个空的，别的钩子照常拿到它们那份。
       if (!config.provider || typeof config.provider !== "object" || Array.isArray(config.provider)) config.provider = {}
-      const was = config.provider[ID] && typeof config.provider[ID] === "object" ? config.provider[ID] : {}
+      // 供应商条目同理：数组也是「对象」，但具名字段写上去会被 JSON.stringify 丢掉，
+      // 索引键（"0"、"1"）反而会留在用户的配置文件里。
+      const was = config.provider[ID] && typeof config.provider[ID] === "object" && !Array.isArray(config.provider[ID]) ? config.provider[ID] : {}
       // 每条的 api.url 写用户设过的那个地址（他自己可能指着自建代理），
       // 否则写厂商网关：写进 config 的就是真话——宿主在那条路径上本来
       // 也取 cfg.api（见 apiBase 的注释），这里只是不让文件里留一个与
@@ -999,6 +1032,11 @@ export async function CodarPlugin(input) {
         // 整个 RPC 失败——所有供应商都从列表里消失，而不只是丢掉这一条。
         // 数组也是对象，但同样不是模型，一并丢掉。
         if (!m || typeof m !== "object" || Array.isArray(m)) continue
+        // id 是 JSON 里手写的键，也可能是 `__proto__`：`merged["__proto__"] = m`
+        // 写的是这张模型表的原型，不是一条模型——第七轮在 mergeModel 里挡住了
+        // 模型字段同名的键，这里是它的兄弟入口（合并发生在模型的上一层）。
+        // 没有模型叫这些名字，丢掉不损失什么。
+        if (MAGIC_KEYS.has(id)) continue
         merged[id] = models[id] ? mergeModel(models[id], m) : m
       }
       config.provider[ID] = {
