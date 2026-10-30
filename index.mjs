@@ -78,6 +78,12 @@ const MAX_WAIT_SECS = MAX_TIME_MS / 1000
 // a made-up second is a made-up wait. NaN when there is no number.
 const numOf = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN)
 
+// plain is a value that is a map: an object, but not an array (an array is
+// an object too, and writing a named field on it would be JSON.stringify'd
+// away) and not null. What the host builds a config model from, and what a
+// vendor record has to be to be read field by field.
+const plain = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v)
+
 // sayableSecs is a vendor's number of seconds when it is one a card can say:
 // finite, positive, and inside the calendar. Anything else is 0 — "not
 // stated" — so callers can decide with one check whether they have a time at
@@ -99,6 +105,11 @@ const checkinWaitSecs = (v) => {
   const n = sayableSecs(v)
   return n > 0 && n <= MAX_CHECKIN_WAIT_SECS ? n : 0
 }
+
+// ALREADY_CLAIMED is how the vendor words "this day is already claimed": its
+// 400 says 24小时内仅可领取一次, and the same words on an answer that names no
+// code mean the same thing.
+const ALREADY_CLAIMED = /24\s*小时|仅可领取一次/
 
 // MAX_MODELS is how many models one vendor catalog may bring back. The host
 // passes a hook's answer to Go as a single JSON line and kills the whole
@@ -149,17 +160,30 @@ const usernameOf = (token) => {
   return typeof u === "string" ? u : ""
 }
 
-// expiredAt is when the token says it runs out (ms), or 0 when it says
+// expSeconds is a token's exp as the vendor's client reads it (app.asar's
+// ZAe): a number, or a string that says one; NaN when it states none.
+const expSeconds = (token) => numOf(payloadOf(token)?.exp)
+
+// expiresAt is when the token says it runs out (ms), or 0 when it says
 // nothing. A token past it is not sent: every endpoint would answer 401 and
-// the card would say "check-in failed" instead of "sign in again".
+// the card would say "check-in failed" instead of "sign in again". The exp
+// is read the way the vendor's client reads it (app.asar's ZAe): a number,
+// or a string that says one — a string exp read as "no expiry" would send a
+// token the vendor already counts as expired, and the card would say the
+// check-in failed instead of asking to sign in again.
 function expiresAt(token) {
-  const exp = payloadOf(token)?.exp
-  return typeof exp === "number" && isFinite(exp) ? exp * 1000 : 0
+  const n = expSeconds(token)
+  return Number.isFinite(n) ? n * 1000 : 0
 }
 
+// expired says whether the token has run out, as that same client decides:
+// a stated exp in the past is expired — the epoch itself included, which the
+// 0-means-unsaid reading of expiresAt cannot tell from "says nothing" — while
+// a token that states no exp is not declared expired here (that client calls
+// it "unknown", and the vendor is the one to answer).
 const expired = (token) => {
-  const at = expiresAt(token)
-  return at > 0 && Date.now() >= at
+  const n = expSeconds(token)
+  return Number.isFinite(n) && Date.now() >= n * 1000
 }
 
 class ApiError extends Error {
@@ -238,6 +262,22 @@ function appToken(file = configPath()) {
   return { token }
 }
 
+// saidBy is what an answer says in words, read the way the vendor's own client
+// reads it (app.asar's Vg): the first non-blank string among the top-level
+// message/msg/error/detail and the same four under `data`. Read as `message`
+// alone, a refusal the vendor spelled in `msg`, and an "already claimed" note
+// under `data`, both came out as no text at all — the check-in then reported a
+// failure where the day was simply already claimed, and the card dropped what
+// the vendor said about every other refusal.
+const saidBy = (body) => {
+  if (!body || typeof body !== "object") return ""
+  const data = body.data && typeof body.data === "object" ? body.data : null
+  for (const said of [body.message, body.msg, body.error, body.detail, data?.message, data?.msg, data?.error, data?.detail]) {
+    if (typeof said === "string" && said.trim()) return said
+  }
+  return ""
+}
+
 async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_MS, fetchImpl = fetch, ua = UA_DESKTOP } = {}) {
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), timeoutMs)
@@ -263,7 +303,7 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
     } catch {
       data = null
     }
-    if (!res.ok) throw new ApiError(data?.message || data?.detail || `HTTP ${res.status}`, res.status)
+    if (!res.ok) throw new ApiError(saidBy(data) || `HTTP ${res.status}`, res.status)
     if (data === null) throw new ApiError("接口返回的不是 JSON")
     return data
   } catch (e) {
@@ -413,6 +453,22 @@ function modelOf(m, base = `${API}/v1`) {
 
 const modelsOf = (list, base) => Object.fromEntries(list.map((m) => [m.id, modelOf(m, typeof base === "function" ? base(m.id) : base)]))
 
+// mergeModel is the user's own model entry folded onto the catalog's, field by
+// field at every depth: what the user set wins, and the fields they did not
+// touch stay. A plain spread kept the catalog's fields only at the top level —
+// a user who set just `provider.api` lost `provider.npm` with it, and the
+// host, reading m.provider?.npm ?? cfg.npm, built a Claude model on the
+// provider-level openai-compatible: it went out over the chat protocol. The
+// same loss hit `limit` (an entry saying only `{ output: 4096 }` dropped the
+// context window). Values that are not maps (a name, a number, a list such as
+// variants or modalities.input) are taken as the user wrote them.
+const mergeModel = (ours, theirs) => {
+  if (!plain(ours) || !plain(theirs)) return theirs
+  const out = { ...ours }
+  for (const [k, v] of Object.entries(theirs)) out[k] = k in ours ? mergeModel(ours[k], v) : v
+  return out
+}
+
 // catalogOf is the vendor's answer as our catalog records: the same fields
 // catalog.mjs keeps, so both paths build the same entries. Vendor text is
 // cleaned: a control character would break the card it lands on, and an id
@@ -462,6 +518,12 @@ function catalogOf(body) {
 // live data shows status "active" and ended_at null; the catalog shows
 // status "active" too).
 const runningActivities = (body) => {
+  // 应答码先过厂商客户端那一关（app.asar 的 Hbt 调 Jo 再读列表）：数字码不是
+  // 200 的应答是拒绝，哪怕它还带着一份 data——照画就会把根本不在跑的活动
+  // 报成免费。今天的应答体没有 code，只有 {data,message,success}，这道关
+  // 对它无事可做；厂商哪天带上 code 的拒绝，这里也跟它的客户端一样挡住。
+  const code = Number(body?.code)
+  if (Number.isFinite(code) && code !== 200) return []
   const list = Array.isArray(body?.data) ? body.data : []
   const now = Date.now() / 1000
   return list.filter((a) => {
@@ -534,7 +596,7 @@ const scrubLine = (said, key) => {
 // is known; a credential-shaped string is cut by its shape, which covers the
 // path where the sign-in threw and there is no token to cut by.
 const scrub = (said, token) => scrubLine(said, String(token ?? "")).slice(0, 400)
-const signMessage = (r, token) => scrub(typeof r?.message === "string" ? r.message : "", token)
+const signMessage = (r, token) => scrub(saidBy(r), token)
 
 export async function CodarPlugin(input) {
   // 每次调用现取，而不是建插件时抓一个：宿主给不给 fetch 都可能，测试也会
@@ -637,7 +699,21 @@ export async function CodarPlugin(input) {
         }
 
         const code = Number(r?.code)
-        if (code === 200) {
+        // 成功的判据与厂商客户端一致（app.asar 的 nRe 只调 Jo）：数字码不是
+        // 200 才算拒绝，没带 code 的应答算领到了——今天的成功应答带 code:200，
+        // 但这个厂商的活动接口就是不带 code 的（只有 {data,message,success}），
+        // 签到哪天也这样省掉，只认 200 会把「领到了」报成失败。
+        //
+        // 只有一处不听它的客户端：应答自己说 `success: false`（厂商在活动接口
+        // 上用的就是这个旗标）时算失败。这一处是有代价的——把一次失败读成
+        // claimed，magpie 就把这一天结清、不再重试，用户白丢一次签到；而读成
+        // failed 最坏只是照旧每 30 分钟再问一次。
+        const refused = Number.isFinite(code) ? code !== 200 : r?.success === false
+        // 「今天已领过」：厂商用 400 加这句话说这件事；没带 code 的应答里，
+        // 同一句话同样说明这次没有领到新的——照成功报会让 magpie 把这一天
+        // 结清，而 credit 的两次读数之间根本没有增量。
+        const already = ALREADY_CLAIMED.test(signMessage(r, token)) && (code === 400 || !Number.isFinite(code))
+        if (!refused && !already) {
           let credit = 0
           try {
             const after = await pointsOf(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
@@ -651,7 +727,7 @@ export async function CodarPlugin(input) {
           }
           return { outcome: "claimed", credit, message: signMessage(r, token) || "签到成功" }
         }
-        if (code === 400 && /24\s*小时|仅可领取一次/.test(signMessage(r, token))) {
+        if (already) {
           // until 是 magpie 0.1.1795 起的契约（"a plugin's until is when its
           // answer stops holding"，v0.1.1795 首发；README 里早先写的 0.1.1862
           // 是首次核对时看错的版本）：签到答案什么时候失效、下次何时该再问。
@@ -870,7 +946,8 @@ export async function CodarPlugin(input) {
     //
     // models 按 id 逐条合并，不是整条替换：用户只改一个模型的某个字段时，
     // 剩下的字段（尤其是 provider.npm）还得在——少了它，宿主给这个模型解析
-    // 出供应商级的 openai-compatible，Claude 模型就按 Chat 协议发了。
+    // 出供应商级的 openai-compatible，Claude 模型就按 Chat 协议发了。合并
+    // 深入到嵌套对象（见 mergeModel）：只设 provider.api 也不会带走 npm。
     async config(config) {
       // 宿主给的 config 本该是 {provider:{…}}，但配错的文件里 provider 可能是
       // 字符串或数字：往字符串上写属性会抛 TypeError，整个钩子失败、这个供应
@@ -893,7 +970,7 @@ export async function CodarPlugin(input) {
         // 整个 RPC 失败——所有供应商都从列表里消失，而不只是丢掉这一条。
         // 数组也是对象，但同样不是模型，一并丢掉。
         if (!m || typeof m !== "object" || Array.isArray(m)) continue
-        merged[id] = models[id] ? { ...models[id], ...m } : m
+        merged[id] = models[id] ? mergeModel(models[id], m) : m
       }
       config.provider[ID] = {
         ...was,
@@ -906,6 +983,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, humanSecs, request, appToken, configPath }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, humanSecs, request, appToken, configPath }
 
 export default CodarPlugin

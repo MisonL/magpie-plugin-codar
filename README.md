@@ -94,20 +94,25 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   the provider-level `api`/`npm` default to Codar's gateway the same way: the
   `config` hook fills each in only when it is missing and never writes over a
   value you set — a rename, or an `api` pointed at your own proxy, survives
-  restarts. A single model's own settings work the same way. The live list
-  follows the same address: every model the vendor's catalog brings back is
-  written at your provider's `api` (or the model's own, if you set one),
-  never at Codar's gateway — magpie prefers a model's URL over the provider's,
-  so a hard-coded gateway there would send your proxy nowhere on the first
-  successful refresh.
+  restarts. A single model's own settings work the same way, field by field
+  at every depth: an entry that sets only `provider.api` keeps the catalog's
+  `provider.npm`, and one that sets only `limit.output` keeps the context
+  window. The live list follows the same address: every model the vendor's
+  catalog brings back is written at your provider's `api` (or the model's
+  own, if you set one), never at Codar's gateway — magpie prefers a model's
+  URL over the provider's, so a hard-coded gateway there would send your
+  proxy nowhere on the first successful refresh.
 - A time that cannot be written down is left out rather than rounded to
   something wrong: a window's `resetsAt` and the "N 后可再领" text are omitted
   when the vendor's number is missing, zero, non-finite (`1e999` reads as
-  `Infinity`), past year 9999, or longer than a week — magpie renders a time
-  of 0 as 1970-01-01, not as "not said". The check-in's `until` is the one
-  thing never omitted: a "done" with no `until` settles the whole day in
-  magpie, so an unusable wait falls back to the 30-minute trust floor
-  described above.
+  `Infinity`) or past year 9999 — magpie renders a time of 0 as 1970-01-01,
+  not as "not said". The check-in's wait has one more bound of its own: its
+  day rolls every 24 hours, so a wait longer than a week is not a next-claim
+  time that window can produce, and the check-in treats such a number as
+  unsaid; an activity's end is a real date, so it is drawn as far out as the
+  calendar allows. The check-in's `until` is the one thing never omitted: a
+  "done" with no `until` settles the whole day in magpie, so an unusable wait
+  falls back to the 30-minute trust floor described above.
 - The state and balance reads follow the vendor's own client: the check-in
   status is read from a boolean `data` or any of `isSigned`/`signed`/
   `hasSigned`/`has_signed` (each only as a real boolean), the balances from
@@ -116,17 +121,27 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   stated (the host clamps a wallet figure to 0, so passing one on would put
   two answers on the card). An answer whose body `code` is a number other
   than 200 is a refusal, as that client reads it: the points read fails with
-  the code instead of reporting a balance of 0, and a refused claim state
-  draws no row rather than "you can claim now". The balances also come from
-  `data` when the vendor wraps them in one, as that client unwraps it. The
-  check-in's credit is the sum of both balances' increases between its two
-  reads — the vendor says a claim grants "点数奖励" without saying which
-  balance holds it — and a balance that fell (the app spending) is not
-  subtracted from it.
+  the code instead of reporting a balance of 0, a refused claim state draws
+  no row rather than "you can claim now", and a refused activity list draws
+  nothing even when it still carries a `data` array. The other side of that
+  gate: an answer that names no code is not a refusal — the vendor's client
+  passes it (its activity API already answers without one), so a claim answer
+  without a code counts as the claim it says it is, unless the answer itself
+  says `success: false`. The check-in's words — including the "already
+  claimed" note that tells a claim from a repeat — are read from the first of
+  `message`/`msg`/`error`/`detail` and the same four under `data`, as that
+  client reads them. The balances also come from `data` when the vendor wraps
+  them in one, as that client unwraps it. The check-in's credit is the sum of
+  both balances' increases between its two reads — the vendor says a claim
+  grants "点数奖励" without saying which balance holds it — and a balance that
+  fell (the app spending) is not subtracted from it.
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card
-  says to sign in again.
+  says to sign in again. An `exp` is read the way the vendor's client reads
+  it, a number or a string that says one; a token whose claims state no `exp`
+  is not called expired by the plugin — that client calls such a token
+  "unknown" and lets the vendor answer.
 - If `GET /v1/codar/models` cannot be reached, the provider keeps the list
   embedded in `catalog.mjs` and magpie marks the list as fallen back. Claude
   models keep the Anthropic protocol on that list too: each model carries its

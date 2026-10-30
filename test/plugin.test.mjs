@@ -10,7 +10,7 @@ import { join } from "node:path"
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 
-const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, humanSecs, payloadOf, request, appToken, configPath } = testables
+const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, humanSecs, payloadOf, request, appToken, configPath } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -142,6 +142,152 @@ test("already claimed today is `done`, with when to come back", async () => {
   // rolling 24-hour window would then lose the next claim. The floor is
   // "how long this answer is trusted", not an invented claim time.
   assert.ok(noWait.until > Date.now() && noWait.until <= Date.now() + 31 * 60 * 1000, "a vendor that names no time gets a bounded hold, not the whole day")
+})
+
+test("a claim the vendor confirmed without a code is a claim, not a failure", async () => {
+  // The vendor's own check-in reads the answer through Jo alone (app.asar's
+  // nRe): only a code that is a number other than 200 is a refusal, so an
+  // answer that names no code is the claim it says it is. Read as `code ===
+  // 200`, one said {"message":"Success","success":true} came back `failed` —
+  // and the vendor's activity API already answers without a code today.
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { message: "Success", success: true } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "claimed")
+  assert.equal(r.credit, 0, "no second balance read means no credit, not a made-up one")
+
+  // The one flag the vendor does use for a refusal is read: success:false is
+  // a failure the user should see, not a day magpie then settles.
+  const no = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { message: "系统繁忙", success: false } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(no.outcome, "failed")
+  assert.match(no.message, /系统繁忙/)
+})
+
+test("an already-claimed answer is read in every spelling the vendor's client reads", async () => {
+  // The vendor's client reads an answer's words as the first of message, msg,
+  // error, detail — and the same four under `data` (app.asar's Vg). Read as
+  // `message` alone, an "already claimed" note spelled `msg` or under `data`
+  // came out as no text at all, and the card said the check-in failed over a
+  // day that was simply already claimed.
+  const p = await CodarPlugin()
+  const said = [
+    { code: 400, message: "24小时内仅可领取一次" },
+    { code: 400, msg: "24小时内仅可领取一次" },
+    { code: 400, detail: "24小时内仅可领取一次" },
+    { code: 400, data: { message: "24小时内仅可领取一次", retry_after: 900 } },
+  ]
+  for (const body of said) {
+    const r = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign": { body },
+      },
+      async () => p.auth.checkin(auth),
+    )
+    assert.equal(r.outcome, "done", `${JSON.stringify(body)} is "already claimed", not a failure`)
+    assert.ok(r.until > Date.now(), "and it still says when to come back")
+  }
+  // a refusal the vendor spelled under `data` still says what it said
+  const busy = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 500, data: { msg: "系统繁忙" } } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(busy.outcome, "failed")
+  assert.match(busy.message, /系统繁忙/, "the vendor's own words, from whichever field it used")
+
+  // a refusal that says nothing at all still names its code
+  const mute = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 503 } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(mute.outcome, "failed")
+  assert.match(mute.message, /code 503/)
+})
+
+test("a free-model read the vendor refused draws nothing, however it is shaped", async () => {
+  // The vendor's own client refuses an answer whose code is a number other
+  // than 200 before it reads the list (app.asar's Hbt calls Jo first), so a
+  // refusal carrying a data array is not a running activity. Today's activity
+  // body has no code at all (only data, message and success), so the gate is
+  // silent on it.
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false } } },
+      "/api/codar/activities/mine": { body: { code: 500, message: "系统繁忙", data: [{ free_until: until, remaining_quota: null, model_ids: ["a"] }] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.error, undefined, "the points still make a card")
+  assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0, "a refused read is not an activity")
+
+  // the same list with no code on the answer is the vendor's own shape: drawn
+  const ok = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false } } },
+      "/api/codar/activities/mine": { body: { data: [{ free_until: until, remaining_quota: null, model_ids: ["a"] }], message: "ok", success: true } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(ok.windows.filter((w) => w.name.startsWith("免费模型")).length, 1, "a body with no code is read as the vendor sends it")
+})
+
+test("an expiry the token spells as a string is an expiry, not something open-ended", () => {
+  // The vendor's own client reads exp as a number or as a string that says
+  // one (app.asar's ZAe: typeof i == "number" ? i : Number(i)). Read as a
+  // number alone, a token whose exp came back as "1793334853" was taken for
+  // one that never runs out, and the plugin sent it: every endpoint answers
+  // 401 and the card says the check-in failed instead of asking to sign in.
+  const soon = Math.floor(Date.now() / 1000) + 60
+  const stringy = mkToken({ username: "user_1", exp: String(soon) })
+  assert.equal(expiresAt(stringy), soon * 1000, "a numeric string is a number")
+  assert.ok(expiresAt(mkToken({ username: "user_1", exp: String(soon - 3600) })) < Date.now(), "and one in the past has run out")
+  assert.equal(expiresAt(mkToken({ username: "user_1", exp: "later" })), 0, "words are not a time")
+  assert.equal(expiresAt(mkToken({ username: "user_1", exp: true })), 0, "nor is a flag: Number(true) is 1, which is 1970")
+  assert.equal(expiresAt(mkToken({ username: "user_1" })), 0, "and a token that says nothing says nothing")
+})
+
+test("a string expiry in the past is not sent, and asks for a sign-in", async () => {
+  const past = mkToken({ username: "user_1", exp: String(Math.floor(Date.now() / 1000) - 60) })
+  const p = await CodarPlugin()
+  const calls = await withFetch({}, async (c) => {
+    const r = await p.auth.checkin(async () => ({ type: "api", key: past }))
+    assert.equal(r.outcome, "failed")
+    assert.match(r.message, /重新登录/)
+    return c
+  })
+  assert.equal(calls.length, 0, "an expired token must not reach the vendor")
+
+  // an exp that names the epoch is a stated time that has passed, not the
+  // "says nothing" reading a bare 0 ms would give it
+  const epoch = mkToken({ username: "user_1", exp: 0 })
+  const second = await withFetch({}, async (c) => {
+    const r = await p.auth.checkin(async () => ({ type: "api", key: epoch }))
+    assert.equal(r.outcome, "failed")
+    assert.match(r.message, /重新登录/)
+    return c
+  })
+  assert.equal(second.length, 0, "a token that says 1970 has run out")
 })
 
 test("a wait the daily window cannot produce gets the trust floor, not a time handed on", async () => {
@@ -1659,6 +1805,45 @@ test("the config hook merges a user's model override field by field", async () =
   assert.equal(m.name, "我的名字", "the user's field wins")
   assert.equal(m.provider?.npm, "@ai-sdk/anthropic", "and the catalog's own fields stay")
   assert.ok(m.api?.url, "including the api entry")
+})
+
+test("a nested override keeps the catalog's fields beside it, as the host reads them", async () => {
+  // The top-level merge kept the catalog's fields, but one level down it was
+  // still a replacement: `{ provider: { api } }` dropped provider.npm, and
+  // host.js's info() — m.provider?.npm ?? cfg.npm ?? … — then gave the Claude
+  // model the provider-level openai-compatible, so it went out over the chat
+  // protocol; `{ limit: { output } }` dropped the context window the same way.
+  const p = await CodarPlugin()
+  const config = {
+    provider: {
+      codar: {
+        models: {
+          "claude-opus-5": { provider: { api: "https://proxy.example/v1" } },
+          "glm-5.2": { limit: { output: 4096 } },
+        },
+      },
+    },
+  }
+  await p.config(config)
+  const opus = config.provider.codar.models["claude-opus-5"]
+  assert.equal(opus.provider.api, "https://proxy.example/v1", "the address the user set")
+  assert.equal(opus.provider.npm, "@ai-sdk/anthropic", "and the SDK that address still needs")
+  assert.equal(opus.limit.context, 1000000, "the catalog's limit is untouched")
+  const glm = config.provider.codar.models["glm-5.2"]
+  assert.equal(glm.limit.output, 4096, "the ceiling the user set")
+  assert.equal(glm.limit.context, 1000000, "beside the context window the catalog stated")
+  assert.equal(glm.provider.npm, "@ai-sdk/openai-compatible", "and the model's own SDK")
+})
+
+test("a value that is not a map is taken as the user wrote it", () => {
+  // The merge goes into maps only: a list (modalities.input, variants) or a
+  // primitive is a value the user replaced, not a map to fold into ours.
+  const ours = { modalities: { input: ["text", "image"], output: ["text"] }, name: "a", variants: ["low", "high"] }
+  const merged = mergeModel(ours, { modalities: { input: ["text"] }, name: "b", variants: [] })
+  assert.deepEqual(merged.modalities, { input: ["text"], output: ["text"] }, "the list is replaced, its sibling map field kept")
+  assert.equal(merged.name, "b")
+  assert.deepEqual(merged.variants, [], "an empty list is the user's answer, not a missing one")
+  assert.equal(ours.name, "a", "the catalog's own entry is not changed")
 })
 
 test("a model entry that is not an object is dropped, not handed to the host", async () => {
