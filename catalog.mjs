@@ -4,8 +4,9 @@
 // of it, as the plugin reports none (see README). maxOutput is the reply
 // ceiling the vendor's own request schema states (max_tokens.maximum), 0
 // where it states none. Kept as the list the provider has before the vendor
-// is asked (and when it cannot be reached). Regenerate it when Codar adds
-// models; `provider.models` refreshes it live.
+// is asked (and when it cannot be reached). Regenerate it with
+// `node scripts/catalog.mjs` when Codar adds models; `provider.models`
+// refreshes it live.
 export const CATALOG = [
   {
     "id": "auto",
@@ -210,8 +211,8 @@ export const CATALOG = [
   {
     "id": "gpt-6-astra",
     "name": "gpt-6-astra",
-    "context": 128000,
-    "maxOutput": 0,
+    "context": 1050000,
+    "maxOutput": 128000,
     "input": [
       "text"
     ],
@@ -224,8 +225,8 @@ export const CATALOG = [
   {
     "id": "gpt-6-sol",
     "name": "gpt-6-sol",
-    "context": 128000,
-    "maxOutput": 0,
+    "context": 1050000,
+    "maxOutput": 128000,
     "input": [
       "text"
     ],

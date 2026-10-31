@@ -38,6 +38,8 @@
   },
   "scripts": {
     "test": "node --test",
+    "catalog": "node scripts/catalog.mjs",
+    "catalog:check": "node scripts/catalog.mjs --check",
     "prepublishOnly": "node --test"
   }
 }

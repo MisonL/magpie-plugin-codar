@@ -182,11 +182,14 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   provider's row from that map in one Promise.all, and one such entry throws —
   taking the whole provider list down, not just that entry.
 - A model's reply ceiling is the vendor's own: the catalog states
-  `max_tokens.maximum` per model (13 of 16 today; `gpt-5.6-sol`, `gpt-6-astra`
-  and `gpt-6-sol` state none, and 0 means "not stated"), and it goes out as
+  `max_tokens.maximum` per model (15 of 16 today; `gpt-5.6-sol` states none,
+  and 0 means "not stated"), and it goes out as
   the model's `limit.output`. magpie lowers a request that asks for more to it
   (its gateway's `maxoutput.go`), so an agent asking past the ceiling gets a
-  lowered request instead of the vendor's refusal.
+  lowered request instead of the vendor's refusal. The list embedded in
+  `catalog.mjs` is the vendor's answer as of the last time it was generated —
+  the fallback for an account whose gateway cannot be reached — so its sizes
+  can trail the live list; the live list wins whenever it can be fetched.
 - Codar's free models allow 3 requests per model at a time (measured: with
   four in flight, the fourth answers 429 `concurrent_limit_exceeded`, "Too
   many concurrent requests"). The auth hook declares 3, so magpie queues
@@ -231,14 +234,22 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
 ## Development
 
 ```bash
-node --test        # the whole suite, no network
-bun test           # the runtime magpie actually loads plugins on
+node --test              # the whole suite, no network
+bun test                 # the runtime magpie actually loads plugins on
+node scripts/catalog.mjs --check   # is catalog.mjs still what the vendor says?
+node scripts/catalog.mjs           # regenerate it from the signed-in app
 ```
 
 The tests stub `fetch`; nothing here talks to SpeedAI. CI runs the suite on
 Node 18–24, on Bun across Linux/macOS/Windows, and on Node on Windows and
 macOS — the plugin reads a file under the home directory, and that is where
 per-platform differences show up.
+
+`catalog.mjs` is the fallback list, generated from the vendor's own catalog
+and committed; nothing at runtime can tell it has gone stale, so run
+`--check` when a card shows a size the live gateway contradicts, and
+regenerate when Codar adds models. It reads the app's token the way the
+sign-in does and never prints it.
 
 ## Licence
 

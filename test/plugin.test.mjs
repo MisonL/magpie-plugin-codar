@@ -2397,8 +2397,13 @@ test("a regeneration that put a __proto__ id in the catalog does not become the 
   const { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs")
   const { tmpdir } = await import("node:os")
   const { join } = await import("node:path")
-  const { pathToFileURL } = await import("node:url")
-  const here = new URL("..", import.meta.url).pathname
+  const { fileURLToPath, pathToFileURL } = await import("node:url")
+  // fileURLToPath, not `.pathname`: pathname keeps the percent-encoding a
+  // repo in a folder with a space ("my project") puts in the URL, and gives a
+  // leading slash in front of a Windows drive letter — both made the copied
+  // plugin unloadable, so the suite went red on a developer machine whose
+  // checkout path has a space in it (CI's has none).
+  const here = fileURLToPath(new URL("..", import.meta.url))
   const root = mkdtempSync(join(tmpdir(), "codar-cat-"))
   try {
     for (const f of ["index.mjs", "catalog.mjs", "package.json"]) cpSync(join(here, f), join(root, f))
@@ -2416,4 +2421,39 @@ test("a regeneration that put a __proto__ id in the catalog does not become the 
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// The embedded catalog is the list served when the vendor cannot be reached,
+// and nothing at runtime can tell it has gone stale — a model's context or
+// reply ceiling moving is a silent wrong number on the card. `scripts/
+// catalog.mjs` regenerates it; this pins the shape an offline run can check,
+// so a hand-edit or a bad regeneration is caught without a network.
+test("the embedded catalog is a well-formed model list", async () => {
+  const { CATALOG } = await import("../catalog.mjs")
+  assert.ok(Array.isArray(CATALOG) && CATALOG.length > 0, "it is a non-empty list")
+  const ids = new Set()
+  const kinds = ["text", "image", "audio", "video", "pdf"]
+  const whole = (v) => Number.isInteger(v) && v >= 0
+  for (const m of CATALOG) {
+    assert.ok(m && typeof m === "object" && !Array.isArray(m), `a record is a plain object: ${JSON.stringify(m)}`)
+    assert.equal(typeof m.id, "string", "with a string id")
+    assert.ok(m.id.trim() && !/[\u0000-\u001f\u007f]/.test(m.id), `whose id is usable as asked: ${JSON.stringify(m.id)}`)
+    assert.equal(ids.has(m.id), false, `and unique: ${m.id}`)
+    ids.add(m.id)
+    assert.equal(typeof m.name, "string", `${m.id} names itself`)
+    assert.ok(whole(m.context) && m.context > 0, `${m.id} has a positive whole context`)
+    assert.ok(whole(m.maxOutput), `${m.id}'s reply ceiling is a whole number (0 is "not stated")`)
+    for (const field of ["input", "output"]) {
+      assert.ok(Array.isArray(m[field]) && m[field].length > 0, `${m.id}.${field} is a non-empty list`)
+      for (const k of m[field]) assert.ok(kinds.includes(k), `${m.id}.${field} names a kind magpie knows: ${k}`)
+    }
+    assert.ok(["text", "image"].includes(m.input[0]), `${m.id} takes text first`)
+    assert.ok(["openai_chat_completions", "anthropic_messages"].includes(m.protocol), `${m.id} names a protocol the plugin serves`)
+    assert.equal(typeof m.reasoning, "boolean", `${m.id} says whether it reasons`)
+  }
+  // and it reads as the models hook's own answer would: a model record, built
+  // into magpie's list shape, carries its context and ceiling through
+  const built = modelOf(CATALOG[0])
+  assert.equal(built.limit.context, CATALOG[0].context, "the record's context reaches limit.context")
+  assert.equal(built.limit.output, CATALOG[0].maxOutput, "and its ceiling reaches limit.output")
 })
