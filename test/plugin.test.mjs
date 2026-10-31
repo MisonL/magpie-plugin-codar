@@ -2278,3 +2278,142 @@ test("a provider entry that is an array is replaced, not written into", async ()
   assert.deepEqual(Object.keys(config.provider.codar), ["name", "npm", "api", "models"], "no index keys survive")
   assert.equal(config.provider.codar.name, "科搭 Codar")
 })
+
+// ---- round 10 ---------------------------------------------------------------
+
+// The vendor's client reads its base as written; so the plugin writes down
+// what it uses on both paths. config (magpie's cfg.api starter) used to keep
+// the user's whitespace and trailing slashes when the live path took them
+// off, so an account with a token that could not refresh sent requests to
+// ".../v1//chat/completions" — which magpie's own test notes the vendor reads
+// as a different path. baseURL makes both paths one rule.
+test("a base the user wrote with spaces and slashes is cleaned on either path", async () => {
+  const p = await CodarPlugin()
+  for (const [typed, clean] of [
+    ["https://proxy.example/v1/", "https://proxy.example/v1"],
+    ["  https://proxy.example/v1  ", "https://proxy.example/v1"],
+    ["https://proxy.example/v1//", "https://proxy.example/v1"],
+    ["https://proxy.example", "https://proxy.example"],
+    ["   ", "https://api.claw.speedai.com/v1"],
+    ["/", "https://api.claw.speedai.com/v1"],
+    ["///", "https://api.claw.speedai.com/v1"],
+    [42, "https://api.claw.speedai.com/v1"],
+    [undefined, "https://api.claw.speedai.com/v1"],
+  ]) {
+    const config = { provider: { codar: { api: typed } } }
+    await p.config(config)
+    assert.equal(config.provider.codar.api, clean, `config: ${JSON.stringify(typed)}`)
+    assert.equal(config.provider.codar.models.auto.api.url, clean, `config model: ${JSON.stringify(typed)}`)
+
+    const live = await withFetch(
+      { "/v1/codar/models": { body: { data: [{ id: "solo", protocol: { type: "openai_chat_completions" } }] } } },
+      async () => p.provider.models({ id: "codar", api: typed, models: {} }, { auth: await auth() }),
+    )
+    assert.equal(live.solo.api.url, clean, `live: ${JSON.stringify(typed)}`)
+  }
+})
+
+// The host's next step on a models-hook answer is `out.models[key] = …`: a
+// bracket assignment, which sets the prototype when key is "__proto__".
+// fromEntries and spread both make it an own key instead, so both our maps
+// were clean and the caller's was not. No model is named that; the hook drops
+// it so it never becomes one.
+test("a model the vendor names __proto__ is dropped, not handed on as a prototype key", async () => {
+  const p = await CodarPlugin()
+  const fresh = await withFetch(
+    {
+      "/v1/codar/models": {
+        body: {
+          data: [
+            { id: "__proto__", display_name: "Evil", protocol: { type: "openai_chat_completions" } },
+            { id: "constructor", display_name: "C", protocol: { type: "openai_chat_completions" } },
+            { id: "prototype", display_name: "P", protocol: { type: "openai_chat_completions" } },
+            { id: "ok", display_name: "Ok", protocol: { type: "openai_chat_completions" } },
+          ],
+        },
+      },
+    },
+    async () => p.provider.models({ id: "codar", models: {} }, { auth: await auth() }),
+  )
+  assert.deepEqual(Object.keys(fresh), ["ok"], "only a model that is a model")
+  assert.equal(Object.getPrototypeOf(fresh), Object.prototype, "the list's own prototype is untouched")
+})
+
+// Three promises the README makes that the suite stayed green without
+// (mutation-tested in round 9: each change below left 102/102 passing).
+test("the promises round 9 found unpinned", async () => {
+  const p = await CodarPlugin()
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const ok = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 2348, agent_token: 4000 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
+      "/api/codar/activities/mine": {
+        body: { code: 200, data: [{ free_until: until, remaining_quota: 3, user_quota_limit: 10, model_ids: ["auto"] }] },
+      },
+    },
+    async () => p.auth.usage(auth),
+  )
+  // 1. no window may name models: the host drops the whole card from
+  //    quotas.json the moment any window has them (quota_last.go's keepLast,
+  //    "a pool that can't be written down isn't kept"), costing the account
+  //    its reading across restarts. The model names live in the window's name.
+  for (const w of ok.windows) assert.equal(w.models, undefined, `no models on the ${w.name} window`)
+  for (const w of ok.windows) assert.equal(w.notModels, undefined, `no notModels either on ${w.name}`)
+
+  // 2. a token that states no exp is not called expired: that client calls it
+  //    "unknown" and lets the vendor answer. Read as expired, a token the
+  //    vendor would have accepted is refused locally instead.
+  const noExp = mkToken({ username: "user_1" })
+  const sent = await withFetch(
+    {
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 3600 } } },
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 1 } },
+    },
+    async (calls) => {
+      const r = await p.auth.checkin(async () => ({ type: "api", key: noExp }))
+      return { r, calls }
+    },
+  )
+  assert.equal(sent.r.outcome, "done", "a token with no exp reaches the vendor and is read")
+  assert.ok(sent.calls.length > 0, "and a request really went out")
+
+  // 3. constructor and prototype, as model *ids*, are dropped like __proto__:
+  //    `merged[id] = …` on the model map writes a property every object has.
+  const config = { provider: { codar: { models: JSON.parse('{"constructor": {"name": "c"}, "prototype": {"name": "p"}}') } } }
+  await p.config(config)
+  const models = config.provider.codar.models
+  assert.equal(Object.hasOwn(models, "constructor"), false, "a model named constructor is dropped")
+  assert.equal(Object.hasOwn(models, "prototype"), false, "a model named prototype is dropped")
+  assert.equal(models.constructor, Object, "and the map's own constructor is what it always was")
+})
+
+// The config path builds its model list from catalog.mjs, which cannot carry
+// a magic id today — but the guard there exists for the day catalog.mjs is
+// regenerated from the vendor and can. CATALOG is an import binding a test
+// cannot swap, so this loads a copy of the plugin whose catalog.mjs holds a
+// `__proto__` record and checks the guard against that copy.
+test("a regeneration that put a __proto__ id in the catalog does not become the map's prototype", async () => {
+  const { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const { pathToFileURL } = await import("node:url")
+  const here = new URL("..", import.meta.url).pathname
+  const root = mkdtempSync(join(tmpdir(), "codar-cat-"))
+  try {
+    for (const f of ["index.mjs", "catalog.mjs", "package.json"]) cpSync(join(here, f), join(root, f))
+    const cat = readFileSync(join(root, "catalog.mjs"), "utf8")
+    writeFileSync(join(root, "catalog.mjs"), cat.replace(/export const CATALOG = \[/, 'export const CATALOG = [\n  { "id": "__proto__", "name": "E", "context": 1, "maxOutput": 1, "input": ["text"], "output": ["text"], "protocol": "openai_chat_completions", "reasoning": false },') )
+    const { default: Other } = await import(pathToFileURL(join(root, "index.mjs")).href)
+    const p = await Other()
+    const config = {}
+    await p.config(config)
+    const models = config.provider.codar.models
+    assert.equal(Object.hasOwn(models, "__proto__"), false, "the id is not an own key of the map handed on")
+    assert.equal(Object.getPrototypeOf(models), Object.prototype, "and the map's prototype is the map's own")
+    assert.equal(models.name, undefined, "no planted field answers for the map")
+    assert.ok(models["auto"], "the rest of the catalog is still there")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

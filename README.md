@@ -101,8 +101,17 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   `constructor`, `prototype`) are never merged in — a model has no field by
   those names — and a model *named* one of them is dropped for the same
   reason: writing `models["__proto__"]` would set the model map's prototype
-  instead of adding a model. A provider slot holding an array is treated as
-  empty rather than written into (its index keys would land in your config).
+  instead of adding a model. A vendor record whose id names one of them is
+  dropped from the live list too (the host's next step on that list is the
+  same bracket assignment), so a renamed or planted id never becomes the
+  prototype of the model map magpie builds. A provider slot holding an array
+  is treated as empty rather than written into (its index keys would land in
+  your config). The address you set is written down the same way on both
+  paths — the `config` entry and the live list's per-model base alike take
+  the surrounding whitespace and the trailing slashes off, and a value that
+  is only whitespace is no value (the gateway fills in) — because magpie
+  joins a request path onto the base as written, and a base kept as
+  `.../v1//` would ask `.../v1//chat/completions`.
   The live list follows the same address: every model the vendor's
   catalog brings back is written at your provider's `api` (or the model's
   own, if you set one), never at Codar's gateway — magpie prefers a model's

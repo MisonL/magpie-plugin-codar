@@ -396,6 +396,18 @@ function tokensOf(v) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
 }
 
+// baseURL is an address as it is written down: the surrounding whitespace
+// and the trailing slashes off, the vendor's gateway when nothing is said.
+// magpie joins a request path onto the base as written, so a base kept as
+// ".../v1//" would ask ".../v1//chat/completions" — and one with a newline
+// in it is a URL no client can send. One rule for both places an address is
+// written: the config entry (which magpie reads as cfg.api), and the base a
+// live refresh writes on each model.
+const baseURL = (v) => {
+  const said = typeof v === "string" ? v.trim().replace(/\/+$/, "") : ""
+  return said || `${API}/v1`
+}
+
 // apiBase is where this provider's requests go: the address the host already
 // resolved for it — the user's own setting when they made one, else the
 // vendor's gateway. host.js builds a config model's api.url as
@@ -408,7 +420,7 @@ function tokensOf(v) {
 const apiBase = (provider, id) => {
   const perModel = id ? provider?.models?.[id]?.api?.url : ""
   const said = typeof perModel === "string" && perModel.trim() ? perModel : provider?.api
-  return typeof said === "string" && said.trim() ? said.trim().replace(/\/+$/, "") : `${API}/v1`
+  return baseURL(said)
 }
 
 // KINDS are the modalities magpie knows, in the order a card lists them.
@@ -489,6 +501,19 @@ const modelsOf = (list, base) => Object.fromEntries(list.map((m) => [m.id, model
 // as own keys the host copies into the model it builds. No model has a field
 // by those names, so dropping them loses nothing.
 const MAGIC_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
+// noMagicKeys drops the keys that name properties of every object from a map
+// about to be handed to the host as a model list. `Object.fromEntries` and
+// object spread both create own data properties — a record whose id is
+// `__proto__` becomes an own key without touching the prototype — but the
+// host's next step on that list is `out.models[key] = { … }`, a bracket
+// assignment, and that one sets the prototype: the model would vanish from
+// `Object.keys` and its fields would answer for the map itself. No model is
+// named any of these, so dropping them costs nothing.
+const noMagicKeys = (map) => {
+  for (const k of MAGIC_KEYS) if (Object.hasOwn(map, k)) delete map[k]
+  return map
+}
 const mergeModel = (ours, theirs) => {
   if (!plain(ours) || !plain(theirs)) return theirs
   const out = { ...ours }
@@ -979,7 +1004,11 @@ export async function CodarPlugin(input) {
           // 自建代理），见 apiBase。
           const known = new Set(CATALOG.map((m) => m.id))
           const own = Object.fromEntries(Object.entries(given).filter(([id]) => !known.has(id)))
-          return { ...own, ...modelsOf(list, (id) => apiBase(provider, id)) }
+          // 厂商目录里若有 id 叫 `__proto__` 的记录，它在 fromEntries/spread 之后
+          // 是自有键（不污染这张表本身），但宿主拿到这份列表的下一步是
+          // `out.models[key] = …` 的方括号赋值——那句写的是原型。没有这种模型，
+          // 丢掉不损失什么（见 noMagicKeys）。
+          return noMagicKeys({ ...own, ...modelsOf(list, (id) => apiBase(provider, id)) })
         } catch {
           return Object.assign(given, { [Symbol.for("magpie.fellBack")]: true })
         }
@@ -1020,12 +1049,21 @@ export async function CodarPlugin(input) {
       // 每条的 api.url 写用户设过的那个地址（他自己可能指着自建代理），
       // 否则写厂商网关：写进 config 的就是真话——宿主在那条路径上本来
       // 也取 cfg.api（见 apiBase 的注释），这里只是不让文件里留一个与
-      // 供应商级 api 不一致的地址。
-      const api = typeof was.api === "string" && was.api ? was.api : `${API}/v1`
+      // 供应商级 api 不一致的地址。地址按 baseURL 正规化，和 live 路径同一条
+      // 规则：宿主在 config 路径上拼请求用的就是这份 cfg.api（models 钩子
+      // 不刷新时——没登录、令牌过期——它原样返回，这张表就是请求用的那份），
+      // 留着 ".../v1//" 或首尾空白，拼出来的就是 ".../v1//chat/completions"。
+      const api = baseURL(was.api)
       const models = modelsOf(CATALOG, api)
       // models 本身不是对象（数组也是「对象」，但按 id 读不出模型）时当作没有。
       const own = was.models && typeof was.models === "object" && !Array.isArray(was.models) ? was.models : {}
-      const merged = { ...models }
+      // 展开会把目录里同名的自有键（`__proto__`）一并带过来——spread 用的是
+      // CreateDataProperty，键是自有键、原型不动，于是 `merged` 上就多了一条
+      // 名叫 `__proto__` 的模型。宿主读这张表时走 `out.models[key] = …` 的方括号
+      // 赋值，那一句写的才是原型（见 mergeModel 的注释、models 钩子的兄弟入口）。
+      // 目录是我们自己的文件，今天没有这种 id；留着这一道是重新生成目录的那天
+      // 也不会有。
+      const merged = noMagicKeys({ ...models })
       for (const [id, m] of Object.entries(own)) {
         // 不是对象的条目不是模型：宿主建供应商信息时把所有模型逐条展开
         // （host.js 的 info，读 m.id/m.provider），其中一个 null 就抛异常，
