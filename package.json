@@ -17,6 +17,7 @@
   "files": [
     "index.mjs",
     "catalog.mjs",
+    "scripts/catalog.mjs",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"

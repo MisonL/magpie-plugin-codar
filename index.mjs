@@ -554,8 +554,8 @@ function catalogOf(body) {
       // states it (request_schema.properties.max_tokens.maximum): magpie
       // lowers a request asking for more to it (gateway's maxoutput.go),
       // which is what keeps a client's over-asking from reaching the vendor
-      // as a refusal. 0 where the vendor states none (gpt-5.6-sol, gpt-6-sol
-      // and gpt-6-astra state none today).
+      // as a refusal. 0 where the vendor states none (gpt-5.6-sol states
+      // none today; gpt-6-sol and gpt-6-astra state 128000).
       maxOutput: tokensOf(m.request_schema?.properties?.max_tokens?.maximum),
       input: Array.isArray(m.input_modalities) ? m.input_modalities : ["text"],
       output: Array.isArray(m.output_modalities) ? m.output_modalities : ["text"],
@@ -1088,6 +1088,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, request, appToken, configPath }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS }
 
 export default CodarPlugin

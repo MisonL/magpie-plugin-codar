@@ -251,6 +251,17 @@ and committed; nothing at runtime can tell it has gone stale, so run
 regenerate when Codar adds models. It reads the app's token the way the
 sign-in does and never prints it.
 
+The generator writes its records with the plugin's own `catalogOf`, so the
+fallback file and the live list are read the same way (a size the vendor
+spells as a string is a size on both paths; a name is a cleaned card line on
+both). `--check` compares the records field by field, so a reordered key or a
+reworded comment is not drift. Its exit codes keep the two failures apart: 0
+is "nothing moved", 1 means a record moved and the file wants regenerating,
+and 2 is "the vendor or the file could not be read" — a run that fails to
+fetch writes nothing rather than emptying the fallback, and an answer naming
+zero models is refused rather than committed. It needs a signed-in app, so it
+is a local command, not a CI step.
+
 ## Licence
 
 MIT.

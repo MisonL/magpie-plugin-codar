@@ -7,80 +7,44 @@
 // contradicts), read the diff, and commit it.
 //
 //   node scripts/catalog.mjs            # regenerate from the signed-in app
-//   node scripts/catalog.mjs --check    # exit 1 if the file is out of date
+//   node scripts/catalog.mjs --check    # say which records moved, write nothing
+//
+// Exit codes, so a caller can tell the two failures apart:
+//   0  wrote the list, or the file already is what the vendor says
+//   1  --check only: a record moved
+//   2  could not read the vendor's answer (or our own files) — nothing was
+//      written. This is not "out of date": it is "ask again", and a caller
+//      that reads 1 as "regenerate" would regenerate from a failed read.
 //
 // The token is read from the app's own config (provider.speedai.token under
 // CODAR_HOME, else ~/.codar/config.json), the same one the sign-in reads, and
-// is never printed. --check is for CI or a pre-release look: it fetches,
-// compares, and says which records moved without writing anything.
+// is never printed.
+//
+// The records are built by the plugin's own catalogOf, not by a second copy
+// of its rules. A copy drifted the day it was written: the live path reads a
+// number the vendor writes as a string, folds the control characters out of a
+// name, and leaves out an id a request could not ask for — this file did none
+// of that, so a regeneration could put a record in the fallback that the live
+// path would never serve (and, for an id, one the plugin's own shape test
+// rejects).
 
 import { readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+
+import { testables } from "../index.mjs"
 
 const API = "https://api.claw.speedai.com"
 const CATALOG_PATH = "/v1/codar/models"
-const OUT = join(dirname(fileURLToPath(import.meta.url)), "..", "catalog.mjs")
-const check = process.argv.includes("--check")
+const HERE = dirname(fileURLToPath(import.meta.url))
 
-const configPath = () => {
-  const home = String(process.env.CODAR_HOME ?? "").trim()
-  return join(home || join(homedir(), ".codar"), "config.json")
-}
+// OUT_PATH is the list this writes: beside the plugin, not under scripts/.
+export const OUT_PATH = join(HERE, "..", "catalog.mjs")
 
-const token = (() => {
-  let raw
-  try {
-    raw = readFileSync(configPath(), "utf8")
-  } catch (e) {
-    console.error(`读不了 ${configPath()}（${e?.code ?? e.message}）：先在这台机器上登录一次科搭`)
-    process.exit(2)
-  }
-  const t = String(JSON.parse(raw)?.provider?.speedai?.token ?? "").trim()
-  if (!t) {
-    console.error(`${configPath()} 里没有 provider.speedai.token：先登录一次科搭`)
-    process.exit(2)
-  }
-  return t
-})()
-
-// whole is a vendor count as the plugin reads one (index.mjs's tokensOf): a
-// positive whole number, else 0 for "not stated". An Infinity or a fraction
-// is not a size anyone can plan with.
-const whole = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0)
-
-const res = await fetch(`${API}${CATALOG_PATH}`, { headers: { Authorization: `Bearer ${token}`, "User-Agent": "node" } })
-if (!res.ok) {
-  console.error(`GET ${CATALOG_PATH} → HTTP ${res.status}`)
-  process.exit(2)
-}
-const body = await res.json()
-const list = Array.isArray(body?.data) ? body.data : Array.isArray(body?.catalog?.data) ? body.catalog.data : null
-if (!list) {
-  console.error("应答里没有 data 数组——厂商换了形状，先核对 index.mjs 的 catalogOf")
-  process.exit(2)
-}
-
-const rows = []
-for (const m of list) {
-  if (!m || typeof m !== "object" || Array.isArray(m)) continue
-  const id = typeof m.id === "string" ? m.id.trim() : ""
-  if (!id) continue
-  rows.push({
-    id,
-    name: typeof m.display_name === "string" && m.display_name.trim() ? m.display_name.trim() : id,
-    context: whole(m.context_window),
-    maxOutput: whole(m.request_schema?.properties?.max_tokens?.maximum),
-    input: Array.isArray(m.input_modalities) ? m.input_modalities : ["text"],
-    output: Array.isArray(m.output_modalities) ? m.output_modalities : ["text"],
-    protocol: m.protocol?.type === "anthropic_messages" ? "anthropic_messages" : "openai_chat_completions",
-    reasoning: Boolean(m.reasoning),
-  })
-}
-rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-
-const head = `// catalog is Codar's model list as its own client keeps it: the answer to
+// The file's own header, then the array. Kept verbatim so regenerating a file
+// that is already current produces no diff at all.
+const HEAD = `// catalog is Codar's model list as its own client keeps it: the answer to
 // GET /v1/codar/models, reduced to what magpie reads (id, name, context,
 // maxOutput, modalities, protocol, reasoning) — the vendor's prices stay out
 // of it, as the plugin reports none (see README). maxOutput is the reply
@@ -91,29 +55,148 @@ const head = `// catalog is Codar's model list as its own client keeps it: the a
 // refreshes it live.
 export const CATALOG = [
 `
-const text = head + rows.map((r) => "  " + JSON.stringify(r, null, 2).replace(/\n/g, "\n  ")).join(",\n") + "\n]\n"
+const KEY = "export const CATALOG ="
 
-if (check) {
-  // Compare the records, not the file's bytes: the header comment is prose
-  // and may be reworded without the list going stale, while a model whose
-  // context or ceiling moved is exactly what this is looking for.
-  const parse = (s) => JSON.parse(s.slice(s.indexOf("["), s.lastIndexOf("]") + 1))
-  const before = new Map(parse(readFileSync(OUT, "utf8")).map((r) => [r.id, r]))
-  const after = new Map(rows.map((r) => [r.id, r]))
-  let moved = 0
-  for (const [id, r] of after) {
-    const b = before.get(id)
-    if (!b) (moved++, console.log(`added:   ${id}`))
-    else if (JSON.stringify(b) !== JSON.stringify(r)) (moved++, console.log(`changed: ${id}  ${JSON.stringify(b)} → ${JSON.stringify(r)}`))
-  }
-  for (const id of before.keys()) if (!after.has(id)) (moved++, console.log(`removed: ${id}`))
-  if (!moved) {
-    console.log(`catalog.mjs is up to date (${rows.length} models)`)
-    process.exit(0)
-  }
-  console.log(`catalog.mjs is out of date (${moved} record(s)): run \`node scripts/catalog.mjs\``)
-  process.exit(1)
+// FIELD_ORDER is the shape a record is written in. Written from the fields
+// rather than stringified as it came, so the file's key order is this file's
+// decision and stays put across a regeneration — `--check` compares values,
+// but a stable order keeps the committed diff about the models.
+const FIELD_ORDER = ["id", "name", "context", "maxOutput", "input", "output", "protocol", "reasoning"]
+
+const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
+
+// configPathOf is where the app keeps its own config, the same place the
+// plugin's read-from-this-machine sign-in looks (index.mjs's configPath).
+export const configPathOf = (env = process.env) => {
+  const home = String(env?.CODAR_HOME ?? "").trim()
+  return join(home || join(homedir(), ".codar"), "config.json")
 }
 
-writeFileSync(OUT, text)
-console.log(`wrote ${rows.length} models to catalog.mjs`)
+// recordsOf is a vendor answer as this file's records: the plugin's own
+// catalogOf, then one record per id with a later one winning — exactly what
+// the runtime's `Object.fromEntries` over the same list leaves in the model
+// map. Then the ids that name a property of every object are dropped, as the
+// runtime drops them (index.mjs's noMagicKeys): a record named `__proto__` is
+// never served, so a file that carried one would be a fallback the live path
+// does not have. null means the answer named no list we could read
+// (catalogOf's own "unreadable", not "empty").
+export const recordsOf = (body) => {
+  const list = testables.catalogOf(body)
+  if (!list) return null
+  const keys = testables.magicKeys
+  return [...new Map(list.filter((r) => !keys.has(r.id)).map((r) => [r.id, r])).values()]
+}
+
+// sortRows orders by id, so a vendor that reorders its list does not show up
+// as a diff. Insertion order is otherwise the vendor's.
+export const sortRows = (rows) => [...rows].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+
+const asWritten = (r) => Object.fromEntries(FIELD_ORDER.map((k) => [k, r[k]]))
+const line = (r) => "  " + JSON.stringify(asWritten(r), null, 2).replace(/\n/g, "\n  ")
+
+// render is the whole file, header and all.
+export const render = (rows) => `${HEAD}${rows.map(line).join(",\n")}\n]\n`
+
+// parseCatalog reads a file back. The literal is ours, so this reads the
+// array after the export: a file we did not write is a file we cannot
+// compare, and the caller says so rather than guessing.
+export const parseCatalog = (text) => {
+  const at = String(text).indexOf(KEY)
+  if (at < 0) throw new Error("no `export const CATALOG = [` to read")
+  const list = JSON.parse(String(text).slice(at + KEY.length).trim())
+  if (!Array.isArray(list)) throw new Error("the export is not a list")
+  return list
+}
+
+// diff is the check's answer: which records moved, compared field by field.
+// Field by field and not by the file's bytes: a reordered key or a reworded
+// header comment is prose, while a model whose context or ceiling moved is
+// exactly what this looks for.
+export const diff = (before, after) => {
+  const was = new Map(before.map((r) => [r.id, r]))
+  const now = new Map(after.map((r) => [r.id, r]))
+  const moved = []
+  for (const [id, r] of now) {
+    const b = was.get(id)
+    if (!b) moved.push(`added:   ${id}`)
+    else if (FIELD_ORDER.some((k) => JSON.stringify(b[k]) !== JSON.stringify(r[k])))
+      moved.push(`changed: ${id}  ${JSON.stringify(asWritten(b))} → ${JSON.stringify(asWritten(r))}`)
+  }
+  for (const id of was.keys()) if (!now.has(id)) moved.push(`removed: ${id}`)
+  return moved
+}
+
+// main is the whole run, with its outside world passed in so a test can drive
+// it without a network, a signed-in app, or the repository's own catalog.mjs.
+// It returns the exit code rather than exiting.
+export const main = async ({ argv = process.argv, env = process.env, out = OUT_PATH, fetchImpl = fetch, log = console } = {}) => {
+  const check = argv.includes("--check")
+  const fail = (message) => {
+    log.error(message)
+    return 2
+  }
+
+  let raw
+  try {
+    raw = readFileSync(configPathOf(env), "utf8")
+  } catch (e) {
+    return fail(`读不了 ${configPathOf(env)}（${e?.code ?? e.message}）：先在这台机器上登录一次科搭`)
+  }
+  let token = ""
+  try {
+    token = String(JSON.parse(raw)?.provider?.speedai?.token ?? "").trim()
+  } catch {
+    return fail(`${configPathOf(env)} 不是 JSON：先在这台机器上登录一次科搭`)
+  }
+  if (!token) return fail(`${configPathOf(env)} 里没有 provider.speedai.token：先登录一次科搭`)
+
+  let body
+  try {
+    const res = await fetchImpl(`${API}${CATALOG_PATH}`, { headers: { Authorization: `Bearer ${token}`, "User-Agent": "node" } })
+    if (!res.ok) return fail(`GET ${CATALOG_PATH} → HTTP ${res.status}`)
+    body = await res.json()
+  } catch (e) {
+    // a thrown fetch and an unparseable body are the same failure: the vendor
+    // did not answer with a list, so there is nothing here to compare
+    return fail(`GET ${CATALOG_PATH} 没读成（${whyOf(e)}）：这是取数的失败，不是目录过时`)
+  }
+
+  const rows = recordsOf(body)
+  if (!rows) return fail("应答里没有一份读得出的模型列表：厂商可能换了形状（先核对 index.mjs 的 catalogOf），也可能是一次故障")
+  // The file is the fallback for the plugin, not one account's answer, and it
+  // is committed. An answer that names no models is not allowed to empty it.
+  if (!rows.length) return fail("厂商这次答了 0 个模型：这份目录是所有人的回退，不拿一次的答案把它清空（确认后手动改 catalog.mjs）")
+
+  const sorted = sortRows(rows)
+
+  if (!check) {
+    try {
+      writeFileSync(out, render(sorted))
+    } catch (e) {
+      return fail(`写不了 ${out}（${whyOf(e)}）`)
+    }
+    log.log(`wrote ${sorted.length} models to catalog.mjs`)
+    return 0
+  }
+
+  let before
+  try {
+    before = parseCatalog(readFileSync(out, "utf8"))
+  } catch (e) {
+    return fail(`读不了 ${out}（${whyOf(e)}）：目录文件本身有问题，不是它过时`)
+  }
+
+  const moved = diff(before, sorted)
+  if (!moved.length) {
+    log.log(`catalog.mjs is up to date (${sorted.length} models)`)
+    return 0
+  }
+  for (const m of moved) log.log(m)
+  log.log(`catalog.mjs is out of date (${moved.length} record(s)): run \`node scripts/catalog.mjs\``)
+  return 1
+}
+
+// only when run as the script: imported by the test suite, this must not
+// reach for a token or exit.
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (isMain) process.exitCode = await main()

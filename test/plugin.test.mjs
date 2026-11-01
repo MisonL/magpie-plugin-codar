@@ -10,7 +10,7 @@ import { join } from "node:path"
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 
-const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, payloadOf, request, appToken, configPath } = testables
+const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, payloadOf, request, appToken, configPath, cleanText } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -2388,6 +2388,56 @@ test("the promises round 9 found unpinned", async () => {
   assert.equal(models.constructor, Object, "and the map's own constructor is what it always was")
 })
 
+test("the guards round 12 found unpinned", async () => {
+  // Each of these was a guard the suite stayed green without (mutation-tested
+  // against this same run): dropping the guard changed what magpie draws, so
+  // each gets its own sentence.
+  const p = await CodarPlugin()
+  const sign = async (body) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign": { body },
+      },
+      async () => p.auth.checkin(auth),
+    )
+
+  // 1. the "already claimed" words are the day's only when the code can be
+  //    the day's either (400, or no code at all). A 500 has the words but is
+  //    a server failure: read as `done`, magpie settles the day off an error
+  //    and stops asking until tomorrow. Only the 400/no-code half was pinned.
+  assert.equal((await sign({ code: 500, message: "24小时内仅可领取一次" })).outcome, "failed", "a 500 quoting the words is a failure, not a claimed day")
+  assert.equal((await sign({ code: 503, message: "24小时内仅可领取一次" })).outcome, "failed", "and so is a 503")
+  //    the other half: no code at all is the day's own shape, and is `done`
+  assert.equal((await sign({ message: "24小时内仅可领取一次", data: { retry_after: 60 } })).outcome, "done", "the same words with no code are the day's")
+
+  // 2. an id the vendor pads with spaces is kept under its trimmed name,
+  //    rather than dropped for not being clean (the trim is what makes it
+  //    clean: cleanText would fold the pad away and the ids would differ).
+  const padded = catalogOf({ data: [{ id: "  spaced  ", display_name: "S" }] })
+  assert.equal(padded.length, 1, "a space-padded id is not an uncleanable one")
+  assert.equal(padded[0].id, "spaced", "it is kept as its trimmed self")
+
+  // 3. a record that states no protocol is an OpenAI-compatible one: the
+  //    vendor's default, and what the desktop app assumes. A record that
+  //    named no protocol read as anthropic would send the wrong SDK.
+  assert.equal(catalogOf({ data: [{ id: "noproto" }] })[0].protocol, "openai_chat_completions", "no protocol stated is the OpenAI-compatible one")
+
+  // 4. an activity over three models says how many, not just the first two:
+  //    "免费模型 · a、b" alone reads as an activity about two models.
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const many = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [{ free_until: until, model_ids: ["a", "b", "c", "d"] }] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const free = many.windows.find((w) => w.name.startsWith("免费模型"))
+  assert.match(free.name, /等 4 个/, "an activity over four models says so")
+})
+
 // The config path builds its model list from catalog.mjs, which cannot carry
 // a magic id today — but the guard there exists for the day catalog.mjs is
 // regenerated from the vendor and can. CATALOG is an import binding a test
@@ -2441,6 +2491,13 @@ test("the embedded catalog is a well-formed model list", async () => {
     assert.equal(ids.has(m.id), false, `and unique: ${m.id}`)
     ids.add(m.id)
     assert.equal(typeof m.name, "string", `${m.id} names itself`)
+    // the name is a card's line, and cleanText is what makes one: a record
+    // whose name still held a control character (a bidi override reverses
+    // what follows it; a zero-width space rides along invisibly) would reach
+    // the card as written. The plugin's own cleanText is the rule — the shape
+    // check applies it rather than assuming the generator did.
+    assert.equal(m.name, cleanText(m.name), `${m.id}'s name is already a cleaned line`)
+    assert.ok(m.name.length > 0, `${m.id}'s name is not empty`)
     assert.ok(whole(m.context) && m.context > 0, `${m.id} has a positive whole context`)
     assert.ok(whole(m.maxOutput), `${m.id}'s reply ceiling is a whole number (0 is "not stated")`)
     for (const field of ["input", "output"]) {
@@ -2456,4 +2513,164 @@ test("the embedded catalog is a well-formed model list", async () => {
   const built = modelOf(CATALOG[0])
   assert.equal(built.limit.context, CATALOG[0].context, "the record's context reaches limit.context")
   assert.equal(built.limit.output, CATALOG[0].maxOutput, "and its ceiling reaches limit.output")
+})
+
+// scripts/catalog.mjs writes the fallback the plugin ships, and it used to be
+// a second copy of the rules the live path applies — which drifted the day it
+// was written (a size the vendor spells as a string, a name with a control
+// character, an id no request could ask for). It now builds its records with
+// the plugin's own catalogOf; these drive its main() with a stubbed fetch and
+// its outside world injected, so the tool that writes the file is itself
+// pinned, offline.
+const { recordsOf, render, parseCatalog, main, sortRows } = await import("../scripts/catalog.mjs")
+
+// genRun drives the generator against a stub vendor and a scratch directory.
+const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFetch } = {}) => {
+  const { mkdtempSync } = await import("node:fs")
+  const { readFileSync, writeFileSync } = await import("node:fs")
+  const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+  const outPath = join(root, out)
+  writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token: "fake.token.value" } } }))
+  if (seeded) writeFileSync(outPath, seeded)
+  const logs = []
+  const exit = await main({
+    argv: ["node", "scripts/catalog.mjs", ...argv],
+    env: { CODAR_HOME: root },
+    out: outPath,
+    fetchImpl: async () => {
+      if (throwOnFetch) throw new TypeError("fetch failed")
+      return new Response(typeof body === "string" ? body : JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
+    },
+    log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
+  })
+  const after = (() => {
+    try {
+      return readFileSync(outPath, "utf8")
+    } catch {
+      return null
+    }
+  })()
+  rmSync(root, { recursive: true, force: true })
+  return { exit, logs, after }
+}
+
+test("the catalog generator builds its records with the plugin's own rules", () => {
+  // The vendor spells a size as a string, plants an id a request could not
+  // ask for, wraps a name in a control character and a bidi override, repeats
+  // an id, and names one __proto__. Everything except the list itself is the
+  // live path's business: this asserts the generator's records are the ones
+  // catalogOf would have made, not a looser read of the same body.
+  const body = {
+    code: 200,
+    data: [
+      { id: "strsizes", display_name: "Strings", context_window: "1000000", request_schema: { properties: { max_tokens: { maximum: "131072" } } } },
+      { id: "ctrl", display_name: "Na‮me​", context_window: 1000 },
+      { id: "bad\u0001id", display_name: "Bad", context_window: 1000 },
+      { id: "dup", display_name: "First", context_window: 1000 },
+      { id: "dup", display_name: "Second", context_window: 2000 },
+      { id: "__proto__", display_name: "Proto", context_window: 1000 },
+      null,
+      "str",
+      [1, 2],
+      { display_name: "no id" },
+    ],
+  }
+  const rows = recordsOf(body)
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  assert.deepEqual([...byId.keys()].sort(), ["ctrl", "dup", "strsizes"], "an uncleanable id, a magic id and a non-record are left out")
+  assert.equal(byId.get("strsizes").context, 1000000, "a size the vendor spells as a string is a size")
+  assert.equal(byId.get("strsizes").maxOutput, 131072, "and so is its reply ceiling")
+  assert.equal(byId.get("dup").name, "Second", "a repeated id keeps the later record, as the run's map does")
+  assert.equal(byId.get("ctrl").name, cleanText("Na‮me​"), "a name is a cleaned line")
+  assert.equal(recordsOf({ code: 200, data: "nope" }), null, "an answer naming no list is no rows, not an empty list")
+})
+
+test("the generator writes what it would serve, and says so", async () => {
+  const body = { code: 200, data: [{ id: "only", display_name: "Na\u0007me", context_window: 1000, request_schema: { properties: { max_tokens: { maximum: 10 } } } }] }
+  const { exit, logs, after } = await genRun({ body })
+  assert.equal(exit, 0)
+  assert.ok(logs.some((l) => l.includes("wrote 1 models")))
+  const written = parseCatalog(after)
+  assert.deepEqual(written, recordsOf(body), "the file holds exactly the records the live path would serve")
+  assert.equal(written[0].name, cleanText("Na\u0007me"), "with the name cleaned, as the card will show it")
+})
+
+test("a generator run that cannot read the vendor writes nothing and does not say 'out of date'", async () => {
+  const seeded = render(sortRows(recordsOf({ code: 200, data: [{ id: "sentinel", display_name: "s", context_window: 1 }] })))
+  for (const [label, opts] of [
+    ["network failure", { body: undefined, throwOnFetch: true }],
+    ["an HTML body", { body: "<html>maintenance</html>" }],
+    ["an answer with no list", { body: { code: 200, message: "nope" } }],
+    ["an empty list", { body: { code: 200, data: [] } }],
+  ]) {
+    const { exit, logs, after } = await genRun({ ...opts, seeded })
+    assert.equal(exit, 2, `${label}: a failed read is exit 2, never the 1 that means "regenerate"`)
+    assert.equal(after, seeded, `${label}: the committed fallback is left alone`)
+    assert.equal(logs.some((l) => l.includes("out of date")), false, `${label}: and is not reported as stale`)
+  }
+})
+
+test("the generator's --check compares values, not the bytes of the file", async () => {
+  const body = { code: 200, data: [{ id: "m", display_name: "M", context_window: 1000, request_schema: { properties: { max_tokens: { maximum: 10 } } } }] }
+  const seeded = render(recordsOf(body))
+  // same records, keys written in another order: prose, not drift
+  const reordered = seeded.replace('"context": 1000,\n    "maxOutput": 10', '"maxOutput": 10,\n    "context": 1000')
+  assert.notEqual(reordered, seeded, "the fixture really did reorder a record")
+  assert.equal((await genRun({ body, argv: ["--check"], seeded: reordered })).exit, 0, "a reordered record is not a change")
+
+  const drifted = seeded.replace('"context": 1000', '"context": 999')
+  const moved = await genRun({ body, argv: ["--check"], seeded: drifted })
+  assert.equal(moved.exit, 1, "a size that really moved is the 1 that means 'regenerate'")
+  assert.ok(moved.logs.some((l) => l.startsWith("changed: m")), "and says which record moved")
+})
+
+test("a --check that cannot read the catalog file is exit 2, not 'out of date'", async () => {
+  const body = { code: 200, data: [{ id: "m", context_window: 1000 }] }
+  const missing = await genRun({ body, argv: ["--check"], seeded: undefined, out: "catalog.mjs" })
+  // seeded: undefined means the file was never written at all
+  assert.equal(missing.exit, 2, "a file we cannot read is a failure to read, not drift")
+  const truncated = await genRun({ body, argv: ["--check"], seeded: "export const CATALOG = [ this is not json" })
+  assert.equal(truncated.exit, 2, "and so is a file that does not parse")
+  assert.equal(truncated.logs.some((l) => l.includes("out of date")), false)
+  const noExport = await genRun({ body, argv: ["--check"], seeded: "// a file we did not write\n" })
+  assert.equal(noExport.exit, 2, "and so is a file with no CATALOG export in it")
+})
+
+test("a generator that cannot write the file says so, as exit 2", async () => {
+  const { mkdtempSync } = await import("node:fs")
+  const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+  writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token: "t" } } }))
+  const logs = []
+  try {
+    const exit = await main({
+      argv: ["node", "scripts/catalog.mjs"],
+      env: { CODAR_HOME: root },
+      // a directory that is not there: the write fails, and the run says so
+      out: join(root, "missing-dir", "catalog.mjs"),
+      fetchImpl: async () => new Response(JSON.stringify({ code: 200, data: [{ id: "m", context_window: 1 }] }), { status: 200 }),
+      log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
+    })
+    assert.equal(exit, 2, "a failed write is exit 2")
+    assert.ok(logs.some((l) => l.includes("写不了")), "and names the file it could not write")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a generator run with no readable token says what to do, as exit 2", async () => {
+  const { mkdtempSync, readFileSync } = await import("node:fs")
+  const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+  const logs = []
+  const run = (env) =>
+    main({ argv: ["node", "scripts/catalog.mjs"], env, out: join(root, "catalog.mjs"), fetchImpl: async () => new Response("{}", { status: 200 }), log: { log: (m) => logs.push(m), error: (m) => logs.push(m) } })
+  try {
+    assert.equal(await run({ CODAR_HOME: join(root, "absent") }), 2, "no config file")
+    assert.ok(logs.some((l) => l.includes("先在这台机器上登录一次科搭")))
+    writeFileSync(join(root, "config.json"), "{not json")
+    assert.equal(await run({ CODAR_HOME: root }), 2, "a config that is not JSON")
+    writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token: "" } } }))
+    assert.equal(await run({ CODAR_HOME: root }), 2, "a config with no token")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
