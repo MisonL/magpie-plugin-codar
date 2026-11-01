@@ -9,7 +9,7 @@ the usage card.
 
 | Hook | What it does |
 |---|---|
-| `config` / `provider` | Adds a `codar` provider with Codar's model list (16 models: the `auto` router plus DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
+| `config` / `provider` | Adds a `codar` provider with Codar's model list (17 models: the `auto` router plus DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
 | `auth.methods` | Two ways to sign in: "读取本机科搭令牌" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the "科搭访问令牌". |
 | `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1795), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. A wait it cannot use — missing, zero, past year 9999, or longer than a week (this day rolls every 24 hours, so 31 years is not a next-claim time) — gets a 30-minute trust floor instead: "done with no `until`" would settle the whole day in magpie, and a rolling window would lose the next claim. |
 | `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". |
@@ -182,7 +182,7 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   provider's row from that map in one Promise.all, and one such entry throws —
   taking the whole provider list down, not just that entry.
 - A model's reply ceiling is the vendor's own: the catalog states
-  `max_tokens.maximum` per model (15 of 16 today; `gpt-5.6-sol` states none,
+  `max_tokens.maximum` per model (16 of 17 today; `gpt-5.6-sol` states none,
   and 0 means "not stated"), and it goes out as
   the model's `limit.output`. magpie lowers a request that asks for more to it
   (its gateway's `maxoutput.go`), so an agent asking past the ceiling gets a

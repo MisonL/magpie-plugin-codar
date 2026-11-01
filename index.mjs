@@ -115,7 +115,7 @@ const ALREADY_CLAIMED = /24\s*小时|仅可领取一次/
 // passes a hook's answer to Go as a single JSON line and kills the whole
 // plugin host — every plugin in it — when that line passes 32 MiB
 // (host.go's maxWireLine); an unbounded list is a way for a vendor to take
-// the host down with data rather than with a bug. Codar lists 16.
+// the host down with data rather than with a bug. Codar lists 17.
 const MAX_MODELS = 2000
 
 // MAX_ACTIVITY_WINDOWS is how many free-model activities go on the card.

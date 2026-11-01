@@ -29,7 +29,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
@@ -43,7 +44,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
@@ -57,7 +59,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
@@ -71,7 +74,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
@@ -82,6 +86,20 @@ export const CATALOG = [
   {
     "id": "claude-sonnet-5",
     "name": "claude-sonnet-5",
+    "context": 1000000,
+    "maxOutput": 128000,
+    "input": [
+      "text"
+    ],
+    "output": [
+      "text"
+    ],
+    "protocol": "anthropic_messages",
+    "reasoning": true
+  },
+  {
+    "id": "claude-sonnet-5-5",
+    "name": "claude-sonnet-5-5",
     "context": 1000000,
     "maxOutput": 128000,
     "input": [

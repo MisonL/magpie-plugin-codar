@@ -9,6 +9,7 @@ import { join } from "node:path"
 
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
+import { CATALOG } from "../catalog.mjs"
 
 const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, payloadOf, request, appToken, configPath, cleanText } = testables
 
@@ -1946,11 +1947,11 @@ test("a model entry that is not an object is dropped, not handed to the host", a
     assert.ok(models[id].provider?.npm, `${id} still carries the fields the host reads`)
   }
   assert.equal(models["my-own"].name, "Mine", "a model of the user's own is kept")
-  assert.equal(Object.keys(models).length, 17, "16 catalog models and the user's one")
+  assert.equal(Object.keys(models).length, CATALOG.length + 1, "the whole catalog and the user's one")
 
   const other = { provider: { codar: { models: [{ id: "x" }] } } }
   await p.config(other)
-  assert.equal(Object.keys(other.provider.codar.models).length, 16, "an array of models is no model map")
+  assert.equal(Object.keys(other.provider.codar.models).length, CATALOG.length, "an array of models is no model map")
 })
 
 test("a points answer whose code is not 200 is a refusal, not a balance of 0", async () => {
@@ -2265,7 +2266,7 @@ test("a model id that names an object property never writes the model map's prot
   const models = config.provider.codar.models
   assert.equal(Object.getPrototypeOf(models), Object.prototype, "the model map's prototype is untouched")
   assert.equal(models.name, undefined, "and no planted field shows through it")
-  assert.equal(Object.keys(models).length, 16, "the catalog is what is listed")
+  assert.equal(Object.keys(models).length, CATALOG.length, "the catalog is what is listed")
 })
 
 test("a provider entry that is an array is replaced, not written into", async () => {
