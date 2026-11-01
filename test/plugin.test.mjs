@@ -2555,7 +2555,7 @@ const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFet
   return { exit, logs, after }
 }
 
-test("the catalog generator builds its records with the plugin's own rules", () => {
+test("the catalog generator builds its records with the plugin's own rules", async () => {
   // The vendor spells a size as a string, plants an id a request could not
   // ask for, wraps a name in a control character and a bidi override, repeats
   // an id, and names one __proto__. Everything except the list itself is the
@@ -2576,14 +2576,14 @@ test("the catalog generator builds its records with the plugin's own rules", () 
       { display_name: "no id" },
     ],
   }
-  const rows = recordsOf(body)
+  const rows = await recordsOf(body)
   const byId = new Map(rows.map((r) => [r.id, r]))
   assert.deepEqual([...byId.keys()].sort(), ["ctrl", "dup", "strsizes"], "an uncleanable id, a magic id and a non-record are left out")
   assert.equal(byId.get("strsizes").context, 1000000, "a size the vendor spells as a string is a size")
   assert.equal(byId.get("strsizes").maxOutput, 131072, "and so is its reply ceiling")
   assert.equal(byId.get("dup").name, "Second", "a repeated id keeps the later record, as the run's map does")
   assert.equal(byId.get("ctrl").name, cleanText("Na‮me​"), "a name is a cleaned line")
-  assert.equal(recordsOf({ code: 200, data: "nope" }), null, "an answer naming no list is no rows, not an empty list")
+  assert.equal(await recordsOf({ code: 200, data: "nope" }), null, "an answer naming no list is no rows, not an empty list")
 })
 
 test("the generator writes what it would serve, and says so", async () => {
@@ -2592,12 +2592,12 @@ test("the generator writes what it would serve, and says so", async () => {
   assert.equal(exit, 0)
   assert.ok(logs.some((l) => l.includes("wrote 1 models")))
   const written = parseCatalog(after)
-  assert.deepEqual(written, recordsOf(body), "the file holds exactly the records the live path would serve")
+  assert.deepEqual(written, await recordsOf(body), "the file holds exactly the records the live path would serve")
   assert.equal(written[0].name, cleanText("Na\u0007me"), "with the name cleaned, as the card will show it")
 })
 
 test("a generator run that cannot read the vendor writes nothing and does not say 'out of date'", async () => {
-  const seeded = render(sortRows(recordsOf({ code: 200, data: [{ id: "sentinel", display_name: "s", context_window: 1 }] })))
+  const seeded = render(sortRows(await recordsOf({ code: 200, data: [{ id: "sentinel", display_name: "s", context_window: 1 }] })))
   for (const [label, opts] of [
     ["network failure", { body: undefined, throwOnFetch: true }],
     ["an HTML body", { body: "<html>maintenance</html>" }],
@@ -2613,7 +2613,7 @@ test("a generator run that cannot read the vendor writes nothing and does not sa
 
 test("the generator's --check compares values, not the bytes of the file", async () => {
   const body = { code: 200, data: [{ id: "m", display_name: "M", context_window: 1000, request_schema: { properties: { max_tokens: { maximum: 10 } } } }] }
-  const seeded = render(recordsOf(body))
+  const seeded = render(await recordsOf(body))
   // same records, keys written in another order: prose, not drift
   const reordered = seeded.replace('"context": 1000,\n    "maxOutput": 10', '"maxOutput": 10,\n    "context": 1000')
   assert.notEqual(reordered, seeded, "the fixture really did reorder a record")
@@ -2655,6 +2655,35 @@ test("a generator that cannot write the file says so, as exit 2", async () => {
     assert.ok(logs.some((l) => l.includes("写不了")), "and names the file it could not write")
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a generator run whose plugin rules cannot be loaded is exit 2, not 'out of date'", async () => {
+  // The generator builds its records with the plugin's own catalogOf. If
+  // index.mjs or catalog.mjs is not beside the script (a broken checkout, a
+  // partial copy), that import fails — and a module-loader stack with exit 1
+  // would read as "the catalog is stale, regenerate it".
+  const { mkdtempSync } = await import("node:fs")
+  const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+  writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token: "t" } } }))
+  // a fresh copy of the generator with no index.mjs beside it: the import of
+  // the plugin's rules is what fails, in a process that has not cached it
+  const { cpSync } = await import("node:fs")
+  const { fileURLToPath } = await import("node:url")
+  const root2 = mkdtempSync(join(tmpdir(), "codar-gen-copy-"))
+  try {
+    const here2 = fileURLToPath(new URL("..", import.meta.url))
+    for (const f of ["scripts", "catalog.mjs"]) cpSync(join(here2, f), join(root2, f), { recursive: true })
+    const { spawnSync } = await import("node:child_process")
+    const run = spawnSync(process.execPath, [join(root2, "scripts", "catalog.mjs"), "--check"], {
+      env: { ...process.env, CODAR_HOME: root },
+      encoding: "utf8",
+    })
+    assert.equal(run.status, 2, "a run that cannot load the plugin's rules exits 2")
+    assert.match(run.stderr + run.stdout, /读不了插件的目录规则/, "and says so in words, not a loader stack")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(root2, { recursive: true, force: true })
   }
 })
 

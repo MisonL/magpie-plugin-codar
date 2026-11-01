@@ -28,12 +28,10 @@
 // path would never serve (and, for an id, one the plugin's own shape test
 // rejects).
 
-import { readFileSync, writeFileSync } from "node:fs"
+import { readFileSync, realpathSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-
-import { testables } from "../index.mjs"
 
 const API = "https://api.claw.speedai.com"
 const CATALOG_PATH = "/v1/codar/models"
@@ -65,6 +63,18 @@ const FIELD_ORDER = ["id", "name", "context", "maxOutput", "input", "output", "p
 
 const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
 
+// plugin is loaded once, when it is first needed: the top-level import is what
+// this file must not depend on. A published package ships scripts/catalog.mjs
+// with index.mjs beside it, but a run from a checkout where the plugin is not
+// resolvable — or a Node that refuses a bare dynamic import of a file beside
+// the script — should get the exit code and the sentence, not a module-loader
+// stack before main() can say anything.
+let plugin = null
+const pluginOf = async () => {
+  if (!plugin) plugin = (await import(new URL("../index.mjs", import.meta.url).href)).testables
+  return plugin
+}
+
 // configPathOf is where the app keeps its own config, the same place the
 // plugin's read-from-this-machine sign-in looks (index.mjs's configPath).
 export const configPathOf = (env = process.env) => {
@@ -80,11 +90,11 @@ export const configPathOf = (env = process.env) => {
 // never served, so a file that carried one would be a fallback the live path
 // does not have. null means the answer named no list we could read
 // (catalogOf's own "unreadable", not "empty").
-export const recordsOf = (body) => {
-  const list = testables.catalogOf(body)
+export const recordsOf = async (body) => {
+  const { catalogOf, magicKeys } = await pluginOf()
+  const list = catalogOf(body)
   if (!list) return null
-  const keys = testables.magicKeys
-  return [...new Map(list.filter((r) => !keys.has(r.id)).map((r) => [r.id, r])).values()]
+  return [...new Map(list.filter((r) => !magicKeys.has(r.id)).map((r) => [r.id, r])).values()]
 }
 
 // sortRows orders by id, so a vendor that reorders its list does not show up
@@ -161,7 +171,15 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
     return fail(`GET ${CATALOG_PATH} 没读成（${whyOf(e)}）：这是取数的失败，不是目录过时`)
   }
 
-  const rows = recordsOf(body)
+  let rows
+  try {
+    rows = await recordsOf(body)
+  } catch (e) {
+    // index.mjs itself could not be loaded (no plugin beside this script, or
+    // its own catalog.mjs missing): without the plugin's rules there is no
+    // record to compare, so this is a read failure — never "out of date".
+    return fail(`读不了插件的目录规则（${whyOf(e)}）：确认 index.mjs 和 catalog.mjs 都在这份脚本旁边`)
+  }
   if (!rows) return fail("应答里没有一份读得出的模型列表：厂商可能换了形状（先核对 index.mjs 的 catalogOf），也可能是一次故障")
   // The file is the fallback for the plugin, not one account's answer, and it
   // is committed. An answer that names no models is not allowed to empty it.
@@ -197,6 +215,15 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
 }
 
 // only when run as the script: imported by the test suite, this must not
-// reach for a token or exit.
-const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+// reach for a token or exit. Compared by real path on both sides: a checkout
+// reached through a symlink (macOS's /tmp is one) gives argv[1] and
+// import.meta.url two spellings of the same file, and a plain string compare
+// read that as "imported" — the script then did nothing and exited 0.
+const isMain = (() => {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+})()
 if (isMain) process.exitCode = await main()
