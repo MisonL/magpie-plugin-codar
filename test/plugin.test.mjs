@@ -2523,7 +2523,13 @@ test("the guards round 12 found unpinned", async () => {
 // regenerated from the vendor and can. CATALOG is an import binding a test
 // cannot swap, so this loads a copy of the plugin whose catalog.mjs holds a
 // `__proto__` record and checks the guard against that copy.
-test("a regeneration that put a __proto__ id in the catalog does not become the map's prototype", async () => {
+// Under Bun the first `import()` of a file from a fresh temp directory costs
+// ~1.8s, once per process — a second copy at another path loads in ~2ms —
+// and this is the test that pays it. Bun's default per-test timeout is 5s,
+// and a loaded machine crossed it (1 fail in ~26 full runs). Node's runner
+// has no such default. The test does no waiting of its own, so the budget is
+// stated here rather than left to the runner.
+test("a regeneration that put a __proto__ id in the catalog does not become the map's prototype", { timeout: 30000 }, async () => {
   const { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs")
   const { tmpdir } = await import("node:os")
   const { join } = await import("node:path")
@@ -2737,7 +2743,9 @@ test("a generator that cannot write the file says so, as exit 2", async () => {
   }
 })
 
-test("a generator run whose plugin rules cannot be loaded is exit 2, not 'out of date'", async () => {
+// a child process: ~1s here, and slower on a loaded Windows runner, where
+// Bun's 5s default would flake for the same reason as the test above
+test("a generator run whose plugin rules cannot be loaded is exit 2, not 'out of date'", { timeout: 30000 }, async () => {
   // The generator builds its records with the plugin's own catalogOf. If
   // index.mjs or catalog.mjs is not beside the script (a broken checkout, a
   // partial copy), that import fails — and a module-loader stack with exit 1
