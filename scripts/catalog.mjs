@@ -160,26 +160,36 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
   }
   if (!token) return fail(`${configPathOf(env)} 里没有 provider.speedai.token：先登录一次科搭`)
 
+  let rules
+  try {
+    rules = await pluginOf()
+  } catch (e) {
+    // index.mjs itself could not be loaded (no plugin beside this script, or
+    // its own catalog.mjs missing): without the plugin's rules there is no
+    // token to check and no record to build, so this is a read failure —
+    // never "out of date".
+    return fail(`读不了插件的目录规则（${whyOf(e)}）：确认 index.mjs 和 catalog.mjs 都在这份脚本旁边`)
+  }
+  // The sign-in's own gate (index.mjs's tokenOf): a token with a newline, a
+  // NUL or anything else that is not visible ASCII cannot go in a header, and
+  // fetch refuses one by quoting the whole header — the token — in its error,
+  // which this script would then print. Refused here, before it is sent.
+  const sent = rules.tokenOf({ type: "api", key: token })
+  if (!sent) return fail(`${configPathOf(env)} 里的令牌含空格、换行或非 ASCII 字符，发不出去：打开一次科搭重新登录`)
+
   let body
   try {
-    const res = await fetchImpl(`${API}${CATALOG_PATH}`, { headers: { Authorization: `Bearer ${token}`, "User-Agent": "node" } })
+    const res = await fetchImpl(`${API}${CATALOG_PATH}`, { headers: { Authorization: `Bearer ${sent}`, "User-Agent": "node" } })
     if (!res.ok) return fail(`GET ${CATALOG_PATH} → HTTP ${res.status}`)
     body = await res.json()
   } catch (e) {
     // a thrown fetch and an unparseable body are the same failure: the vendor
-    // did not answer with a list, so there is nothing here to compare
-    return fail(`GET ${CATALOG_PATH} 没读成（${whyOf(e)}）：这是取数的失败，不是目录过时`)
+    // did not answer with a list, so there is nothing here to compare. The
+    // token is cut from what is said, in case an error names it anyway.
+    return fail(`GET ${CATALOG_PATH} 没读成（${whyOf(e).split(sent).join("…")}）：这是取数的失败，不是目录过时`)
   }
 
-  let rows
-  try {
-    rows = await recordsOf(body)
-  } catch (e) {
-    // index.mjs itself could not be loaded (no plugin beside this script, or
-    // its own catalog.mjs missing): without the plugin's rules there is no
-    // record to compare, so this is a read failure — never "out of date".
-    return fail(`读不了插件的目录规则（${whyOf(e)}）：确认 index.mjs 和 catalog.mjs 都在这份脚本旁边`)
-  }
+  const rows = await recordsOf(body)
   if (!rows) return fail("应答里没有一份读得出的模型列表：厂商可能换了形状（先核对 index.mjs 的 catalogOf），也可能是一次故障")
   // The file is the fallback for the plugin, not one account's answer, and it
   // is committed. An answer that names no models is not allowed to empty it.

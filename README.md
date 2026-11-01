@@ -145,9 +145,13 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   gate: an answer that names no code is not a refusal — the vendor's client
   passes it (its activity API already answers without one), so a claim answer
   without a code counts as the claim it says it is, unless the answer itself
-  says `success: false` — and `success: false` is consulted however the code
-  sits, a `code: 200` body that says the flag included: that is an HTTP layer
-  saying yes and the vendor saying no, so the flag decides. The one thing the
+  says `success: false` — and on the claim answer `success: false` is
+  consulted however the code sits, a `code: 200` body that says the flag
+  included: that is an HTTP layer saying yes and the vendor saying no, so the
+  flag decides. That flag is read on the claim answer only: the claim-state
+  and activity reads follow that client's own gate, which looks at the code
+  alone, so a `success: false` there without a refusing code is drawn as its
+  data says — as the app itself draws it. The one thing the
   flag does not override is the vendor's own note that the day is already
   claimed: a `400` naming "24小时内仅可领取一次" beside `success: false` is
   that client's "today is in", and reading it as a failure would have magpie

@@ -48,9 +48,17 @@ const POINTS_PATH = "/v1/gettoken"
 const UA_SIDECAR = "Go-http-client/1.1"
 const UA_DESKTOP = "node"
 
+// 时间：magpie 的 Go 侧给一次用量读取 20 秒（plugin_usage.go 的
+// context.WithTimeout），给一次签到 2 分钟（workbuddy_checkin.go）。插件的
+// 超时要先到：宿主先掐断的话，卡片上是宿主的超时，而不是插件自己的「请求
+// 超时」。用量三路并行，最坏是一个 TIMEOUT_MS；签到三次串行，最坏是三个。
+// 预算是总上限，单次超时取 min(TIMEOUT_MS, 预算剩下的)，预算先用完时后面
+// 的请求只剩 1 秒。测试钉住这几个数与宿主截止时间的关系。
 const TIMEOUT_MS = 8000
 const CHECKIN_BUDGET_MS = 25 * 1000
 const USAGE_BUDGET_MS = 18 * 1000
+const HOST_USAGE_DEADLINE_MS = 20 * 1000
+const HOST_CHECKIN_DEADLINE_MS = 120 * 1000
 
 // MAX_TIME_MS is the largest time that survives the whole trip to magpie.
 // Two ceilings matter, and the lower one wins: JS's Date.toISOString() throws
@@ -1088,6 +1096,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
 
 export default CodarPlugin

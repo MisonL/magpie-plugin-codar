@@ -1033,6 +1033,85 @@ test("a request that never answers is aborted and says so in words", async () =>
   )
 })
 
+test("the plugin's timeouts land before magpie's own deadlines", () => {
+  // magpie's Go side gives a usage read 20s and a check-in 2 minutes. When
+  // the host cuts first the card shows the host's timeout, not the plugin's
+  // own "请求超时" — so the worst case of each hook must fit inside its own.
+  const t = testables.timing
+  // usage: three reads at once, so one full per-request timeout has to fit
+  // the budget, and the budget has to land before the host's 20s
+  assert.ok(t.TIMEOUT_MS <= t.USAGE_BUDGET_MS, "one usage read gets its full timeout")
+  assert.ok(t.USAGE_BUDGET_MS < t.HOST_USAGE_DEADLINE_MS, "and the whole usage read lands before the host's deadline")
+  // check-in: three reads in a row (points, the claim, points). If three full
+  // timeouts did not fit the budget, a slow first read could leave the claim
+  // itself only the 1s floor — a claim that would have answered in 3s,
+  // reported as a timeout. The budget caps the rest; it lands before the
+  // host's 2 minutes.
+  assert.ok(3 * t.TIMEOUT_MS <= t.CHECKIN_BUDGET_MS, "a slow first read cannot starve the claim to the 1s floor")
+  assert.ok(t.CHECKIN_BUDGET_MS < t.HOST_CHECKIN_DEADLINE_MS, "and the whole check-in lands before the host's deadline")
+})
+
+test("the timeouts each request is given are the ones the budget says", async () => {
+  // Every request's timeout is min(TIMEOUT_MS, what is left of the budget),
+  // and never under 1s. Measured from the timers request() really sets:
+  // a vendor that hangs until aborted, and a clock the test moves forward.
+  const realNow = Date.now
+  const realSet = globalThis.setTimeout
+  let now = realNow()
+  const given = []
+  Date.now = () => now
+  globalThis.setTimeout = (fn, ms, ...a) => {
+    given.push(ms)
+    return realSet(fn, 0, ...a)
+  }
+  const p = await CodarPlugin()
+  const realFetchForTimers = globalThis.fetch
+  const hang = async (_u, init) => {
+    // each request eats 10s of the clock before it is aborted
+    now += 10 * 1000
+    await new Promise((_ok, no) => init.signal.addEventListener("abort", () => no(Object.assign(new Error("a"), { name: "AbortError" }))))
+  }
+  try {
+    const real = globalThis.fetch
+    globalThis.fetch = hang
+    try {
+      given.length = 0
+      const r = await p.auth.checkin(auth)
+      assert.equal(r.outcome, "failed")
+      const t = testables.timing
+      // first two requests get the whole per-request cap; the third would
+      // start with 25 - 20 = 5s left of the budget, but the sign already
+      // failed — the check-in makes only the points read and the sign here
+      assert.deepEqual(given.slice(0, 2), [t.TIMEOUT_MS, t.TIMEOUT_MS], "a fresh budget gives each request its full cap")
+    } finally {
+      globalThis.fetch = real
+    }
+
+    // a budget mostly spent: the floor is 1s, never 0 or negative
+    given.length = 0
+    now = realNow()
+    let calls = 0
+    globalThis.fetch = async (u, init) => {
+      calls++
+      // the first read eats almost the whole budget, then answers
+      if (calls === 1) {
+        now += testables.timing.CHECKIN_BUDGET_MS + 5000
+        return new Response(JSON.stringify({ code: 200, token: 1, agent_token: 0 }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 400, message: "24小时内仅可领取一次", data: { retry_after: 60 } }), { status: 200 })
+    }
+    try {
+      await p.auth.checkin(auth)
+      assert.equal(given[1], 1000, "a spent budget leaves the next request the 1s floor, not 0 or a negative wait")
+    } finally {
+      globalThis.fetch = realFetchForTimers
+    }
+  } finally {
+    Date.now = realNow
+    globalThis.setTimeout = realSet
+  }
+})
+
 test("the read-from-this-machine sign-in hands magpie a key, and says why when it can't", async () => {
   const p = await CodarPlugin()
   const [read, paste] = p.auth.methods
@@ -2684,6 +2763,61 @@ test("a generator run whose plugin rules cannot be loaded is exit 2, not 'out of
   } finally {
     rmSync(root, { recursive: true, force: true })
     rmSync(root2, { recursive: true, force: true })
+  }
+})
+
+test("the generator never sends, or prints, a token it cannot put in a header", async () => {
+  // A token with a newline, a CR or a NUL inside it is refused by fetch with
+  // the whole header — the token — quoted in its error, which the generator
+  // used to print. It now applies the sign-in's own gate (tokenOf) first.
+  const { mkdtempSync } = await import("node:fs")
+  const secret = "eyJhbGciOiJIUzI1NiJ9.FAKE"
+  for (const bad of [`${secret}\nSECRET.sig`, `${secret}\rSECRET.sig`, `${secret}\u0000SECRET.sig`, `${secret}中SECRET.sig`]) {
+    const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+    writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token: bad } } }))
+    const logs = []
+    let sent = 0
+    try {
+      const exit = await main({
+        argv: ["node", "scripts/catalog.mjs", "--check"],
+        env: { CODAR_HOME: root },
+        out: join(root, "catalog.mjs"),
+        // the real fetch's behaviour: it refuses the header by quoting it
+        fetchImpl: async (_u, init) => {
+          sent++
+          throw new TypeError(`Headers.append: "${init.headers.Authorization}" is an invalid header value.`)
+        },
+        log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
+      })
+      assert.equal(exit, 2, "an unsendable token is a read failure")
+      assert.equal(sent, 0, "and is never handed to fetch")
+      assert.equal(logs.some((l) => l.includes("SECRET") || l.includes(secret)), false, `no part of the token is printed: ${JSON.stringify(logs)}`)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test("a generator fetch error that names the token has the token cut", async () => {
+  const { mkdtempSync } = await import("node:fs")
+  const token = mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+  writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token } } }))
+  const logs = []
+  try {
+    const exit = await main({
+      argv: ["node", "scripts/catalog.mjs", "--check"],
+      env: { CODAR_HOME: root },
+      out: join(root, "catalog.mjs"),
+      fetchImpl: async (_u, init) => {
+        throw new TypeError(`refused ${init.headers.Authorization}`)
+      },
+      log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
+    })
+    assert.equal(exit, 2)
+    assert.equal(logs.some((l) => l.includes(token)), false, "the token never reaches the output")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 
