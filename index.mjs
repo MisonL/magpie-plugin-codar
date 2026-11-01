@@ -53,7 +53,15 @@ const UA_DESKTOP = "node"
 // 超时要先到：宿主先掐断的话，卡片上是宿主的超时，而不是插件自己的「请求
 // 超时」。用量三路并行，最坏是一个 TIMEOUT_MS；签到三次串行，最坏是三个。
 // 预算是总上限，单次超时取 min(TIMEOUT_MS, 预算剩下的)，预算先用完时后面
-// 的请求只剩 1 秒。测试钉住这几个数与宿主截止时间的关系。
+// 的请求只剩 1 秒。测试不读这几个常量，而是从 request() 真正设过的定时器上
+// 量每个请求拿到的超时值，所以「某条路改用别的数」会被抓住。
+//
+// 用量那三路是同一瞬间发的（Promise.allSettled 的数组字面量里连着取三次
+// opts()，中间没有 await），所以 left() 今天永远取到整个 TIMEOUT_MS——用量这
+// 条路上的预算和 1 秒下限都夹不到谁，它们是天花板，不是会被走到的分支（把
+// 下限改成 0 也一样全绿，不是漏测）。这条路上真正要钉的是「三路各拿到那个
+// cap」，测试从 request() 设过的定时器上量。真正用到「预算剩下的」是签到的
+// 串行三问：前一次读得慢，后面的就只剩小的那份，最少 1 秒。
 const TIMEOUT_MS = 8000
 const CHECKIN_BUDGET_MS = 25 * 1000
 const USAGE_BUDGET_MS = 18 * 1000
@@ -330,7 +338,10 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
 function humanSecs(secs) {
   const raw = numOf(secs)
   if (!isFinite(raw) || raw > MAX_WAIT_SECS) return ""
-  const n = Math.max(0, Math.round(raw))
+  // A positive wait under half a second rounds to 0, and the card read
+  // "0 秒后可再领" — a window the vendor opened almost now, said as no wait
+  // at all. Rounded up instead: retry_after 0.4 is said as "1 秒".
+  const n = raw > 0 ? Math.max(1, Math.round(raw)) : 0
   if (n < 60) return `${n} 秒`
   const m = Math.round(n / 60)
   if (m < 60) return `${m} 分钟`
@@ -796,7 +807,7 @@ export async function CodarPlugin(input) {
         // 每 30 分钟重问一遍（workbuddy_checkin.go 的 wbCheckinRetry），
         // 卡片还一直写「签到失败」；而读成 done 只是把厂商说出的那个时刻
         // 记下来。拒绝时不读余额算 credit——那是给一次真领到算的。
-        if (r?.success === false && !already) return { outcome: "failed", message: said || `签到失败（code ${code || "?"}）` }
+        if (r?.success === false && !already) return { outcome: "failed", message: said || (Number.isFinite(code) ? `签到失败（code ${code}）` : "签到失败") }
         // 401/403 是登录过期，说给用户看的是「重新登录」，而不是一个码。
         if (code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
         // 码说的拒绝，且消息不是「已领过」：厂商客户端只把非 200 的数当失败。
@@ -947,7 +958,7 @@ export async function CodarPlugin(input) {
           // 卡片只画得下几行，而这段答案要变成宿主的一行 JSON：厂商一次
           // 报太多活动时只取前几个，不能让数据把宿主的 32 MiB 行撑爆。
           for (const a of running.slice(0, MAX_ACTIVITY_WINDOWS)) {
-            const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string" && x).map(cleanText) : []
+            const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string").map(cleanText).filter(Boolean) : []
             // 两个数都要有限：1e999 是合法的 JSON，读出来却是 Infinity，
             // 拿去算份额会得到 NaN，卡片上就写「已用 Infinity / Infinity」。
             const cap = typeof a.user_quota_limit === "number" && isFinite(a.user_quota_limit) && a.user_quota_limit > 0 ? a.user_quota_limit : null
@@ -1096,6 +1107,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
 
 export default CodarPlugin

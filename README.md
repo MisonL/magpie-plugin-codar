@@ -128,9 +128,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   day rolls every 24 hours, so a wait longer than a week is not a next-claim
   time that window can produce, and the check-in treats such a number as
   unsaid; an activity's end is a real date, so it is drawn as far out as the
-  calendar allows. The check-in's `until` is the one thing never omitted: a
-  "done" with no `until` settles the whole day in magpie, so an unusable wait
-  falls back to the 30-minute trust floor described above.
+  calendar allows. A positive wait of under a second is said as one second:
+  rounding it said "0 秒后可再领", a window the vendor just opened told as no
+  wait at all (a stated zero is still a zero). The check-in's `until` is the
+  one thing never omitted: a "done" with no `until` settles the whole day in
+  magpie, so an unusable wait falls back to the 30-minute trust floor
+  described above.
 - The state and balance reads follow the vendor's own client: the check-in
   status is read from a boolean `data` or any of `isSigned`/`signed`/
   `hasSigned`/`has_signed` (each only as a real boolean), the balances from
@@ -156,9 +159,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   claimed: a `400` naming "24小时内仅可领取一次" beside `success: false` is
   that client's "today is in", and reading it as a failure would have magpie
   retry the rest of the day every 30 minutes while the card said the check-in
-  failed. The check-in's words — including that "already claimed" note that
-  tells a claim from a repeat — are read from the first of `message`/`msg`/
-  `error`/`detail` and the same four under `data`, as that client reads them. The balances also come
+  failed. A refusal's words print a code only where the vendor stated one:
+  with no code in the body there is no code in the sentence (it used to read
+  "签到失败（code ?）", a question mark the user cannot act on). The check-in's
+  words — including that "already claimed" note that tells a claim from a
+  repeat — are read from the first of `message`/`msg`/`error`/`detail` and the
+  same four under `data`, as that client reads them. The balances also come
   from `data` when the vendor wraps them in one, as that client unwraps it;
   and a points refusal is said in those same words. The check-in's credit is
   the sum of both balances' increases between its two reads — the vendor says

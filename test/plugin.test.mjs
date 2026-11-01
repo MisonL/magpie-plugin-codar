@@ -11,7 +11,7 @@ import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, payloadOf, request, appToken, configPath, cleanText } = testables
+const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, payloadOf, request, appToken, configPath, cleanText } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -189,6 +189,19 @@ test("a claim the vendor confirmed without a code is a claim, not a failure", as
   assert.equal(noWithCode.outcome, "failed", "success:false with a code is a refusal too")
   assert.match(noWithCode.message, /签到失败/)
   assert.equal(noWithCode.credit, undefined, "and no balance is read for a claim that did not happen")
+
+  // A refusal that names neither a code nor a message is still a refusal, and
+  // the card says so in words. It used to print "签到失败（code ?）" — a
+  // question mark where a code goes, on a card the user cannot act on.
+  const noWords = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { success: false } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(noWords.outcome, "failed")
+  assert.equal(noWords.message, "签到失败", "no code stated means no code printed, not a question mark")
 })
 
 test("an already-claimed answer is read in every spelling the vendor's client reads", async () => {
@@ -976,6 +989,60 @@ test("a number of seconds no calendar can say is said as nothing", () => {
   assert.match(humanSecs(1e11), /天/, "a long wait a calendar can still say is said")
 })
 
+test("a wait a vendor states as a fraction of a second is not said as no wait", () => {
+  // Math.round(0.4) is 0, so retry_after 0.4 — a window the vendor opens
+  // almost now — came out as "0 秒后可再领" beside an until 400 ms away: a
+  // wait stated as no wait at all. A stated zero is still a zero.
+  assert.equal(humanSecs(0.4), "1 秒", "a positive wait rounds up, never to zero")
+  assert.equal(humanSecs(0.04), "1 秒")
+  assert.equal(humanSecs(0), "0 秒", "a stated zero is said as zero")
+})
+
+test("a sub-second wait the vendor states reads as a wait on both cards", async () => {
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 0.4 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const win = u.windows.find((w) => w.name === "每日签到")
+  assert.doesNotMatch(win.display, /0 秒/, "the row does not say the window opens in no time")
+  assert.match(win.display, /1 秒后可再领/)
+  assert.ok(win.resetsAt > Date.now(), "and the resetsAt is a time in the future")
+
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 400, message: "24小时内仅可领取一次", data: { retry_after: 0.4 } } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "done")
+  assert.doesNotMatch(r.message, /0 秒/, "nor does the check-in's own words")
+  assert.match(r.message, /1 秒后可再领/)
+  assert.ok(r.until > Date.now(), "and its until is a time in the future")
+})
+
+test("safeTime clamps to the last instant both sides can read", () => {
+  // A vendor's retry_after is a number nothing bounds. Date.toISOString()
+  // throws past 8.64e15, and magpie's Go side parses the ISO string with a
+  // four-digit-year layout, so a "+275760-…" parses to zero and the time is
+  // dropped in silence. The clamp is the last line of defence — today every
+  // caller caps the wait first (sayableSecs / checkinWaitSecs), which is
+  // exactly why nothing else would notice it going away.
+  assert.equal(safeTime(253402300799999), 253402300799999, "the last instant both accept is kept as it is")
+  assert.equal(safeTime(253402300800000), 253402300799999, "one past it is clamped, not dropped")
+  assert.equal(safeTime(8.64e15), 253402300799999, "and so is a time toISOString would throw on")
+  assert.equal(new Date(safeTime(1e17)).toISOString(), "9999-12-31T23:59:59.999Z")
+  assert.equal(safeTime(0), 0, "a time that is not one is said as nothing")
+  assert.equal(safeTime(-1), 0)
+  assert.equal(safeTime(Infinity), 0)
+  assert.equal(safeTime(NaN), 0)
+})
+
 test("every request carries the User-Agent the desktop app sends on that host", async () => {
   const p = await CodarPlugin()
   await withFetch(
@@ -1109,6 +1176,64 @@ test("the timeouts each request is given are the ones the budget says", async ()
   } finally {
     Date.now = realNow
     globalThis.setTimeout = realSet
+  }
+})
+
+test("each of the usage hook's three reads is given the per-request cap", async () => {
+  // The usage hook had no such reading: only the check-in path was measured,
+  // so a mutant that handed the usage reads a different timeout (or dropped
+  // the budget out of the expression) stayed green. Measured off the timers
+  // request() really sets, as the check-in test above does.
+  const realNow = Date.now
+  const realSet = globalThis.setTimeout
+  const realFetch = globalThis.fetch
+  let now = realNow()
+  const given = []
+  Date.now = () => now
+  globalThis.setTimeout = (fn, ms, ...a) => {
+    given.push(ms)
+    return realSet(fn, 0, ...a)
+  }
+  // a vendor that hangs until aborted. The clock stands still, so the three
+  // reads (issued together) are all handed the same `left()` — which is what
+  // the real path does, since nothing between two of them can move it. That
+  // also means the 1s floor on this path is unreachable, so there is nothing
+  // here to pin about it; the check-in test above is where the floor bites.
+  globalThis.fetch = async (_u, init) =>
+    new Promise((_ok, no) => init.signal.addEventListener("abort", () => no(Object.assign(new Error("a"), { name: "AbortError" }))))
+  try {
+    const p = await CodarPlugin()
+    const u = await p.auth.usage(auth)
+    assert.match(u.error, /超时/, "a read that never answers is reported as the plugin's own timeout")
+    const t = testables.timing
+    assert.deepEqual(given, [t.TIMEOUT_MS, t.TIMEOUT_MS, t.TIMEOUT_MS], "three reads, each with the full per-request cap")
+  } finally {
+    Date.now = realNow
+    globalThis.setTimeout = realSet
+    globalThis.fetch = realFetch
+  }
+})
+
+test("a request that has already answered is not aborted later", async () => {
+  // request() arms an abort timer and clears it in `finally`. Deleting that
+  // clearTimeout left every test green: the answer arrived either way. What
+  // it costs is a stray timer per request that aborts a signal nobody is
+  // reading any more — and, on a hook that runs on every card refresh, a
+  // pile of them.
+  const realFetch = globalThis.fetch
+  let signal
+  globalThis.fetch = async (_u, init) => {
+    signal = init.signal
+    return new Response(JSON.stringify({ code: 200 }), { status: 200, headers: { "Content-Type": "application/json" } })
+  }
+  try {
+    const body = await request("https://api.claw.speedai.com/v1/x", { token: "t", timeoutMs: 40 })
+    assert.deepEqual(body, { code: 200 })
+    assert.equal(signal.aborted, false, "an answered request is not aborted while it is answering")
+    await new Promise((ok) => setTimeout(ok, 150))
+    assert.equal(signal.aborted, false, "nor once the timeout it did not need has passed")
+  } finally {
+    globalThis.fetch = realFetch
   }
 })
 
@@ -2516,6 +2641,33 @@ test("the guards round 12 found unpinned", async () => {
   )
   const free = many.windows.find((w) => w.name.startsWith("免费模型"))
   assert.match(free.name, /等 4 个/, "an activity over four models says so")
+})
+
+test("a model id that is nothing but a control character does not leave a separator on the card", async () => {
+  // The filter kept any non-empty string and cleanText then folded "\n" away,
+  // so ["\n","auto"] was joined as "、auto" — a name that reads as an activity
+  // over an unnamed model. Cleaning first and dropping what is left empty is
+  // the same order catalogOf uses for a record's id.
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const p = await CodarPlugin()
+  const nameFor = async (model_ids) => {
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: false, retry_after: 60 } } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [{ free_until: until, remaining_quota: null, model_ids }] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+    const w = u.windows.find((x) => x.name.startsWith("免费模型"))
+    assert.ok(w, "the activity is still on the card")
+    return w.name
+  }
+
+  assert.equal(await nameFor(["\n", "auto"]), "免费模型 · auto", "the empty one is dropped, not left as a separator")
+  assert.equal(await nameFor(["\n", "\t", "  "]), "免费模型", "an activity whose every id cleans to nothing is named without them")
+  assert.equal(await nameFor(["a", "\n", "b", "c"]), "免费模型 · a、b 等 3 个", "the count is of the ids that are left")
+  assert.equal(await nameFor(["a", 7, null, "b"]), "免费模型 · a、b", "a non-string id is dropped as before")
 })
 
 // The config path builds its model list from catalog.mjs, which cannot carry
