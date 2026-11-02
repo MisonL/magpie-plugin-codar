@@ -11,7 +11,7 @@ import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, payloadOf, request, appToken, configPath, cleanText } = testables
+const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, payloadOf, request, appToken, configPath, cleanText } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -691,6 +691,11 @@ test("the usage reads go out together, and a dead balance still reads the rest",
   // are launched before any is awaited: a points read that fails must not
   // stop the other two from having been asked, and the three must overlap
   // in flight (inFlight reaches 3) rather than run one after another.
+  //
+  // The fourth request is the fallback: /v1/gettoken failing sends the read to
+  // the vendor's second balance endpoint (app.asar's S0), and it is issued
+  // after the first three settle, not beside them — a read that answers is
+  // not asked for twice.
   const p = await CodarPlugin()
   const seen = []
   let inFlight = 0
@@ -705,13 +710,14 @@ test("the usage reads go out together, and a dead balance still reads the rest",
     await new Promise((ok) => setTimeout(ok, 15))
     inFlight--
     if (String(url).includes("/v1/gettoken")) return new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
+    if (String(url).includes("/v1/agent/balance")) return new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
     if (String(url).includes("/v1/daily-sign/status")) return new Response(JSON.stringify({ code: 200, data: { isSigned: true, retry_after: 60 } }), { status: 200 })
     return new Response(JSON.stringify({ code: 200, data: [] }), { status: 200 })
   }
   try {
     const u = await p.auth.usage(auth)
-    assert.ok(u.error, "the balance failing is the card's error")
-    assert.equal(seen.length, 3, "all three were launched, not the balance first and the rest after")
+    assert.ok(u.error, "both balance reads failing is the card's error")
+    assert.equal(seen.length, 4, "the three reads, then the one fallback the first of them asked for")
     assert.equal(most, 3, "the three overlapped in flight, not one after another")
   } finally {
     globalThis.fetch = real
@@ -961,6 +967,8 @@ test("a model's abilities reach both of the host's paths, not just one", () => {
   assert.deepEqual(m.modalities.input, ["text", "image"])
   assert.deepEqual(m.modalities.output, ["text"])
   assert.equal(m.capabilities.reasoning, true, "the models hook path reads this")
+  assert.equal(m.capabilities.toolcall, true, "and that path's own names for tools and sampling")
+  assert.equal(m.capabilities.temperature, true)
   assert.deepEqual(m.capabilities.input, { text: true, image: true, audio: false, video: false, pdf: false })
   assert.deepEqual(m.capabilities.output, { text: true, image: false, audio: false, video: false, pdf: false })
 
@@ -1265,7 +1273,10 @@ test("each of the usage hook's three reads is given the per-request cap", async 
     const u = await p.auth.usage(auth)
     assert.match(u.error, /超时/, "a read that never answers is reported as the plugin's own timeout")
     const t = testables.timing
-    assert.deepEqual(given, [t.TIMEOUT_MS, t.TIMEOUT_MS, t.TIMEOUT_MS], "three reads, each with the full per-request cap")
+    // three reads, then the balance fallback the first of them asked for:
+    // each gets min(TIMEOUT_MS, what is left). The clock stands still here, so
+    // that is the cap on all four.
+    assert.deepEqual(given, [t.TIMEOUT_MS, t.TIMEOUT_MS, t.TIMEOUT_MS, t.TIMEOUT_MS], "every read is given the full per-request cap")
   } finally {
     Date.now = realNow
     globalThis.setTimeout = realSet
@@ -3376,4 +3387,205 @@ test("a word where a number belongs is not a wait, on any of the four fields", (
   })
   assert.equal(running.length, 1, "a boolean, an array and an object are not times")
   assert.equal(secsOf(true), 0, "and it is the reading that refuses them, not a comparison that happens to")
+})
+
+// ---- readings the review found unpinned -----------------------------------
+
+test("the claim row's next-claim time is that many seconds from now, in ms", async () => {
+  // The sign-in's `until` had a tight reading (>= before + 3600s); the row this
+  // same rule builds for the card did not — only "> Date.now()", which a
+  // millisecond/second slip of 1000x still passes. A two-hour wait that came
+  // out as 7.2 seconds would tell the user to claim again in a moment.
+  const p = await CodarPlugin()
+  const before = Date.now()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 7200 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const win = u.windows.find((w) => w.name === "每日签到")
+  const gap = win.resetsAt - before
+  assert.ok(Math.abs(gap - 7200 * 1000) < 2000, `a two-hour wait is 7.2e6 ms, not 7.2e3 (got ${gap})`)
+})
+
+test("a user's model field that is not a map is taken as written, not spread into one", () => {
+  // mergeModel folds the user's entry into the catalog's at every depth. The
+  // guard on `theirs` is load-bearing: without it a nested value the user
+  // wrote as a string is handed to Object.entries, which spreads a string by
+  // index — {0:"h",1:"t",…} beside the catalog's npm — and the host then sends
+  // that model to an address nobody set.
+  const merged = mergeModel({ provider: { npm: "@ai-sdk/anthropic" } }, { provider: "https://my-proxy.example/v1" })
+  assert.equal(merged.provider, "https://my-proxy.example/v1", "the string the user wrote, not a map of its characters")
+  assert.deepEqual(merged, { provider: "https://my-proxy.example/v1" })
+})
+
+test("a space inside a key is not visible ASCII either", () => {
+  // tokenOf refuses anything that cannot go in a header, and a space is the
+  // one character a trimmed key can still carry inside it. Sent, fetch quotes
+  // the whole header value — the key — back in an error magpie logs.
+  assert.equal(tokenOf({ type: "api", key: "eyJhbG ciOi.abc" }), "", "an inner space is refused, as a newline is")
+  assert.equal(tokenOf({ type: "api", key: "  eyJabc.def.ghi  " }), "eyJabc.def.ghi", "the surrounding ones are trimmed, as before")
+})
+
+test("an agent figure the first read leaves out is read from the second", async () => {
+  // The vendor keeps the two balances in separate reads, and its own client
+  // takes the agent one from /v1/agent/balance when /v1/gettoken didn't give
+  // it (app.asar's S0). Measured the same day: both answer 4000.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500 } },
+      "/v1/agent/balance": { body: { code: 200, message: "Success", data: { username: "user_1", agent_balance: 1970 } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.error, undefined)
+  assert.equal(u.balance, "500 点 · Agent 1970 点 可用", "the agent figure the second endpoint names")
+  assert.equal(u.windows.find((w) => w.name === "点数余额").balance, 500, "and the wallet is still the first read's")
+})
+
+test("a dead balance read still leaves the agent figure, and does not blank the card", async () => {
+  // Measured 2026-11-02: /v1/gettoken and /v1/agent/balance both answer, and
+  // the second names the same agent figure. The vendor's own client falls
+  // back across them (S0); with one read the card was an error instead.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { status: 500, body: { detail: "boom" } },
+      "/v1/agent/balance": { body: { code: 200, message: "Success", data: { username: "user_1", agent_balance: 4000 } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.error, undefined, "a card that read the agent figure is not an error card")
+  assert.equal(u.balance, "Agent 4000 点 可用")
+  assert.equal(u.windows.find((w) => w.name === "点数余额"), undefined, "no wallet: the general figure was not said, and 0 is not it")
+  assert.ok(u.windows.find((w) => w.name === "每日签到"), "the check-in row is still drawn")
+})
+
+test("both balance reads failing is still the card's error, with its reason", async () => {
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { status: 500, body: { detail: "boom" } },
+      "/v1/agent/balance": { status: 500, body: { detail: "also boom" } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.error, /boom/, "the vendor's own words for the first read")
+  assert.equal(u.windows, undefined, "and nothing is drawn beside it")
+})
+
+test("a sign-in the vendor turns away is not retried on the second endpoint", async () => {
+  // A 403 means every read of this account says the same thing. Falling back
+  // would spend a second request to hear it again, and the card would lose
+  // the "sign in again" mark that is the only thing the user can act on.
+  const p = await CodarPlugin()
+  const seen = []
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    seen.push(String(url))
+    if (String(url).includes("/v1/agent/balance")) return new Response(JSON.stringify({ code: 200, data: { agent_balance: 1 } }), { status: 200 })
+    return new Response(JSON.stringify({ code: 403, message: "Forbidden" }), { status: 200 })
+  }
+  try {
+    const u = await p.auth.usage(auth)
+    assert.equal(u.signIn, "expired")
+    assert.equal(u.error, "登录已过期，请重新登录")
+    assert.ok(!seen.some((u2) => u2.includes("/v1/agent/balance")), "no second read behind a sign-out")
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test("a refusal spelled with a small code is a refusal on the activity and status reads too", async () => {
+  // pointsOf's code gate was pinned against {code:1}; the activity list and
+  // the sign-in status had the same gate and only ever saw 500. A vendor that
+  // says no with {code:1} would have had its data drawn as live.
+  const p = await CodarPlugin()
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 1, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 1, data: { isSigned: false } } },
+      "/api/codar/activities/mine": { body: { code: 1, data: [{ free_until: until, remaining_quota: null, model_ids: ["auto"] }] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.windows.find((w) => w.name === "每日签到"), undefined, "{code:1} is not a state to draw")
+  assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0, "nor a live campaign")
+})
+
+test("an HTTP refusal keeps the vendor's own words, not just the status", async () => {
+  // request() prefers what the body says over "HTTP 429". Nothing pinned that:
+  // the 401 path is answered by signedOut() before the body is read, so a
+  // rate limit came out as a bare status code the user cannot act on.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    { "/v1/gettoken": { status: 429, body: { detail: "quota exceeded for this account" } }, "/v1/agent/balance": { status: 429, body: { detail: "quota exceeded for this account" } } },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.error, /quota exceeded for this account/)
+})
+
+test("an HTTP 403 is a sign-in to redo, on both the card and the sign-in", async () => {
+  // 401 was the only status tested. A vendor that answers 403 (measured on
+  // this very account's chat gateway: "API access is restricted") would have
+  // left the card showing a bare code and no "sign in again".
+  const p = await CodarPlugin()
+  const u = await withFetch({ "/v1/gettoken": { status: 403, body: { detail: "Forbidden" } } }, async () => p.auth.usage(auth))
+  assert.equal(u.signIn, "expired")
+  assert.equal(u.error, "登录已过期，请重新登录")
+
+  const r = await withFetch({ "/v1/daily-sign": { status: 403, body: { detail: "Forbidden" } } }, async () => p.auth.checkin(auth))
+  assert.equal(r.outcome, "failed")
+  assert.equal(r.message, "登录已过期，请重新登录")
+})
+
+test("a model record with no name is named by its id", () => {
+  // Two fallbacks guard the name, and neither was pinned: catalogOf's
+  // `said || id` and modelOf's `name: m.name || m.id`. Drop either and a
+  // vendor record with no display_name becomes a nameless row on the list.
+  assert.equal(catalogOf({ data: [{ id: "x" }] })[0].name, "x")
+  assert.equal(modelOf({ id: "m" }).name, "m")
+})
+
+test("chat.headers finds its provider by the info the listing hands it, too", async () => {
+  // The hook reads input.model.providerID ?? input.provider.info.id. Only the
+  // first was tested; a listing that handed it the second left the chat
+  // request without the sidecar's User-Agent.
+  const p = await CodarPlugin()
+  const out = { headers: {} }
+  await p["chat.headers"]({ provider: { info: { id: "codar" } } }, out)
+  assert.equal(out.headers["User-Agent"], "Go-http-client/1.1")
+})
+
+test("the sign-in budget keeps room above three requests, and both stay under magpie's", () => {
+  // The old assertions were `3 * TIMEOUT <= BUDGET` and `BUDGET < HOST_*`,
+  // which a budget shrunk to exactly 3 timeouts still passes — no room for the
+  // read after the claim — and which compare the host deadlines only to the
+  // plugin's own copy of them.
+  const t = testables.timing
+  assert.ok(3 * t.TIMEOUT_MS + 1000 <= t.CHECKIN_BUDGET_MS, "the check-in's three reads plus a second to spare")
+  assert.ok(t.USAGE_BUDGET_MS > t.TIMEOUT_MS, "the usage reads are not cut short by their own budget")
+  assert.ok(t.CHECKIN_BUDGET_MS < t.HOST_CHECKIN_DEADLINE_MS, "and the plugin's timeout lands before magpie's")
+  assert.ok(t.USAGE_BUDGET_MS < t.HOST_USAGE_DEADLINE_MS)
+})
+
+test("a protocol this provider cannot carry is not listed as the one it can", () => {
+  // The vendor's sidecar schema names three protocols and posts
+  // openai_responses to /v1/responses. This plugin's only OpenAI wire is the
+  // chat one, so a record that says responses is left out rather than listed
+  // as chat — where every request would go out in the wrong shape.
+  assert.equal(protocolOf({ protocol: { type: "openai_responses" } }), "openai_responses", "the vendor's own word is kept")
+  assert.equal(protocolOf({ protocol: { type: "anthropic_messages" } }), "anthropic_messages")
+  assert.equal(protocolOf({}), "openai_chat_completions", "and a record that says nothing is the chat one")
+  const list = catalogOf({ data: [{ id: "a", protocol: { type: "openai_chat_completions" } }, { id: "b", protocol: { type: "openai_responses" } }, { id: "c", protocol: { type: "anthropic_messages" } }] })
+  assert.deepEqual(list.map((m) => m.id), ["a", "c"], "a responses model is not served over the chat wire")
 })

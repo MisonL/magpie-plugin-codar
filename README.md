@@ -12,7 +12,7 @@ the usage card.
 | `config` / `provider` | Adds a `codar` provider with Codar's model list (17 models: the `auto` router plus DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
 | `auth.methods` | Two ways to sign in: "读取本机科搭令牌" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the "科搭访问令牌". |
 | `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1795), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. A wait it cannot use — missing, zero, past year 9999, or longer than a week (this day rolls every 24 hours, so 31 years is not a next-claim time) — gets a 30-minute trust floor instead: "done with no `until`" would settle the whole day in magpie, and a rolling window would lose the next claim. |
-| `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". |
+| `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". An agent figure this read leaves out — or the whole read failing — is asked of the vendor's second balance endpoint (`/v1/agent/balance`), as its own client does; a card that got the agent figure is still drawn, just without the wallet row. |
 | `chat.headers` | Sends the desktop client's `User-Agent` on Codar's own requests, so the gateway sees the app's traffic shape. The hook runs for every provider's requests, so it filters by provider id and leaves the others alone. |
 
 Chat itself goes straight from magpie to Codar's gateway
@@ -150,7 +150,10 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   gate: an answer that names no code is not a refusal — the vendor's client
   passes it (its activity API already answers without one), so a claim answer
   without a code counts as the claim it says it is, unless the answer itself
-  says `success: false` — and on the claim answer `success: false` is
+  says `success: false` (or it happens to carry a readable
+  `data.retry_after` — on a rolling 24-hour window that is the seconds to the
+  next claim, the same "`400` beside `retry_after`" reading, only without the
+  code) — and on the claim answer `success: false` is
   consulted however the code sits, a `code: 200` body that says the flag
   included: that is an HTTP layer saying yes and the vendor saying no, so the
   flag decides. That flag is read on the claim answer only: the claim-state
@@ -195,7 +198,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   answered is not a fallback even when it is empty: an account the vendor
   serves no models gets no list, while one whose every record the plugin had
   to leave out (no usable id) is a list it could not read and still falls
-  back.
+  back. A record the vendor states on a protocol this plugin cannot carry
+  (`openai_responses`, which the vendor's own sidecar posts to `/v1/responses`)
+  is left out the same way rather than listed as chat: this provider's only
+  OpenAI wire is the chat one, so a listed model would have every request go
+  out in the wrong shape. The vendor's three protocols are kept as stated, so a
+  regeneration writes the same record into the fallback.
 - Models you add to this provider yourself (ids the embedded catalog does not
   have) are kept when the vendor's list refreshes; the vendor's own entries
   follow the vendor. An entry of yours that names no `id` is given its key as

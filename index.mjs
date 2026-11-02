@@ -39,6 +39,7 @@ const ACTIVITIES_PATH = "/api/codar/activities/mine"
 const SIGN_PATH = "/v1/daily-sign"
 const SIGN_STATUS_PATH = "/v1/daily-sign/status"
 const POINTS_PATH = "/v1/gettoken"
+const AGENT_POINTS_PATH = "/v1/agent/balance"
 
 // 桌面端两条链路各发各的 User-Agent，插件按接口分开对齐：
 //   - 对话走 Go 侧车 → "Go-http-client/1.1"（实测抓包）
@@ -97,7 +98,7 @@ const safeTime = (ms) => {
 const MAX_WAIT_SECS = MAX_TIME_MS / 1000
 
 // numOf is a vendor field as a number, read the way its own client reads one
-// (app.asar's B0): a number, or a string that says one. A boolean, an array
+// (app.asar's Po): a number, or a string that says one. A boolean, an array
 // or an object is not one — Number(true) is 1 and Number([3600]) is 3600, and
 // a made-up second is a made-up wait. NaN when there is no number.
 const numOf = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN)
@@ -190,13 +191,13 @@ const usernameOf = (token) => {
 }
 
 // expSeconds is a token's exp as the vendor's client reads it (app.asar's
-// ZAe): a number, or a string that says one; NaN when it states none.
+// Zh): a number, or a string that says one; NaN when it states none.
 const expSeconds = (token) => numOf(payloadOf(token)?.exp)
 
 // expiresAt is when the token says it runs out (ms), or 0 when it says
 // nothing. A token past it is not sent: every endpoint would answer 401 and
 // the card would say "check-in failed" instead of "sign in again". The exp
-// is read the way the vendor's client reads it (app.asar's ZAe): a number,
+// is read the way the vendor's client reads it (app.asar's Po): a number,
 // or a string that says one — a string exp read as "no expiry" would send a
 // token the vendor already counts as expired, and the card would say the
 // check-in failed instead of asking to sign in again.
@@ -303,7 +304,7 @@ function appToken(file = configPath()) {
 }
 
 // saidBy is what an answer says in words, read the way the vendor's own client
-// reads it (app.asar's Vg): the first non-blank string among the top-level
+// reads it (app.asar's vo): the first non-blank string among the top-level
 // message/msg/error/detail and the same four under `data`. Read as `message`
 // alone, a refusal the vendor spelled in `msg`, and an "already claimed" note
 // under `data`, both came out as no text at all — the check-in then reported a
@@ -377,6 +378,38 @@ function humanSecs(secs) {
   return rh ? `${d} 天 ${rh} 小时` : `${d} 天`
 }
 
+// balanceOf is a vendor field as a balance: a number, or a string that says
+// one (numOf). A made-up 0 is a balance the account does not have — routing
+// would read the account as spent. A negative is not a balance either: the
+// host clamps a wallet reading to 0, so passing one on would put "-5 点" on
+// the card beside a routing figure of 0.
+const balanceOf = (v) => {
+  const n = numOf(v)
+  return Number.isFinite(n) && n >= 0 ? n : null
+}
+
+// pickOf reads each field by trying the vendor's own names in the order its
+// client does (app.asar's Dn), and takes the first that says a balance.
+const pickOf = (body, names) => {
+  for (const name of names) {
+    const n = balanceOf(body?.[name])
+    if (n != null) return n
+  }
+  return null
+}
+
+// unwrapped is the body the vendor's client reads: `data` when that is an
+// object, the answer itself otherwise (app.asar's Gt). The live points body
+// is flat ({code, token, agent_token, rewrite_token}); a wrapped one is what
+// that client prefers if the vendor starts sending it.
+const unwrapped = (r) => (r?.data && typeof r.data === "object" ? r.data : r)
+
+// GENERAL_POINTS_NAMES / AGENT_POINTS_NAMES are the names the vendor's own
+// client reads each balance by (app.asar's am → Dn(n, […])); the live body
+// says `token` and `agent_token`, and the rest are the spellings it hedges on.
+const GENERAL_POINTS_NAMES = ["token", "remaining_points", "points", "balance"]
+const AGENT_POINTS_NAMES = ["agent_token", "agentToken", "agent_points", "agentPoints"]
+
 // pointsOf reads the account's two balances. `token` is the general points,
 // `agent_token` the agent ones; both are integers the server keeps. A refusal
 // comes back as HTTP 200 with a body code (measured 2026-10-27: {"code":401,
@@ -384,49 +417,55 @@ function humanSecs(secs) {
 // came out blank with no error and no expired mark.
 const pointsOf = async (token, username, opts) => {
   const r = await request(`${ACCOUNT}${POINTS_PATH}`, { method: "POST", body: { username, token: 0 }, token, ...opts })
-  // the vendor's own client (app.asar's Jo) refuses any answer whose code is
+  // the vendor's own client (app.asar's ft) refuses any answer whose code is
   // a number other than 200 — Number(e.code) as it reads it — and only then
   // reads the balances. Only `>= 400` was refused here, so a refusal spelled
   // with a smaller code ({code: 1, token: 0}) read as a balance of 0 and the
   // card said the account was spent.
   const code = Number(r?.code)
   if (Number.isFinite(code) && code !== 200) {
-    // 拒绝的话按厂商客户端的读法（app.asar 的 Vg）取：message/msg/error/detail
+    // 拒绝的话按厂商客户端的读法（app.asar 的 vo）取：message/msg/error/detail
     // 与 data 下同样四个字段里第一个有字的——只读 message 会丢掉 msg 或 data 里
     // 厂商的话，卡片于是只报一个干巴巴的码。
     const said = saidBy(r).trim()
     throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
   }
-  // …and the balances come from `data` when that is an object, as its client
-  // unwraps it (Fc): the live body is flat ({code, token, agent_token,
-  // rewrite_token}), and a wrapped one is what that client prefers if the
-  // vendor starts sending it.
-  const body = r?.data && typeof r.data === "object" ? r.data : r
-  const balance = (v) => {
-    // a number, or a string that says one (numOf): a made-up 0 is a balance
-    // the account does not have — routing would read the account as spent.
-    // A negative is not a balance either: the host clamps a wallet reading
-    // to 0, so passing one on would put "-5 点" on the card beside a routing
-    // figure of 0.
-    const n = numOf(v)
-    return Number.isFinite(n) && n >= 0 ? n : null
-  }
-  // the vendor's own client reads each balance by trying these names in this
-  // order (app.asar's Xbt → hd(n, […])); the live body says `token` and
-  // `agent_token`, and the rest are the spellings that client hedges on.
-  const pick = (names) => {
-    for (const name of names) {
-      const n = balance(body?.[name])
-      if (n != null) return n
-    }
-    return null
-  }
-  const general = pick(["token", "remaining_points", "points", "balance"])
-  const agent = pick(["agent_token", "agentToken", "agent_points", "agentPoints"])
+  const body = unwrapped(r)
+  const general = pickOf(body, GENERAL_POINTS_NAMES)
+  const agent = pickOf(body, AGENT_POINTS_NAMES)
   // a 200 whose body names no balance at all is a read we cannot use: said
   // as an error, the card says why, instead of drawing nothing
   if (general == null && agent == null) throw new ApiError("点数查询没有返回余额", 0)
   return { general, agent }
+}
+
+// AGENT_BALANCE_NAMES is the vendor's own list for the second endpoint
+// (app.asar's cm → Dn(n, […])) plus the name today's answer actually uses:
+// measured 2026-11-02 it answers {data:{"username":…,"agent_balance":N}}, and
+// neither that client's list nor ours named `agent_balance` — so neither of
+// us could read it. `balance`/`points` keep their place at the front, as that
+// client has them.
+const AGENT_BALANCE_NAMES = ["balance", "points", "agent_balance", "agent_token", "agentToken", "agent_points", "agentPoints", "remaining_points"]
+
+// agentPointsOf reads the account's agent points from the vendor's second
+// balance endpoint. Its own client keeps this read beside the one above and
+// falls back across the two (app.asar's S0: allSettled over /v1/gettoken,
+// /v1/agent/balance and /api/user/self), so a dead /v1/gettoken still leaves
+// the agent figure readable.
+//
+// It does not read /api/user/self, the third path: that one answers a
+// different pot (measured the same day: its quota is 0 while the points are
+// 2348). Reported as this account's wallet it would put "0 点" on the card
+// and route a funded account as spent — the one thing every read here
+// refuses to do.
+const agentPointsOf = async (token, username, opts) => {
+  const r = await request(`${ACCOUNT}${AGENT_POINTS_PATH}`, { method: "POST", body: { username }, token, ...opts })
+  const code = Number(r?.code)
+  if (Number.isFinite(code) && code !== 200) {
+    const said = saidBy(r).trim()
+    throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
+  }
+  return pickOf(unwrapped(r), AGENT_BALANCE_NAMES)
 }
 
 // tokensOf is a vendor's token count — a context window, a reply ceiling —
@@ -480,6 +519,19 @@ const KINDS = ["text", "image", "audio", "video", "pdf"]
 const kindsOf = (v) => {
   const known = Array.isArray(v) ? KINDS.filter((k) => v.includes(k)) : []
   return known.length ? known : ["text"]
+}
+
+// protocolOf is a vendor record's protocol as its own catalogue names it. The
+// vendor's schema has three (its sidecar's protocol.type enum:
+// openai_chat_completions | openai_responses | anthropic_messages, the last
+// two posted to /v1/responses and /v1/messages). A record keeps the vendor's
+// own word: flattened to the chat one, the fallback list would say a protocol
+// we cannot serve is one we can, and a regeneration would write that lie into
+// catalog.mjs.
+const PROTOCOLS = new Set(["openai_chat_completions", "openai_responses", "anthropic_messages"])
+const protocolOf = (m) => {
+  const said = m?.protocol?.type
+  return typeof said === "string" && PROTOCOLS.has(said) ? said : "openai_chat_completions"
 }
 
 // modelOf is one catalog record as magpie's provider list has it. `base` is
@@ -588,6 +640,14 @@ function catalogOf(body) {
     const rawId = typeof m.id === "string" ? m.id.trim() : ""
     const id = cleanText(rawId)
     if (!id || id !== rawId) continue
+    // a record on a protocol this provider cannot carry is left out, as an id
+    // a request could not ask for is: the vendor posts `openai_responses` to
+    // /v1/responses, and the only OpenAI wire this plugin has is the chat one
+    // (provider.npm = @ai-sdk/openai-compatible). Listed as chat it would be
+    // a model whose every request goes out in the wrong shape. Nothing in
+    // today's catalog says it (the vendor's 17 are chat or anthropic).
+    const protocol = protocolOf(m)
+    if (protocol === "openai_responses") continue
     const said = typeof m.display_name === "string" ? cleanText(m.display_name) : ""
     out.push({
       id,
@@ -602,7 +662,7 @@ function catalogOf(body) {
       maxOutput: tokensOf(m.request_schema?.properties?.max_tokens?.maximum),
       input: Array.isArray(m.input_modalities) ? m.input_modalities : ["text"],
       output: Array.isArray(m.output_modalities) ? m.output_modalities : ["text"],
-      protocol: m.protocol?.type === "anthropic_messages" ? "anthropic_messages" : "openai_chat_completions",
+      protocol,
       reasoning: Boolean(m.reasoning),
     })
   }
@@ -622,7 +682,7 @@ function catalogOf(body) {
 // live data shows status "active" and ended_at null; the catalog shows
 // status "active" too).
 const runningActivities = (body) => {
-  // 应答码先过厂商客户端那一关（app.asar 的 Hbt 调 Jo 再读列表）：数字码不是
+  // 应答码先过厂商客户端那一关（app.asar 的 EI 调 ft 再读列表）：数字码不是
   // 200 的应答是拒绝，哪怕它还带着一份 data——照画就会把根本不在跑的活动
   // 报成免费。今天的应答体没有 code，只有 {data,message,success}，这道关
   // 对它无事可做；厂商哪天带上 code 的拒绝，这里也跟它的客户端一样挡住。
@@ -684,7 +744,7 @@ const publishedConcurrency = (body) => {
 }
 
 // signedIn is whether the account has claimed today, read the way the
-// vendor's own client reads it (app.asar's ayt): the answer's data is either
+// vendor's own client reads it (app.asar's um): the answer's data is either
 // the state itself (a boolean) or an object naming it, and the client accepts
 // any of four spellings, each only as a real boolean. A string "false" is not
 // one: Boolean("false") is true, and a card that claims the day when it is
@@ -826,7 +886,7 @@ export async function CodarPlugin(input) {
         }
 
         const code = Number(r?.code)
-        // 成功的判据与厂商客户端一致（app.asar 的 nRe 只调 Jo）：数字码不是
+        // 成功的判据与厂商客户端一致（app.asar 的 k0 只调 ft）：数字码不是
         // 200 才算拒绝，没带 code 的应答算领到了——今天的成功应答带 code:200，
         // 但这个厂商的活动接口就是不带 code 的（只有 {data,message,success}），
         // 签到哪天也这样省掉，只认 200 会把「领到了」报成失败。
@@ -943,21 +1003,39 @@ export async function CodarPlugin(input) {
           request(`${API}${ACTIVITIES_PATH}`, { method: "GET", token, ...opts() }),
         ])
 
-        if (pointsR.status === "rejected") {
+        // pointsError 是「卡片有一项没读成」的理由。magpie 的卡片一看到
+        // error 就只画那一行、不再画 windows（assets/kernel.js 的 pqLine /
+        // quotaWindows），所以它不是「部分读到了」的标记：部分读到就照画读到
+        // 的部分，只有什么点数都没读到才让整张卡变成一句错误。
+        let points
+        if (pointsR.status === "fulfilled") {
+          points = pointsR.value
+          // 通用点数与 Agent 点数是两处读数，厂商自己的客户端也是分开取的
+          // （app.asar 的 S0）：这一处没给 Agent 数时问另一条余额接口。
+          if (points.agent == null) points.agent = await agentPointsOf(token, username, opts()).catch(() => null)
+        } else {
           const e = pointsR.reason
-          return { error: scrub(whyOf(e), token) || "点数查询失败", signIn: signedOut(e) ? "expired" : "" }
+          // 登录过期是整张卡的答案：另两处也会这么说，换谁重试都没用，用户
+          // 要做的只有重新登录。这一条是原来那一句，别改成码。
+          if (signedOut(e)) return { error: "登录已过期，请重新登录", signIn: "expired" }
+          // 厂商自己的客户端在这一处读不到时会去问另一条余额接口（S0 的
+          // allSettled）：这里照样问一次。读到了就照画签到行、活动和 Agent
+          // 点数——钱包那一行不画，通用点数这一回没说，编一个 0 会让路由把
+          // 一个有钱的账号排到最后。两条都读不到，才是整张卡的一句错误。
+          const agent = await agentPointsOf(token, username, opts()).catch(() => null)
+          if (agent == null) return { error: scrub(whyOf(e), token) || "点数查询失败", signIn: "" }
+          points = { general: null, agent }
         }
-        const points = pointsR.value
 
         const windows = []
 
         // 今日签到：明天这个时候能再领一次。等待结束时（retry_after 0）这
-        // 一行也要在——那正是"现在可以领"的时刻，旧写法 retry > 0 会让它消失。
+        // 一行也要在——那正是"现在可以领"的时刻，旧写法 secs > 0 会让它消失。
         // 不带 used：签到不是一份会用完的额度，magpie 的 plugin_usage.go 把
         // 没有份额的 aside 行标成 Text（它自己的注释也拿「每日签到」当例子），
         // 不会画成一个 100% 的进度条。
         //
-        // 状态按厂商 App 自己的读法（app.asar 的 ayt）：data 可以是那个布尔，
+        // 状态按厂商 App 自己的读法（app.asar 的 um）：data 可以是那个布尔，
         // 也可以是写着它的对象（四种写法）；两种形状都画这一行，其余形状不画。
         // 先过它的 code 关：厂商调状态接口时也是先 Jo（数字码不是 200 就当
         // 失败），再 ayt 读应答。只认 data 的话，{code: 500, data:{isSigned:
@@ -1183,6 +1261,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
 
 export default CodarPlugin
