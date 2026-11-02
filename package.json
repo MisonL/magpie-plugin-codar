@@ -18,6 +18,7 @@
     "index.mjs",
     "catalog.mjs",
     "scripts/catalog.mjs",
+    "test/plugin.test.mjs",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"

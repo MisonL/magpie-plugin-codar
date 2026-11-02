@@ -11,7 +11,7 @@ import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, payloadOf, request, appToken, configPath, cleanText } = testables
+const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, payloadOf, request, appToken, configPath, cleanText } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -64,6 +64,12 @@ test("a token's claims give the account name and the expiry", () => {
   assert.ok(expiresAt(TOKEN) > Date.now())
   assert.equal(payloadOf("not a jwt"), null)
   assert.equal(usernameOf("garbage"), "")
+  // the claim is a string or it is nothing: a number sent as the account in
+  // every request body is not something the vendor's client would have read
+  const numeric = (v) => mkToken({ username: v, exp: Math.floor(Date.now() / 1000) + 600 })
+  assert.equal(usernameOf(numeric(123)), "", "a number is not an account name")
+  assert.equal(usernameOf(numeric(null)), "")
+  assert.equal(usernameOf(numeric({ name: "u" })), "")
 })
 
 // A key with anything but visible ASCII would make fetch throw with the whole
@@ -112,6 +118,7 @@ test("check-in claims, reports the points it added, and reads the balance after"
   )
   assert.equal(r.outcome, "claimed")
   assert.equal(r.credit, 50)
+  assert.equal(r.message, "Success", "the vendor's own words are what the card says, not a line of ours")
 })
 
 test("already claimed today is `done`, with when to come back", async () => {
@@ -418,6 +425,7 @@ test("usage reports both balances and the claim window", async () => {
   const win = u.windows.find((w) => w.name === "每日签到")
   assert.ok(win, "the claim window is there")
   assert.equal(win.used, undefined, "a check-in is not a share of an allowance: no used, so the host shows it as its text")
+  assert.equal(win.aside, true, "and it is set aside, which is what makes the host read it as text")
   assert.ok(win.resetsAt > Date.now())
 })
 
@@ -449,6 +457,12 @@ test("the claim row reads the vendor client's own spellings", async () => {
   assert.equal((await row(true)).display, "今天已领", "a boolean answer is the state itself")
   assert.equal((await row(false)).display, "今天还没领，现在可以领")
   assert.equal((await row({ isSigned: "true" })).display, "今天还没领，现在可以领", "a string is not a boolean: Boolean(\"false\") is true")
+  // the shapes the client does not read are no state at all: a string is
+  // truthy and an array is an object, so a looser test drew "现在可以领" over
+  // data the vendor never meant as a state
+  for (const data of ["yes", [true], 1]) {
+    assert.equal(await row(data), undefined, `data ${JSON.stringify(data)} is not a claim state`)
+  }
 })
 
 test("the balances are read by the vendor client's own names", async () => {
@@ -1026,17 +1040,18 @@ test("a sub-second wait the vendor states reads as a wait on both cards", async 
   assert.ok(r.until > Date.now(), "and its until is a time in the future")
 })
 
-test("safeTime clamps to the last instant both sides can read", () => {
-  // A vendor's retry_after is a number nothing bounds. Date.toISOString()
-  // throws past 8.64e15, and magpie's Go side parses the ISO string with a
-  // four-digit-year layout, so a "+275760-…" parses to zero and the time is
-  // dropped in silence. The clamp is the last line of defence — today every
-  // caller caps the wait first (sayableSecs / checkinWaitSecs), which is
-  // exactly why nothing else would notice it going away.
+test("a time past the calendar is not a time, never a rounded one", () => {
+  // Two ceilings meet here: Date.toISOString() throws past 8.64e15, and
+  // magpie's Go side parses the ISO string with a four-digit-year layout, so
+  // a "+275760-…" parses to zero and the time is dropped in silence. A time
+  // past the last instant both accept is said as nothing — not clamped to
+  // 9999-12-31, which is a date the vendor never stated. (The clamping
+  // version was dead code: every caller bounds the wait first, so no test
+  // could tell the two apart until this one asked safeTime directly.)
   assert.equal(safeTime(253402300799999), 253402300799999, "the last instant both accept is kept as it is")
-  assert.equal(safeTime(253402300800000), 253402300799999, "one past it is clamped, not dropped")
-  assert.equal(safeTime(8.64e15), 253402300799999, "and so is a time toISOString would throw on")
-  assert.equal(new Date(safeTime(1e17)).toISOString(), "9999-12-31T23:59:59.999Z")
+  assert.equal(safeTime(253402300800000), 0, "one past it is not a time")
+  assert.equal(safeTime(8.64e15), 0, "nor is a time toISOString would throw on")
+  assert.equal(safeTime(1e17), 0)
   assert.equal(safeTime(0), 0, "a time that is not one is said as nothing")
   assert.equal(safeTime(-1), 0)
   assert.equal(safeTime(Infinity), 0)
@@ -1063,6 +1078,13 @@ test("every request carries the User-Agent the desktop app sends on that host", 
   const out = { headers: {} }
   await p["chat.headers"]({ model: { providerID: "codar" }, provider: { info: { id: "codar" } } }, out)
   assert.equal(out.headers["User-Agent"], "Go-http-client/1.1", "chat goes out through the app's Go sidecar")
+
+  // host.js tells the hook the provider both ways (input.model.providerID and
+  // input.provider.info.id); a hook that read only one of them would leave
+  // our own requests without the sidecar's UA on the hosts that pass the other
+  const viaModel = { headers: {} }
+  await p["chat.headers"]({ model: { providerID: "codar" } }, viaModel)
+  assert.equal(viaModel.headers["User-Agent"], "Go-http-client/1.1", "our own request is recognised by the model too")
 })
 
 test("chat.headers leaves another provider's request alone", async () => {
@@ -1537,6 +1559,35 @@ test("a JWT whose payload is not JSON reads as no claims", () => {
   assert.equal(payloadOf(broken), null)
 })
 
+test("a credential with not exactly three parts is not read as a JWT", () => {
+  // The vendor's client takes the middle of a three-part token; the plugin
+  // reads the middle too, but only of something shaped like a JWT. A
+  // two-part string whose middle happens to decode as claims was read as the
+  // account's claims, and every request then named an account the token
+  // never carried.
+  const claims = Buffer.from(JSON.stringify({ username: "bob", exp: 1_900_000_000 })).toString("base64url")
+  assert.equal(payloadOf(`header.${claims}`), null, "two parts is not a token")
+  assert.equal(payloadOf(`${claims}`), null, "nor is one")
+  assert.equal(payloadOf(`header.${claims}.sig.extra`), null, "nor is four")
+  assert.equal(usernameOf(`header.${claims}`), "", "and no account name comes out of it")
+  assert.equal(payloadOf(`header.${claims}.sig`).username, "bob", "three is")
+})
+
+test("a token runs out at the second it names, as the vendor's client reads it", () => {
+  // app.asar's Zh: `i*1e3 - t <= 0 ? "expired"`. Read as `>` the exact
+  // instant would be one more second of life the client does not give.
+  const real = Date.now
+  const at = 1_800_000_000
+  try {
+    Date.now = () => at * 1000
+    assert.equal(expired(mkToken({ username: "u", exp: at })), true, "the second it names is already gone")
+    Date.now = () => at * 1000 - 1
+    assert.equal(expired(mkToken({ username: "u", exp: at })), false, "the millisecond before it is not")
+  } finally {
+    Date.now = real
+  }
+})
+
 test("a claim whose point reads fail still claims, with no made-up credit", async () => {
   // The claim is what the vendor said; the points are a bonus we can only
   // report when both reads worked. A failed read must not turn a claim into
@@ -1980,23 +2031,36 @@ test("a claim row whose time no calendar can state carries no resetsAt, not 1970
 })
 
 test("an activity whose end no calendar can state carries no resetsAt, not 1970", async () => {
-  // free_until: 1e999 is valid JSON that reads as Infinity, so the activity
-  // passes the vendor app's own rule (a future free_until) but its end time
-  // cannot be written down. The row is still reported; the epoch is not.
+  // Two ways an end time cannot be written down, and one that can. 1e999 is
+  // valid JSON that reads as Infinity; 316224000000 seconds is about the year
+  // 12000, a real number a calendar cannot spell. Both pass the vendor app's
+  // own rule (a free_until in the future), and neither may reach the card as
+  // a time — the epoch (when(0)) or a rounded 9999-12-31 are both dates the
+  // vendor never stated. A year-9999 end is a real instant and is drawn.
   const p = await CodarPlugin()
-  const u = await withFetch(
-    {
-      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
-      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
-      "/api/codar/activities/mine": () =>
-        new Response('{"code":200,"data":[{"status":"active","free_until":1e999,"remaining_quota":null,"model_ids":["a"]}]}', { status: 200, headers: { "Content-Type": "application/json" } }),
-    },
-    async () => p.auth.usage(auth),
-  )
-  const free = u.windows.find((w) => w.name.startsWith("免费模型"))
-  assert.ok(free, "the activity is still reported: it is running")
-  assert.equal("resetsAt" in free, false, "without a reset time the host would draw as 1970")
-  assert.equal(free.display, "免费使用中（不限量）")
+  // the body is written as text: JSON.stringify turns 1e999 into null, and
+  // the point of that case is a body that really says Infinity
+  const read = async (freeUntilText) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
+        "/api/codar/activities/mine": () =>
+          new Response(`{"code":200,"data":[{"status":"active","free_until":${freeUntilText},"remaining_quota":null,"model_ids":["a"]}]}`, { status: 200, headers: { "Content-Type": "application/json" } }),
+      },
+      async () => p.auth.usage(auth),
+    )
+  const far = (await read("316224000000")).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.ok(far, "an activity ending in the year 12000 is still reported: it is running")
+  assert.equal("resetsAt" in far, false, "but a date no calendar can spell is not handed on")
+
+  const beyond = (await read("1e999")).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.ok(beyond, "and so is one whose end reads as Infinity")
+  assert.equal("resetsAt" in beyond, false, "without a reset time the host would draw as 1970")
+  assert.equal(beyond.display, "免费使用中（不限量）")
+
+  const last = (await read("253402300799")).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.equal(last.resetsAt, 253402300799000, "the last instant both ends accept is a time, and is said")
 })
 
 test("a max_concurrency of the wrong type does not pin the account to one at a time", async () => {
@@ -2012,6 +2076,16 @@ test("a max_concurrency of the wrong type does not pin the account to one at a t
     async () => q.provider.models({ models: {} }, { auth: await auth() }),
   )
   assert.equal(q.auth.maxConcurrency, 7, "a real number still is")
+  // The vendor can state one per model; the account queues at the smallest,
+  // and only a count a host can keep is a count at all. The 700k-entry test
+  // below puts the smallest value last, so a fold that kept the last one
+  // would pass it — these put it first.
+  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 2 }, { max_concurrency: 9 }] }), 2, "the smallest wins, wherever it sits")
+  assert.equal(publishedConcurrency({ max_concurrency: 5, data: [{ max_concurrency: 9 }] }), 5, "a provider-level count counts")
+  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 2.5 }] }), 0, "a fraction is not a count of requests")
+  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 5000 }] }), 0, "nor is a number no account could honour")
+  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 1000 }] }), 1000, "the cap itself is a count")
+  assert.equal(publishedConcurrency({ data: [{ max_concurrency: "4" }] }), 4, "a numeric string is a number, as the vendor client reads them")
 })
 
 test("a catalog big enough to overflow a spread argument still yields its concurrency", async () => {
@@ -2360,6 +2434,10 @@ test("an activity with a stated total is not called unlimited", async () => {
 
   const unlimited = (await read({ user_quota_limit: null, remaining_quota: null })).windows.find((w) => w.name.startsWith("免费模型"))
   assert.match(unlimited.display, /不限量/, "with no total, unlimited is the vendor's own shape")
+
+  const rounded = (await read({ user_quota_limit: 8, remaining_quota: 7 })).windows.find((w) => w.name.startsWith("免费模型"))
+  assert.equal(rounded.used, 13, "a share of 12.5% is rounded to 13, not floored to 12")
+  assert.equal(rounded.display, "免费使用中，已用 1 / 8")
 })
 
 test("the seven promises no test used to pin", async () => {
@@ -2831,6 +2909,29 @@ test("the generator writes what it would serve, and says so", async () => {
   const written = parseCatalog(after)
   assert.deepEqual(written, await recordsOf(body), "the file holds exactly the records the live path would serve")
   assert.equal(written[0].name, cleanText("Na\u0007me"), "with the name cleaned, as the card will show it")
+  // The file is read by people as much as by the plugin: its header says what
+  // it is and how to regenerate it. --check compares records, so a run that
+  // dropped the header would otherwise leave the committed file unreadable
+  // prose-less on its next regeneration.
+  assert.ok(after.startsWith("// catalog is Codar's model list"), "the file's own header is written")
+  assert.match(after, /export const CATALOG = \[/)
+})
+
+test("the generator writes records in id order, whatever order the vendor used", async () => {
+  // A vendor that reorders its list is not a change: the committed file is
+  // sorted by id so the diff stays about models. The record set is the same,
+  // only the order differs.
+  const body = {
+    code: 200,
+    data: [
+      { id: "zeta", display_name: "Z", context_window: 1 },
+      { id: "alpha", display_name: "A", context_window: 1 },
+      { id: "mike", display_name: "M", context_window: 1 },
+    ],
+  }
+  const { exit, after } = await genRun({ body })
+  assert.equal(exit, 0)
+  assert.deepEqual(parseCatalog(after).map((r) => r.id), ["alpha", "mike", "zeta"], "the file is written in id order")
 })
 
 test("a generator run that cannot read the vendor writes nothing and does not say 'out of date'", async () => {
@@ -2872,6 +2973,9 @@ test("a --check that cannot read the catalog file is exit 2, not 'out of date'",
   assert.equal(truncated.logs.some((l) => l.includes("out of date")), false)
   const noExport = await genRun({ body, argv: ["--check"], seeded: "// a file we did not write\n" })
   assert.equal(noExport.exit, 2, "and so is a file with no CATALOG export in it")
+  const notAList = await genRun({ body, argv: ["--check"], seeded: "export const CATALOG = { \"id\": 1 }\n" })
+  assert.equal(notAList.exit, 2, "and so is one whose export is not a list")
+  assert.ok(notAList.logs.some((l) => l.includes("not a list")), "said as what it is, not as a crash")
 })
 
 test("a generator that cannot write the file says so, as exit 2", async () => {

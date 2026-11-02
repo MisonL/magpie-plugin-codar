@@ -127,10 +127,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   not as "not said". The check-in's wait has one more bound of its own: its
   day rolls every 24 hours, so a wait longer than a week is not a next-claim
   time that window can produce, and the check-in treats such a number as
-  unsaid; an activity's end is a real date, so it is drawn as far out as the
-  calendar allows. A positive wait of under a second is said as one second:
-  rounding it said "0 秒后可再领", a window the vendor just opened told as no
-  wait at all (a stated zero is still a zero). The check-in's `until` is the
+  unsaid; an activity's end is a real date, but one past the calendar cannot
+  be written down either, so it is left out rather than rounded to
+  9999-12-31 — a date the vendor never stated. A positive wait of under a
+  second is said as one second: rounding it said "0 秒后可再领", a window the
+  vendor just opened told as no wait at all (a stated zero is still a zero).
+  The check-in's `until` is the
   one thing never omitted: a "done" with no `until` settles the whole day in
   magpie, so an unusable wait falls back to the 30-minute trust floor
   described above.

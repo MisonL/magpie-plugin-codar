@@ -73,19 +73,27 @@ const HOST_CHECKIN_DEADLINE_MS = 120 * 1000
 // past 8.64e15 ("Invalid time value"), and magpie's own side parses the ISO
 // string with Go's RFC3339 layout, which has four year digits — a "+275760-…"
 // string parses to zero and the time is dropped in silence. 253402300799999
-// is 9999-12-31T23:59:59.999Z, the last instant both accept. A vendor's
-// retry_after is a number nothing bounds, so a time past it is clamped here
-// rather than dropped downstream.
+// is 9999-12-31T23:59:59.999Z, the last instant both accept.
 const MAX_TIME_MS = 253402300799999
+
+// safeTime is a stated number of milliseconds when it is a time magpie can
+// read (see MAX_TIME_MS), and 0 — "not stated" — when it is not: not a
+// number, not positive, or past the last instant both ends accept. A time
+// past the calendar is not clamped to it: 9999-12-31 is not a moment the
+// vendor stated, and rounding an unwritable time to a wrong one is what
+// every other field here refuses to do. 0 is what makes the caller leave the
+// field out — and what keeps the host's `new Date(ms).toISOString()` from
+// throwing RangeError on a "+275760-…". Each caller bounds the wait first
+// (secsOf and the per-window caps), so this is the last gate, not the first.
 const safeTime = (ms) => {
   const n = Number(ms)
-  if (!isFinite(n) || n <= 0) return 0
-  return Math.min(n, MAX_TIME_MS)
+  return isFinite(n) && n > 0 && n <= MAX_TIME_MS ? n : 0
 }
 
-// MAX_WAIT_SECS is the longest wait a card can say: a wait past the last
-// time magpie can read (year 9999) would be clamped to it anyway, and
-// "1.1574074074074072e+303 天后" is not a thing a card says.
+// MAX_WAIT_SECS is the longest wait a card can say: a wait past the last time
+// magpie can read (year 9999). humanSecs says one past it as nothing —
+// "1.1574074074074072e+303 天后" is not a thing a card says — and the seconds
+// the plugin hands it are already bounded by that window's own cap.
 const MAX_WAIT_SECS = MAX_TIME_MS / 1000
 
 // numOf is a vendor field as a number, read the way its own client reads one
@@ -100,14 +108,16 @@ const numOf = (v) => (typeof v === "number" ? v : typeof v === "string" && v.tri
 // vendor record has to be to be read field by field.
 const plain = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v)
 
-// sayableSecs is a vendor's number of seconds when it is one a card can say:
-// finite, positive, and inside the calendar. Anything else is 0 — "not
-// stated" — so callers can decide with one check whether they have a time at
-// all. The bound is what keeps `secs * 1000` from overflowing to Infinity,
-// which safeTime would turn into 0 and a host would draw as 1970-01-01.
-const sayableSecs = (v) => {
+// secsOf is a vendor field as a number of seconds, or 0 — "not stated" — when
+// it is not one: a value that is not a number (numOf), a zero, or a negative.
+// A zero reads as "not stated" because a window with no wait is drawn in its
+// own words ("现在可以领"), not as a time. What a particular window will trust
+// is not this function's business: the check-in caps a wait at a week
+// (checkinWaitSecs), and every time goes through safeTime before a card sees
+// it — a number past the calendar comes out of there as 0, not as year 9999.
+const secsOf = (v) => {
   const n = numOf(v)
-  return Number.isFinite(n) && n > 0 && n <= MAX_WAIT_SECS ? n : 0
+  return Number.isFinite(n) && n > 0 ? n : 0
 }
 
 // MAX_CHECKIN_WAIT_SECS is the longest wait the daily check-in can name.
@@ -118,7 +128,7 @@ const sayableSecs = (v) => {
 // number is treated as one we cannot use, like a missing one.
 const MAX_CHECKIN_WAIT_SECS = 7 * 24 * 3600
 const checkinWaitSecs = (v) => {
-  const n = sayableSecs(v)
+  const n = secsOf(v)
   return n > 0 && n <= MAX_CHECKIN_WAIT_SECS ? n : 0
 }
 
@@ -187,16 +197,23 @@ const expSeconds = (token) => numOf(payloadOf(token)?.exp)
 // or a string that says one — a string exp read as "no expiry" would send a
 // token the vendor already counts as expired, and the card would say the
 // check-in failed instead of asking to sign in again.
+// A stated exp of 0 is the epoch, not "says nothing": it is a time that has
+// passed, so it is handed back as a time (and read as expired). That is why
+// the reading is "> 0" and not ">= 0" — 0 is both a real instant and the
+// value expiresAt uses for "not stated", and only the sign tells them apart.
 function expiresAt(token) {
   const n = expSeconds(token)
-  return Number.isFinite(n) ? n * 1000 : 0
+  return Number.isFinite(n) && n > 0 ? n * 1000 : 0
 }
 
-// expired says whether the token has run out, as that same client decides:
-// a stated exp in the past is expired — the epoch itself included, which the
-// 0-means-unsaid reading of expiresAt cannot tell from "says nothing" — while
-// a token that states no exp is not declared expired here (that client calls
-// it "unknown", and the vendor is the one to answer).
+// expired says whether the token has run out, as that same client decides
+// (app.asar's Zh: `i*1e3 - t <= 0 ? "expired"`): a stated exp in the past is
+// expired — the instant itself included, hence `>=` — while a token that
+// states no exp is not declared expired here (that client calls it "unknown",
+// and the vendor is the one to answer). A stated exp of 0 is the epoch, so it
+// is expired; that is the one case the "0 means not stated" reading of
+// expiresAt could not tell apart, which is why this function reads the claims
+// itself rather than asking expiresAt.
 const expired = (token) => {
   const n = expSeconds(token)
   return Number.isFinite(n) && Date.now() >= n * 1000
@@ -823,10 +840,10 @@ export async function CodarPlugin(input) {
           // 漏掉下一次可领。给一个 30 分钟的保质期：这只是「这个答案我们
           // 信多久」，不是替厂商编一个可领时刻；最坏也就是回到 until 之前
           // 的每 30 分钟问一次。
-          // 秒数先说得出、再说信多久：日历写不出的数（1e308 乘 1000 溢出成
-          // Infinity）和滚动 24 小时窗口产不出的数（1e9 秒是 31 年）都不是
-          // 「可信的时刻」，和厂商没说一样落到 30 分钟的保质期；照单全收会
-          // 把这一天结清到 2058 年。见 checkinWaitSecs。
+          // 秒数先说得出、再说信多久：滚动 24 小时窗口产不出的数（1e9 秒是
+          // 31 年）和日历写不出的数都不是「可信的时刻」，和厂商没说一样落到
+          // 30 分钟的保质期；照单全收会把这一天结清到 2058 年。见
+          // checkinWaitSecs（一周）与 safeTime（年 9999）。
           const secs = checkinWaitSecs(r?.data?.retry_after)
           const wait = secs ? humanSecs(secs) : ""
           const waitSecs = secs || 30 * 60
@@ -907,12 +924,15 @@ export async function CodarPlugin(input) {
         const status = statusR.status === "fulfilled" ? statusR.value : null
         const statusCode = Number(status?.code)
         const data = Number.isFinite(statusCode) && statusCode !== 200 ? undefined : status?.data
-        if (typeof data === "boolean" || (data && typeof data === "object")) {
+        // a boolean or a plain object, as the vendor's client reads it: an
+        // array is an object too, and drawing a row over one says "今天还没
+        // 领，现在可以领" about data the vendor never meant as a state.
+        if (typeof data === "boolean" || plain(data)) {
           const signed = signedIn(data)
           // 秒数先说得出、再在签到说得出的范围内：说不出的（没给、给了 0、
-          // 大到日历写不出——1e308 乘 1000 溢出成 Infinity，safeTime 给 0）
-          // 就没有可报的时刻，文案和 resetsAt 一起省掉。宿主的 when(0) 会把
-          // 0 画成 1970-01-01，而不是当成「没说」。见 checkinWaitSecs。
+          // 大到日历写不出）就没有可报的时刻，文案和 resetsAt 一起省掉。
+          // 宿主的 when(0) 会把 0 画成 1970-01-01，而不是当成「没说」。见
+          // checkinWaitSecs 与 safeTime。
           const secs = checkinWaitSecs(typeof data === "object" ? data.retry_after : undefined)
           const wait = secs ? humanSecs(secs) : ""
           windows.push({
@@ -962,15 +982,18 @@ export async function CodarPlugin(input) {
             // 两个数都要有限：1e999 是合法的 JSON，读出来却是 Infinity，
             // 拿去算份额会得到 NaN，卡片上就写「已用 Infinity / Infinity」。
             const cap = typeof a.user_quota_limit === "number" && isFinite(a.user_quota_limit) && a.user_quota_limit > 0 ? a.user_quota_limit : null
-            const left = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
+            // named for what it is: `left` would shadow the usage hook's own
+            // left() budget function two scopes up, and the next caller of
+            // opts() in here would get a TypeError instead of a timeout
+            const quotaLeft = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
             // 「已用」只在两个数都在、且互相说得通时才算得出来：剩下比总额还多，
             // 是两个数在说两件事（厂商报的是池子，不是这次活动），相减只会造出
             // 一个 0，卡片写「已用 0 / 100」而厂商说还剩 150——不如把剩下的照说。
-            const used = cap != null && left != null && left <= cap ? cap - left : null
+            const used = cap != null && quotaLeft != null && quotaLeft <= cap ? cap - quotaLeft : null
             const share = used != null && cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0
             // 活动的结束时间（也是秒数）读不出来就不带 resetsAt：活动
-            // 本身照报——它确实在跑，只是没说何时结束。见 sayableSecs。
-            const freeUntil = safeTime(sayableSecs(a.free_until) * 1000)
+            // 本身照报——它确实在跑，只是没说何时结束（safeTime 给 0）。
+            const freeUntil = safeTime(secsOf(a.free_until) * 1000)
             windows.push({
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
               used: share,
@@ -978,7 +1001,7 @@ export async function CodarPlugin(input) {
               // 说得出总额就说总额：remaining_quota 没给，不代表活动「不限量」
               // ——厂商的 user_quota_limit 白纸黑字写了多少。只有两个数都没有
               // 时才是「不限量」（今天的线上形状）。
-              display: left == null ? (cap == null ? "免费使用中（不限量）" : `免费使用中，共 ${cap}`) : used == null ? `免费使用中，还剩 ${left}` : `免费使用中，已用 ${used} / ${cap}`,
+              display: quotaLeft == null ? (cap == null ? "免费使用中（不限量）" : `免费使用中，共 ${cap}`) : used == null ? `免费使用中，还剩 ${quotaLeft}` : `免费使用中，已用 ${used} / ${cap}`,
               ...(used != null ? { amount: used, limit: cap } : {}),
               aside: true,
             })
@@ -1107,6 +1130,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
 
 export default CodarPlugin
