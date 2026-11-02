@@ -11,7 +11,7 @@ import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, payloadOf, request, appToken, configPath, cleanText } = testables
+const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, payloadOf, request, appToken, configPath, cleanText } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -880,7 +880,9 @@ test("the config hook keeps a provider name the user set", async () => {
   await p.config(config)
   assert.equal(config.provider.codar.name, "我的科搭")
   assert.deepEqual(config.provider.codar.options, { note: "kept" })
-  assert.deepEqual(config.provider.codar.models["my-model"], { name: "自建" }, "the user's own model entry survives")
+  // 键就是 id：宿主建这一行时读 m.id，没写 id 的自建条目会是一条没有名字的
+  // 模型。补上的是键本身，别的字段一个不动。
+  assert.deepEqual(config.provider.codar.models["my-model"], { name: "自建", id: "my-model" }, "the user's own model entry survives, given the id the host reads from its key")
   assert.ok(config.provider.codar.models["deepseek-v4.1-flash"], "the catalog is still filled in")
 })
 
@@ -1085,6 +1087,13 @@ test("every request carries the User-Agent the desktop app sends on that host", 
   const viaModel = { headers: {} }
   await p["chat.headers"]({ model: { providerID: "codar" } }, viaModel)
   assert.equal(viaModel.headers["User-Agent"], "Go-http-client/1.1", "our own request is recognised by the model too")
+
+  // host.js always hands in an object with headers, but this hook runs inside
+  // every provider's request path: one that is missing the bag is made, not
+  // reached into. A shape the host does not send must not throw there.
+  const bare = {}
+  await p["chat.headers"]({ model: { providerID: "codar" } }, bare)
+  assert.equal(bare.headers["User-Agent"], "Go-http-client/1.1", "a bag that is not there is made, not assumed")
 })
 
 test("chat.headers leaves another provider's request alone", async () => {
@@ -1192,6 +1201,34 @@ test("the timeouts each request is given are the ones the budget says", async ()
     try {
       await p.auth.checkin(auth)
       assert.equal(given[1], 1000, "a spent budget leaves the next request the 1s floor, not 0 or a negative wait")
+    } finally {
+      globalThis.fetch = realFetchForTimers
+    }
+
+    // a budget partly spent: the middle of the expression. Every other reading
+    // here lands on the cap (a fresh budget) or on the floor (a spent one), so
+    // `min(TIMEOUT_MS, left())` could have been `TIMEOUT_MS` alone and stayed
+    // green. 20s of the 25s gone leaves the second request 5s.
+    given.length = 0
+    now = realNow()
+    calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      if (calls === 1) {
+        now += 20 * 1000
+        return new Response(JSON.stringify({ code: 200, token: 1, agent_token: 0 }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 200, message: "Success" }), { status: 200 })
+    }
+    try {
+      const r = await p.auth.checkin(auth)
+      assert.equal(r.outcome, "claimed")
+      const t = testables.timing
+      assert.equal(given[1], t.CHECKIN_BUDGET_MS - 20 * 1000, "a part-spent budget hands the next request what is left of it, not the full cap")
+      // …and the same for the balance read after the claim: it is the third
+      // request on this path, and it had its own min() that no reading here
+      // reached (the claim and the first read both answered instantly).
+      assert.equal(given[2], t.CHECKIN_BUDGET_MS - 20 * 1000, "the read after the claim is handed the same remainder, not the full cap")
     } finally {
       globalThis.fetch = realFetchForTimers
     }
@@ -2854,7 +2891,7 @@ const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFet
     env: { CODAR_HOME: root },
     out: outPath,
     fetchImpl: async () => {
-      if (throwOnFetch) throw new TypeError("fetch failed")
+      if (throwOnFetch) throw throwOnFetch instanceof Error ? throwOnFetch : new TypeError("fetch failed")
       return new Response(typeof body === "string" ? body : JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
     },
     log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
@@ -3101,4 +3138,242 @@ test("a generator run with no readable token says what to do, as exit 2", async 
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// Round 19: the four gaps a full review found in code that was green.
+test("a wording the plugin has never seen is still the day already claimed", async () => {
+  // 「已领过」 used to be one Chinese sentence, tested against the card's
+  // copy — already cut at 400 characters. Both halves of that were holes:
+  // a vendor answering in English ("You can only claim once every 24 hours")
+  // read as a plain refusal, and magpie then retried the claim every 30
+  // minutes while the card said it failed. The answer's own retry_after is
+  // the other statement of the same fact: a 400 that still knows when the
+  // next claim opens is a day already claimed, whatever it says in words.
+  const p = await CodarPlugin()
+  const read = (body) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign": { body },
+      },
+      async () => p.auth.checkin(auth),
+    )
+  for (const [label, body] of [
+    ["English words", { code: 400, message: "You can only claim once every 24 hours" }],
+    ["a plain 400 with a wait", { code: 400, data: { retry_after: 3600 } }],
+    ["the sentence buried past the card's cut", { code: 400, message: "x".repeat(600) + "24小时内仅可领取一次", data: { retry_after: 60 } }],
+    // …and with no wait to fall back on, so it is the un-truncated words that
+    // have to say it: the card's copy is cut at 400 characters, and this
+    // sentence sits at 601.
+    ["buried, with no wait either", { code: 400, message: "x".repeat(600) + "24小时内仅可领取一次" }],
+  ]) {
+    const r = await read(body)
+    assert.equal(r.outcome, "done", `${label}: this day is claimed, not a failure`)
+    assert.ok(r.until > Date.now(), `${label}: and it says when the window opens again`)
+  }
+  // the other side: a 200 that says the day is already claimed is not a new
+  // claim. It was read as one — a claimed outcome over a day that had already
+  // been settled, with a credit of 0.
+  const twice = await read({ code: 200, data: { message: "24小时内仅可领取一次", retry_after: 3600 } })
+  assert.equal(twice.outcome, "done", "a success code beside the already-claimed words is that day, not a second claim")
+  assert.equal(twice.message, "今天已领过，1 小时后可再领")
+})
+
+test("an activity's numbers are read the way every other vendor number is", async () => {
+  // free_until and remaining_quota were the two fields read with `typeof ===
+  // "number"` while every other number in the plugin goes through numOf. A
+  // vendor spelling either as a string made the activity vanish from the card
+  // without a word — the hardest kind of fault to see.
+  const now = Math.floor(Date.now() / 1000)
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": {
+        body: {
+          code: 200,
+          data: [
+            { free_until: String(now + 3600), remaining_quota: "3", user_quota_limit: "10", model_ids: ["a"] },
+            { free_until: String(now + 3600), remaining_quota: "0", user_quota_limit: "10", model_ids: ["b"] },
+            { free_until: "later", remaining_quota: null, model_ids: ["c"] },
+          ],
+        },
+      },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
+  assert.equal(free.length, 1, "a string-wrapped time is a time; a spent string quota still ends the activity; a word is not a time")
+  assert.equal(free[0].amount, 7, "and the share is the two numbers the strings spelled")
+  assert.equal(free[0].limit, 10)
+  assert.equal(free[0].display, "免费使用中，已用 7 / 10")
+})
+
+test("a name cut to fit the card never ends mid-character", () => {
+  // 120 UTF-16 units can end between the halves of a surrogate pair, and the
+  // lone high surrogate that leaves behind is a character nobody wrote:
+  // JSON carries it as \ud83d and the host's decoder draws U+FFFD. The cut is
+  // by code point, so each emoji is one of the 120 and none is halved.
+  const emoji = "😀".repeat(130) // 130 code points, 260 UTF-16 units
+  const cleaned = cleanText(emoji)
+  assert.equal(Array.from(cleaned).length, 120, "120 characters, not 120 code units")
+  assert.equal(cleaned, "😀".repeat(120), "and every one of them whole")
+  assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cleaned), false, "no lone high surrogate is left behind")
+  // a name already inside the limit is untouched
+  assert.equal(cleanText("😀".repeat(70)), "😀".repeat(70), "70 whole pairs stay as they are")
+})
+
+test("a self-written model entry gets the id its key names", async () => {
+  // The host builds every model row from m.id; a hand-written entry that
+  // names only `name` used to reach it with an id of undefined.
+  const p = await CodarPlugin()
+  const config = { provider: { codar: { models: { "my-model": { name: "自建", provider: { api: "https://my.example/v1" } } } } } }
+  await p.config(config)
+  const mine = config.provider.codar.models["my-model"]
+  assert.equal(mine.id, "my-model", "the key is the id the host reads")
+  assert.equal(mine.name, "自建", "and the user's own fields are kept beside it")
+  assert.equal(mine.provider.api, "https://my.example/v1")
+  // an entry that names its own id keeps it: the key is only the fallback
+  const named = { provider: { codar: { models: { "k": { id: "other", name: "Other" } } } } }
+  await p.config(named)
+  assert.equal(named.provider.codar.models.k.id, "other", "an id the user wrote is never overwritten by the key")
+})
+
+test("the generator cuts a wrapped or payload-only token out of what it says", async () => {
+  // The generator's failure path used to split on the exact token string; a
+  // server that wrapped the credential or quoted back only its payload would
+  // have had it printed into a CI log. It now cuts by the JWT's shape, the
+  // same rule the plugin's own messages use.
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const jwt = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 3600 })}.sig`
+  const folded = jwt.match(/.{1,24}/g).join("\n")
+  for (const [label, said] of [
+    ["the token folded", `bad key ${folded}`],
+    ["only its payload", `bad key ${jwt.split(".")[1]}`],
+  ]) {
+    const { exit, logs } = await genRun({ body: undefined, throwOnFetch: new Error(said), token: jwt })
+    assert.equal(exit, 2, `${label}: a failed fetch is still exit 2`)
+    const said2 = logs.join("\n")
+    assert.doesNotMatch(said2, /eyJ[\w-]{10,}/, `${label}: no credential reaches the log`)
+    assert.match(said2, /…/, `${label}: and the place it was is marked`)
+  }
+})
+
+test("the readings no test used to pin, spelled out one by one", () => {
+  // Each of these is a branch the suite stayed green without: deleting it
+  // changed what a card says, and nothing went red.
+  //
+  // saidBy reads eight spellings; five were covered. The three below are the
+  // ones a vendor actually uses for a refusal.
+  assert.equal(saidBy({ error: "boom" }), "boom", "a refusal spelled `error`")
+  assert.equal(saidBy({ data: { error: "boom" } }), "boom", "and one under data")
+  assert.equal(saidBy({ data: { detail: "why" } }), "why", "and `detail` under data")
+  // the order is the client's (app.asar's Vg): a top-level field wins over the
+  // same name under data, whatever order the object was written in
+  assert.equal(saidBy({ data: { message: "inner" }, msg: "outer" }), "outer", "a top-level msg beats data.message")
+  assert.equal(saidBy({ detail: "d", message: "m" }), "m", "and message comes before detail")
+  assert.equal(saidBy({ message: "   ", msg: "real" }), "real", "a blank string is not words")
+  assert.equal(saidBy("nope"), "", "and a body that is not an object says nothing")
+
+  // secsOf directly: every call site guards the zero, so its own reading of
+  // "not stated" was never asked.
+  assert.equal(secsOf(0), 0, "a zero is not a wait")
+  assert.equal(secsOf(-1), 0, "nor is a negative")
+  assert.equal(secsOf(true), 0, "nor is a boolean: Number(true) is 1 second nobody stated")
+  assert.equal(secsOf([3600]), 0, "nor is a one-element array")
+  assert.equal(secsOf(""), 0, "nor is a blank string")
+  assert.equal(secsOf("3600"), 3600, "a number spelled as a string is one")
+  assert.equal(secsOf(3600), 3600)
+  // the check-in's week ceiling, at the instant it bites
+  assert.equal(checkinWaitSecs(7 * 24 * 3600), 7 * 24 * 3600, "exactly a week is a wait this window can name")
+  assert.equal(checkinWaitSecs(7 * 24 * 3600 + 1), 0, "one second past it is not")
+
+  // humanSecs' own ceiling: the last second both ends accept is said, the
+  // next one is not.
+  assert.match(humanSecs(253402300799), /天/, "the last instant a card can hold is said as a wait")
+  assert.equal(humanSecs(253402300800), "", "one second past the calendar is said as nothing, not as year 10000")
+
+  // cleanText's control-character classes: only four of them had a test, so
+  // half the regex could have been deleted in silence. C1, the soft hyphen,
+  // the line and paragraph separators, the bidi isolates and the BOM alike
+  // are one space on a card.
+  for (const [label, ch] of [
+    ["a C1 control", "\u0085"],
+    ["a soft hyphen", "­"],
+    ["a line separator", " "],
+    ["a bidi isolate", "⁦"],
+    ["a byte-order mark", "﻿"],
+    ["an interlinear annotation", "￹"],
+  ]) {
+    assert.equal(cleanText(`a${ch}b`), "a b", `${label} is a space on a card, not a character`)
+  }
+})
+
+test("a 200 with nothing in it is a failure with a reason, not a crash", async () => {
+  // text() empty is its own branch: JSON.parse("") would throw, so the plugin
+  // decides on the empty string first. A card that says nothing at all over a
+  // blank 200 would be worse than a sentence.
+  const p = await CodarPlugin()
+  const blank = () => new Promise((ok) => ok(new Response("", { status: 200 })))
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => (String(url).includes("/v1/gettoken") ? blank() : blank())
+  try {
+    const u = await p.auth.usage(auth)
+    assert.match(u.error, /不是 JSON|失败/, "a blank answer is said as what it is")
+    assert.ok(u.error, "and not as an empty card")
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test("a status or activity read that never answers does not sink the card", async () => {
+  // Both are extra information: the points read is the card. Their promises
+  // are read through allSettled, so a rejection (a timeout, a dropped socket)
+  // is dropped while the card still comes out of the points. Only the
+  // answered-with-500 shape was pinned; the rejected one was read from code.
+  const p = await CodarPlugin()
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    const u = String(url)
+    if (u.includes("/v1/gettoken")) return new Response(JSON.stringify({ code: 200, token: 77, agent_token: 5 }), { status: 200 })
+    throw new TypeError("fetch failed")
+  }
+  try {
+    const u = await p.auth.usage(auth)
+    assert.equal(u.error, undefined, "the points still make a card")
+    assert.match(u.balance, /77 点/, "with the balance they answered")
+    assert.equal(u.windows.filter((w) => w.name === "每日签到").length, 0, "a status read that never came back draws no row")
+    assert.equal(u.windows.filter((w) => w.name.startsWith("免费模型")).length, 0, "and neither does an activity read")
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test("a concurrency on the catalog envelope itself is read too", () => {
+  // publishedConcurrency reads three places for the number: the body, the
+  // catalog wrapper, and each model. Only the first and the last had a test,
+  // so the wrapped spelling could have been dropped in silence.
+  assert.equal(publishedConcurrency({ catalog: { max_concurrency: 4, data: [{ id: "a" }] } }), 4, "a count on the catalog wrapper is a count")
+  assert.equal(publishedConcurrency({ catalog: { max_concurrency: 6, data: [{ max_concurrency: 9 }] } }), 6, "and the smallest of all of them still wins")
+})
+
+test("a word where a number belongs is not a wait, on any of the four fields", () => {
+  // numOf accepts numbers and numeric strings; a boolean, an array and an
+  // object are none of them. Every field read with it had its own guard, but
+  // the reader itself was only pinned through secsOf. On an activity the
+  // wrong answer is silent: the activity is still drawn, with "不限量" the
+  // vendor never said — or, worse, it disappears because true > 0 fails as a
+  // time.
+  const now = Math.floor(Date.now() / 1000)
+  const running = runningActivities({
+    code: 200,
+    data: [
+      { free_until: now + 3600, remaining_quota: true, user_quota_limit: true, model_ids: ["a"] },
+      { free_until: [now + 3600], remaining_quota: null, model_ids: ["b"] },
+      { free_until: { at: now + 3600 }, remaining_quota: null, model_ids: ["c"] },
+    ],
+  })
+  assert.equal(running.length, 1, "a boolean, an array and an object are not times")
+  assert.equal(secsOf(true), 0, "and it is the reading that refuses them, not a comparison that happens to")
 })

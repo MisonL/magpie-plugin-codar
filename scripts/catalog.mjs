@@ -186,7 +186,9 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
     // a thrown fetch and an unparseable body are the same failure: the vendor
     // did not answer with a list, so there is nothing here to compare. The
     // token is cut from what is said, in case an error names it anyway.
-    return fail(`GET ${CATALOG_PATH} 没读成（${whyOf(e).split(sent).join("…")}）：这是取数的失败，不是目录过时`)
+    // 按形状切，不只按这把令牌精确切：服务器可能把令牌折行、插空格，或只回显
+    // payload 段地引回来，精确子串匹配挡不住（见 index.mjs 的 jwtShape）。
+    return fail(`GET ${CATALOG_PATH} 没读成（${rules.scrubLine(whyOf(e), sent)}）：这是取数的失败，不是目录过时`)
   }
 
   const rows = await recordsOf(body)

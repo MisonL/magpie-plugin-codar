@@ -161,7 +161,13 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   claimed: a `400` naming "24小时内仅可领取一次" beside `success: false` is
   that client's "today is in", and reading it as a failure would have magpie
   retry the rest of the day every 30 minutes while the card said the check-in
-  failed. A refusal's words print a code only where the vendor stated one:
+  failed. That note is read in the vendor's English too ("Already signed"),
+  and so is a wording it has never used: a `400` (or a `200` saying the same
+  thing) beside a readable `retry_after` is that day as well — a 400 that
+  still knows when the next claim opens is not a failure, whatever sentence
+  it came with. The words are matched before the card's 400-character cut, so
+  a sentence buried past it is still found. A refusal's words print a code
+  only where the vendor stated one:
   with no code in the body there is no code in the sentence (it used to read
   "签到失败（code ?）", a question mark the user cannot act on). The check-in's
   words — including that "already claimed" note that tells a claim from a
@@ -171,7 +177,10 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   and a points refusal is said in those same words. The check-in's credit is
   the sum of both balances' increases between its two reads — the vendor says
   a claim grants "点数奖励" without saying which balance holds it — and a
-  balance that fell (the app spending) is not subtracted from it.
+  balance that fell (the app spending) is not subtracted from it. A string
+  shown on a card — a model's name, a message — is cut to fit by the
+  character, not by the UTF-16 unit, so a name full of emoji never ends in
+  half a character.
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card
@@ -189,7 +198,10 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   back.
 - Models you add to this provider yourself (ids the embedded catalog does not
   have) are kept when the vendor's list refreshes; the vendor's own entries
-  follow the vendor. A config model entry that is not a plain object (a null,
+  follow the vendor. An entry of yours that names no `id` is given its key as
+  one — the host builds each model row from `m.id`, and an entry without one
+  would be a model with no name; an `id` you did write is never replaced by
+  the key. A config model entry that is not a plain object (a null,
   a string, an array) is dropped rather than passed on: the host builds every
   provider's row from that map in one Promise.all, and one such entry throws —
   taking the whole provider list down, not just that entry.
@@ -224,7 +236,12 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   text, but has no wallet reading for routing to go on.
 - A free-model activity is drawn by the vendor app's own rule — `free_until`
   in the future, and a `remaining_quota` that isn't spent — not by its
-  `status` field, which the app doesn't read. It is `aside` — using it up
+  `status` field, which the app doesn't read. Its numbers are read the way
+  every other vendor number here is (a number, or a string that says one), so
+  a time or a quota the vendor spells as text is still read rather than
+  making the activity vanish from the card. An end past the calendar is not a
+  reason to drop a running activity: it still is one, and is drawn without a
+  time. It is `aside` — using it up
   only sends those models back to points, it doesn't stop the account — and
   carries `amount`/`limit` when the vendor states a total
   (`user_quota_limit`) *and* what is left of it: only then is the share a
@@ -267,7 +284,10 @@ The generator writes its records with the plugin's own `catalogOf`, so the
 fallback file and the live list are read the same way (a size the vendor
 spells as a string is a size on both paths; a name is a cleaned card line on
 both). `--check` compares the records field by field, so a reordered key or a
-reworded comment is not drift. Its exit codes keep the two failures apart: 0
+reworded comment is not drift. Its error messages cut a credential out by the
+token's shape, as the plugin's own messages do, so a server that wraps the
+token or quotes back only part of it cannot get it into a CI log. Its exit
+codes keep the two failures apart: 0
 is "nothing moved", 1 means a record moved and the file wants regenerating,
 and 2 is "the vendor or the file could not be read" — a run that fails to
 fetch writes nothing rather than emptying the fallback, and an answer naming

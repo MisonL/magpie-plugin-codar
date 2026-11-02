@@ -134,8 +134,11 @@ const checkinWaitSecs = (v) => {
 
 // ALREADY_CLAIMED is how the vendor words "this day is already claimed": its
 // 400 says 24小时内仅可领取一次, and the same words on an answer that names no
-// code mean the same thing.
-const ALREADY_CLAIMED = /24\s*小时|仅可领取一次/
+// code mean the same thing. Its answers come back in English too (the status
+// endpoint's "Already signed" is one), so both languages are read here, and
+// the pairing in the check-in (a 400 beside a readable retry_after) covers a
+// wording this list has never seen.
+const ALREADY_CLAIMED = /24\s*小时|仅可领取一次|once\s+(?:every|in|per)\s+(?:a\s+)?(?:24\s*(?:hours?|h)|day)|already\s+(?:claimed|signed|checked)/i
 
 // MAX_MODELS is how many models one vendor catalog may bring back. The host
 // passes a hook's answer to Go as a single JSON line and kills the whole
@@ -241,7 +244,11 @@ const controlChars =
 
 // cleanText is a vendor string as a card can show it: control characters
 // out, one line (runs of spaces folded), and never longer than a card reads.
-const cleanText = (s) => String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim().slice(0, 120)
+// The cut is by code point, not by code unit: 120 UTF-16 units can end in the
+// middle of a surrogate pair, and a lone high surrogate is a character no one
+// wrote — JSON.stringify writes it as \ud83d and the host's decoder reads it
+// as U+FFFD.
+const cleanText = (s) => Array.from(String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim()).slice(0, 120).join("")
 
 // jwtShape is a credential as a server might quote it back. Every Codar token
 // is a JWT, and every JWT segment is base64url. A server can wrap the token
@@ -625,9 +632,25 @@ const runningActivities = (body) => {
   const now = Date.now() / 1000
   return list.filter((a) => {
     if (!a || typeof a !== "object") return false
-    if (typeof a.free_until !== "number" || a.free_until <= now) return false
-    // a quota that says it's exhausted means these models aren't free
-    if (a.remaining_quota != null && (typeof a.remaining_quota !== "number" || a.remaining_quota <= 0)) return false
+    // the same reading every other number here gets (numOf): a time the
+    // vendor spells as a string is a time, not a missing one, and one no
+    // calendar can state (1e999 reads as Infinity) is still a running
+    // activity — the window below draws it without an end rather than
+    // dropping a campaign over a number it cannot write down. Read as "not a
+    // number" the activity vanished from the card without a word.
+    const until = numOf(a.free_until)
+    // `>` is false for a value that says no number at all (NaN) and for an
+    // end already past, and true for an end past the calendar: 1e999 reads
+    // as Infinity, and Infinity is in the future. The vendor's own client
+    // rejects only a non-number, and a future it cannot write down is still
+    // a future — the window below draws it without a time rather than
+    // dropping a campaign over a number nobody can spell.
+    if (!(until > now)) return false
+    // a quota that says it's exhausted means these models aren't free; one
+    // that says nothing readable is not an exhausted one (the window below
+    // reads the same field with numOf, so both stages agree on what "said" is)
+    const quotaLeft = numOf(a.remaining_quota)
+    if (a.remaining_quota != null && Number.isFinite(quotaLeft) && quotaLeft <= 0) return false
     return true
   })
 }
@@ -813,8 +836,27 @@ export async function CodarPlugin(input) {
         //（活动接口就是这种形状）也是同一句话。文案按客户端的读法（saidBy，
         // 8 拼写）取。这句要先算：它是对「这一天」的陈述，比下面任何一个
         // 「这一次」的旗标都更能决定 outcome（见 success:false 那段）。
-        const said = signMessage(r, token)
-        const already = ALREADY_CLAIMED.test(said) && (code === 400 || !Number.isFinite(code))
+        //
+        // 两种读法，任一成立就算这一天已领：文案认得出（中英文都认，见
+        // ALREADY_CLAIMED），或者「400 加一个读得懂的 retry_after」这一对——
+        // 滚动 24 小时的窗口里，400 还给得出下次可领的秒数，几乎只可能是今天
+        // 已经领了。文案认不出（换了语言、换了措辞，或 400 之前垫了长噪声）时，
+        // 这一对数还在。文案判在没被截断的 words 上：said 是给卡片看的 400 字
+        // 以内版本，厂商那句话排在后面时整句就没了。
+        const words = saidBy(r)
+        const said = scrub(words, token)
+        const earlySecs = checkinWaitSecs(r?.data?.retry_after)
+        const refused = code === 400 || !Number.isFinite(code)
+        // The words say the day is claimed on the codes that can carry that
+        // statement: 200 (it already went through), 400 (today's wording),
+        // or no code at all. They do not on a 500/503 — that is a server
+        // failure that happened to repeat the sentence, and reading it as
+        // `done` would settle the day off an error. 401/403 keep meaning
+        // "sign in again", never a claim. A 200 beside the words is the one
+        // shape that used to fall through to "just claimed" with a credit of
+        // 0 over a day that was already settled.
+        const wordsSaid = ALREADY_CLAIMED.test(words) && (code === 400 || code === 200 || !Number.isFinite(code))
+        const already = wordsSaid || (refused && Boolean(earlySecs))
         // 只有一处不听客户端的：应答自己说 `success: false`（厂商在活动接口
         // 上用的就是这个旗标）时算失败，无论带没带 code——code:200 配
         // success:false 正是「HTTP 层说好、业务层说不」。**但不压过「已领
@@ -844,7 +886,7 @@ export async function CodarPlugin(input) {
           // 31 年）和日历写不出的数都不是「可信的时刻」，和厂商没说一样落到
           // 30 分钟的保质期；照单全收会把这一天结清到 2058 年。见
           // checkinWaitSecs（一周）与 safeTime（年 9999）。
-          const secs = checkinWaitSecs(r?.data?.retry_after)
+          const secs = earlySecs
           const wait = secs ? humanSecs(secs) : ""
           const waitSecs = secs || 30 * 60
           const hold = safeTime(Date.now() + waitSecs * 1000)
@@ -981,11 +1023,13 @@ export async function CodarPlugin(input) {
             const ids = Array.isArray(a.model_ids) ? a.model_ids.filter((x) => typeof x === "string").map(cleanText).filter(Boolean) : []
             // 两个数都要有限：1e999 是合法的 JSON，读出来却是 Infinity，
             // 拿去算份额会得到 NaN，卡片上就写「已用 Infinity / Infinity」。
-            const cap = typeof a.user_quota_limit === "number" && isFinite(a.user_quota_limit) && a.user_quota_limit > 0 ? a.user_quota_limit : null
+            const capSaid = numOf(a.user_quota_limit)
+            const cap = Number.isFinite(capSaid) && capSaid > 0 ? capSaid : null
             // named for what it is: `left` would shadow the usage hook's own
             // left() budget function two scopes up, and the next caller of
             // opts() in here would get a TypeError instead of a timeout
-            const quotaLeft = typeof a.remaining_quota === "number" && isFinite(a.remaining_quota) ? a.remaining_quota : null
+            const leftSaid = numOf(a.remaining_quota)
+            const quotaLeft = Number.isFinite(leftSaid) ? leftSaid : null
             // 「已用」只在两个数都在、且互相说得通时才算得出来：剩下比总额还多，
             // 是两个数在说两件事（厂商报的是池子，不是这次活动），相减只会造出
             // 一个 0，卡片写「已用 0 / 100」而厂商说还剩 150——不如把剩下的照说。
@@ -1066,6 +1110,11 @@ export async function CodarPlugin(input) {
     "chat.headers": async (input, out) => {
       const owner = input?.model?.providerID ?? input?.provider?.info?.id
       if (owner !== ID) return
+      // host.js hands in `{headers: {}}`, but the hook is the one place a
+      // missing bag would throw inside another provider's request path; make
+      // one instead of assuming it.
+      if (!out || typeof out !== "object") return
+      if (!out.headers || typeof out.headers !== "object") out.headers = {}
       out.headers["User-Agent"] = UA_SIDECAR
     },
 
@@ -1117,7 +1166,11 @@ export async function CodarPlugin(input) {
         // 模型字段同名的键，这里是它的兄弟入口（合并发生在模型的上一层）。
         // 没有模型叫这些名字，丢掉不损失什么。
         if (MAGIC_KEYS.has(id)) continue
-        merged[id] = models[id] ? mergeModel(models[id], m) : m
+        // 用户手写的条目可以不带 id——键就是 id。宿主建这一行时读 m.id，一个
+        // undefined 的 id 就是一条没有名字的模型；补上键而不是丢掉这条，因为
+        // 他写的是自己要的模型。
+        const entry = models[id] ? mergeModel(models[id], m) : m
+        merged[id] = typeof entry?.id === "string" && entry.id.trim() ? entry : { ...entry, id }
       }
       config.provider[ID] = {
         ...was,
@@ -1130,6 +1183,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
 
 export default CodarPlugin
