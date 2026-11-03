@@ -25,7 +25,7 @@
 import { CATALOG } from "./catalog.mjs"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join, relative, sep } from "node:path"
 
 const ID = "codar"
 
@@ -152,11 +152,27 @@ const checkinWaitSecs = (v) => {
 // wording this list has never seen.
 const ALREADY_CLAIMED = /24\s*小时|仅可领取一次|once\s+(?:every|in|per)\s+(?:a\s+)?(?:24\s*(?:hours?|h)|day)|already\s+(?:claimed|signed|checked)/i
 
+// MAX_SCRUB_CHARS is how much of a vendor's string the cleaners look at.
+// cleanText and scrubLine both run global regexes over vendor text, and V8's
+// engine recurses while matching them: measured 2026-11-03, an 8 MB run of
+// "eyJ"+"a " (or of one long word, or of a bare HS256 signature) throws
+// RangeError "Maximum call stack size exceeded" out of the usage hook, and an
+// 8 MB name of newlines or control characters took 2.5 s to fold. The same
+// text clipped to 8k runs in about a millisecond. A card shows 120 characters
+// and a 400-character message; 8k leaves room for a vendor that pads its
+// prose, and a credential a server quotes back sits where its message is.
+const MAX_SCRUB_CHARS = 8192
+
 // MAX_MODELS is how many models one vendor catalog may bring back. The host
 // passes a hook's answer to Go as a single JSON line and kills the whole
 // plugin host — every plugin in it — when that line passes 32 MiB
 // (host.go's maxWireLine); an unbounded list is a way for a vendor to take
 // the host down with data rather than with a bug. Codar lists 17.
+//
+// The same number bounds the entries catalogOf looks at, not just the ones it
+// keeps: with the cap on kept records only, a list whose every record is
+// malformed — a shape the vendor could send by accident — was walked to the
+// end, entry by entry, for nothing. Every real catalog is far below this.
 const MAX_MODELS = 2000
 
 // MAX_ACTIVITY_WINDOWS is how many free-model activities go on the card.
@@ -261,31 +277,68 @@ const controlChars =
 // is not broken into a lone surrogate (JSON.stringify writes one as \ud83d and
 // the host's decoder reads it as U+FFFD). A vendor name and a vendor message
 // both come through here, so they break at the same place.
-const cut = (s, n) => (s.length <= n ? s : Array.from(s).slice(0, n).join(""))
+//
+// The walk is over s.slice(0, 2 * n), not the whole string: n code points take
+// at most 2n UTF-16 units, so nothing that belongs in the answer is past 2n,
+// and a vendor's 8 MB sentence costs a 2n-unit array rather than an 8M-entry
+// one (measured before this: 156 ms and 76 MB of heap for 8 MB). A surrogate
+// pair straddling the 2n boundary becomes a lone surrogate — always after the
+// n code points taken, so it never reaches the answer.
+const cut = (s, n) => (s.length <= n ? s : Array.from(s.slice(0, 2 * n)).slice(0, n).join(""))
 
 // cleanText is a vendor string as a card can show it: control characters
 // out, one line (runs of spaces folded), and never longer than a card reads.
-const cleanText = (s) => cut(String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim(), 120)
+// Only the first MAX_SCRUB_CHARS characters are cleaned: a card shows 120,
+// and folding the runs of a multi-megabyte name cost seconds in a host every
+// plugin shares (measured 2026-11-03: 2.5 s for an 8 MB name of newlines and
+// control characters). The cut below drops the rest anyway, so the tail is
+// never read — a 120-character answer needs at most 120 characters of input
+// plus whatever folding removes, and 8k leaves room for a vendor that pads.
+const cleanText = (s) => cut(String(s).slice(0, MAX_SCRUB_CHARS).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim(), 120)
 
 // jwtShape is a credential as a server might quote it back. Every Codar token
 // is a JWT, and every JWT segment is base64url. A server can wrap the token
 // at any column or insert whitespace anywhere in the message; the shape must
 // match both intact tokens and the same token split with spaces/newlines.
-// The pattern matches an eyJ-started segment, then dot-separated segments.
-// Whitespace between chunks of base64url inside a segment is allowed, so the
-// whole token cuts regardless of where lines were inserted. A real JWT
-// requires two dots; we allow 0–2 extra segments for safety. Prose beginning
-// with eyJ would also be cut, but that's acceptable in an error message where
-// failing closed (removing more rather than less) matters.
-const jwtShape = /eyJ[\w-]*(?:\s+[\w-]+)*(?:\s*\.\s*[\w-]+(?:\s+[\w-]+)*){0,2}/g
+//
+// The first alternative is the token itself: an eyJ-started segment, then
+// dot-separated segments, whitespace allowed inside either (so the whole
+// token cuts regardless of where lines were inserted). The second is the same
+// token with its eyJ head eaten — a message that swallowed the first letter
+// ("…ror: bGciOiJIUzI1NiJ9.eyJzdWIi…") still leaves a usable credential, and
+// it is dot-separated base64url just the same; the 16-character floor on both
+// segments keeps host names and file names out of it. The third is a
+// signature segment quoted on its own: 40+ base64url characters (a HS256
+// signature is 43) carrying an upper case, a lower case and a digit, which
+// words and all-lowercase hex hashes do not. A real JWT requires two dots; we
+// allow 1–2 extra segments for safety, and prose that happens to fit these
+// shapes will be cut too — acceptable in an error message, where failing
+// closed (removing more rather than less) matters.
+const jwtShape =
+  /eyJ[\w-]*(?:\s+[\w-]+)*(?:\s*\.\s*[\w-]+(?:\s+[\w-]+)*){0,2}|(?<![\w-])[\w-]{16,}(?:\s*\.\s*[\w-]{16,}){1,2}(?![\w-])|(?<![\w-])(?=[\w-]{40})(?=[\w-]{0,39}\d)(?=[\w-]{0,39}[A-Z])(?=[\w-]{0,39}[a-z])[\w-]{40,}(?![\w-])/g
 
 // configPath is where the Codar app keeps its own config. The app takes
 // CODAR_HOME over the home directory when it is set (its sidecar's
 // `codar config path` says so), so the file is looked for in the same
-// place the app would have written it.
+// place the app would have written it — value verbatim, not trimmed:
+// `CODAR_HOME="  /tmp/x  "` answers `  /tmp/x  /config.json` from the
+// sidecar (measured against the installed app), so a plugin that trimmed
+// would read a file the app never wrote. An empty value is the app's
+// "not set" and falls back to ~/.codar.
 const configPath = () => {
-  const home = String(process.env.CODAR_HOME ?? "").trim()
+  const home = String(process.env.CODAR_HOME ?? "")
   return join(home || join(homedir(), ".codar"), "config.json")
+}
+
+// shownPath is a local path as a sign-in message may say it: under the home
+// directory the home part is written ~, so a dialog read off a screenshot or
+// pasted into an issue carries no account name. Any other path is the user's
+// own choice (CODAR_HOME, a test's temp dir) and is said as it is.
+const shownPath = (file) => {
+  const home = homedir()
+  if (!home) return file
+  const rel = relative(home, file)
+  return rel && !rel.startsWith("..") && !isAbsolute(rel) ? `~${sep}${rel}` : file
 }
 
 // appToken reads the token the Codar desktop app keeps, for the "read from
@@ -295,27 +348,30 @@ const configPath = () => {
 // is the app's, and the plugin never writes it. A failure says why in words
 // the sign-in dialog can show, since this runs where no card exists yet.
 function appToken(file = configPath()) {
+  // 错误文案里写 ~/.codar/config.json 而不是本机完整路径：登录对话框会出现在
+  // 截图、录屏和 issue 里，主目录那一段带着用户名。
+  const shown = shownPath(file)
   let text
   try {
     text = readFileSync(file, "utf8")
   } catch (e) {
     // 不存在和读不了是两回事：让人「先登录一次科搭」修不好权限问题，指过去
     // 只会白跑一趟。
-    if (e?.code === "ENOENT") return { error: `没找到 ${file}，先在这台机器上登录一次科搭，或改用「科搭访问令牌」粘贴` }
-    return { error: `读不了 ${file}（${e?.code ?? whyOf(e)}），检查文件权限后重试，或改用「科搭访问令牌」粘贴` }
+    if (e?.code === "ENOENT") return { error: `没找到 ${shown}，先在这台机器上登录一次科搭，或改用「科搭访问令牌」粘贴` }
+    return { error: `读不了 ${shown}（${e?.code ?? whyOf(e)}），检查文件权限后重试，或改用「科搭访问令牌」粘贴` }
   }
   let token = ""
   try {
     token = String(JSON.parse(text)?.provider?.speedai?.token ?? "").trim()
   } catch {
-    return { error: `${file} 读不出 JSON，可能损坏了；改用「科搭访问令牌」粘贴` }
+    return { error: `${shown} 读不出 JSON，可能损坏了；改用「科搭访问令牌」粘贴` }
   }
-  if (!token) return { error: `${file} 里没有 provider.speedai.token；先在这台机器上登录一次科搭，或改用粘贴` }
-  if (!tokenOf({ type: "api", key: token })) return { error: `${file} 里的令牌无法识别；改用「科搭访问令牌」粘贴` }
+  if (!token) return { error: `${shown} 里没有 provider.speedai.token；先在这台机器上登录一次科搭，或改用粘贴` }
+  if (!tokenOf({ type: "api", key: token })) return { error: `${shown} 里的令牌无法识别；改用「科搭访问令牌」粘贴` }
   // every call this plugin makes sends the account name from the token's
   // own claims; one without it would be saved and then fail on the card
-  if (!usernameOf(token)) return { error: `${file} 里的令牌没有账号名；打开一次科搭重新登录，或改用「科搭访问令牌」粘贴` }
-  if (expired(token)) return { error: `${file} 里的令牌已过期；打开一次科搭让它续期，再试一次` }
+  if (!usernameOf(token)) return { error: `${shown} 里的令牌没有账号名；打开一次科搭重新登录，或改用「科搭访问令牌」粘贴` }
+  if (expired(token)) return { error: `${shown} 里的令牌已过期；打开一次科搭让它续期，再试一次` }
   return { token }
 }
 
@@ -333,6 +389,50 @@ const saidBy = (body) => {
     if (typeof said === "string" && said.trim()) return said
   }
   return ""
+}
+
+// MAX_ANSWER_BYTES is how much of a vendor's answer request() reads before it
+// gives up. Every endpoint this plugin calls answers in kilobytes (the whole
+// catalog is tens of them); a body past this is not an answer we could use,
+// and holding it costs the host — one process shared by every plugin — memory
+// in the size of whatever the vendor sends. 8 MiB is ~200× the catalog.
+const MAX_ANSWER_BYTES = 8 * 1024 * 1024
+
+// readAnswer is a Response's body as text, refusing one larger than
+// MAX_ANSWER_BYTES. The read goes through the body stream so the limit is
+// applied while reading rather than after: res.text() holds the whole answer
+// first, whatever its size. A Response that offers no stream (a stub in a
+// test) falls back to text().
+const readAnswer = async (res) => {
+  const stream = res.body
+  if (!stream || typeof stream.getReader !== "function") return { text: await res.text() }
+  const reader = stream.getReader()
+  const chunks = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value) continue
+    total += value.byteLength
+    if (total > MAX_ANSWER_BYTES) {
+      // telling the server to stop; an implementation that cannot is not a
+      // reason to fail differently
+      try {
+        await reader.cancel()
+      } catch {}
+      throw new ApiError(`厂商应答超过 ${MAX_ANSWER_BYTES / 1024 / 1024} MB，已放弃`, 0)
+    }
+    chunks.push(value)
+  }
+  // decoded once, at the end: a chunk boundary can fall inside a multi-byte
+  // character, and per-chunk decoding would turn it into U+FFFD
+  const all = new Uint8Array(total)
+  let at = 0
+  for (const c of chunks) {
+    all.set(c, at)
+    at += c.byteLength
+  }
+  return { text: new TextDecoder().decode(all) }
 }
 
 async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_MS, fetchImpl = fetch, ua = UA_DESKTOP } = {}) {
@@ -353,7 +453,7 @@ async function request(url, { method = "GET", body, token, timeoutMs = TIMEOUT_M
     // Bun's network fetch drop it from text(), but the fetch the host hands
     // in need not, so it is dropped here too: one line, one guarantee less
     // that depends on which fetch answered.
-    const text = (await res.text()).replace(/^\uFEFF/, "")
+    const text = (await readAnswer(res)).text.replace(/^\uFEFF/, "")
     let data = null
     try {
       data = text ? JSON.parse(text) : null
@@ -438,7 +538,14 @@ const pointsOf = async (token, username, opts) => {
   // reads the balances. Only `>= 400` was refused here, so a refusal spelled
   // with a smaller code ({code: 1, token: 0}) read as a balance of 0 and the
   // card said the account was spent.
-  const code = Number(r?.code)
+  //
+  // numOf, not Number: Number({toString:1}) calls the object's toString and
+  // Number({valueOf:…}) calls valueOf, so a vendor answering {"code":{…}}
+  // threw out of the hook — no card, no message, just a failed read. numOf
+  // reads only numbers and non-blank strings, and answers NaN for everything
+  // else, which the isFinite guard below treats as "no code", as the vendor's
+  // own client does when the field is missing.
+  const code = numOf(r?.code)
   if (Number.isFinite(code) && code !== 200) {
     // 拒绝的话按厂商客户端的读法（app.asar 的 vo）取：message/msg/error/detail
     // 与 data 下同样四个字段里第一个有字的——只读 message 会丢掉 msg 或 data 里
@@ -476,7 +583,7 @@ const AGENT_BALANCE_NAMES = ["balance", "points", "agent_balance", "agent_token"
 // refuses to do.
 const agentPointsOf = async (token, username, opts) => {
   const r = await request(`${ACCOUNT}${AGENT_POINTS_PATH}`, { method: "POST", body: { username }, token, ...opts })
-  const code = Number(r?.code)
+  const code = numOf(r?.code) // an object code must not throw (see pointsOf)
   if (Number.isFinite(code) && code !== 200) {
     const said = saidBy(r).trim()
     throw new ApiError(code === 401 || code === 403 ? "登录已过期，请重新登录" : said || `点数查询失败（code ${code}）`, code)
@@ -645,8 +752,12 @@ function catalogOf(body) {
   const list = body?.catalog?.data ?? body?.data ?? null
   if (!Array.isArray(list)) return null
   const out = []
+  let examined = 0
+  // examined counts every record looked at, kept or dropped; out.length alone
+  // never reaches the cap on a list of records that all fail the checks below,
+  // and the walk would run to the end of whatever the vendor sent.
   for (const m of list) {
-    if (out.length >= MAX_MODELS) break
+    if (out.length >= MAX_MODELS || ++examined > MAX_MODELS) break
     // a record that is not a plain object (the list held a null, a boolean,
     // a bare number, an array) is left out: it has no id to serve, and the
     // host reads the list this hook answers with while it builds every
@@ -702,7 +813,7 @@ const runningActivities = (body) => {
   // 200 的应答是拒绝，哪怕它还带着一份 data——照画就会把根本不在跑的活动
   // 报成免费。今天的应答体没有 code，只有 {data,message,success}，这道关
   // 对它无事可做；厂商哪天带上 code 的拒绝，这里也跟它的客户端一样挡住。
-  const code = Number(body?.code)
+  const code = numOf(body?.code) // an object code must not throw (see pointsOf)
   if (Number.isFinite(code) && code !== 200) return []
   const list = Array.isArray(body?.data) ? body.data : []
   const now = Date.now() / 1000
@@ -782,11 +893,16 @@ const gain = (was, now) => (was != null && now != null && now >= was ? now - was
 // where it is known, then anything credential-shaped where it is not (a
 // getAuth that threw leaves no key to cut by). A token a server spliced a
 // space or newline into is still cut — jwtShape lets whitespace fall anywhere
-// inside a segment, and every Codar token is a JWT.
+// inside a segment, and every Codar token is a JWT. Only the first
+// MAX_SCRUB_CHARS characters are cleaned (see the constant); nothing past
+// them could reach a card or a log line, and cleaning them would cost
+// seconds on a multi-megabyte sentence. The key is cut over the whole string
+// first, so a token the vendor split around the boundary is still removed
+// where its parts are.
 const scrubLine = (said, key) => {
   let text = typeof said === "string" ? said : ""
   if (key) text = text.split(key).join("…")
-  return text
+  return text.slice(0, MAX_SCRUB_CHARS)
     .replace(controlChars, " ")
     .replace(jwtShape, "…")
     .replace(/\s{2,}/g, " ")
@@ -803,9 +919,11 @@ const scrub = (said, token) => cut(scrubLine(said, String(token ?? "")), 400)
 const signMessage = (r, token) => scrub(saidBy(r), token)
 
 export async function CodarPlugin(input) {
-  // 每次调用现取，而不是建插件时抓一个：宿主给不给 fetch 都可能，测试也会
-  // 在这之后换掉全局的那个。
-  const fetchImpl = (...args) => (input?.fetch ?? globalThis.fetch)(...args)
+  // 每次调用现取，而不是建插件时抓一个：测试会在这之后换掉全局那个。宿主
+  // 不往 input 里放 fetch——host.js 的 loadPlugins 交过来的是 client/project/
+  // directory/worktree/experimental_workspace/serverUrl/$/magpie——所以读的
+  // 就是 globalThis.fetch，没有第二条路。
+  const fetchImpl = (...args) => globalThis.fetch(...args)
 
   // 并发数：厂商目前哪个接口都不说（实测 2026-10-27 的目录、pricing、429
   // 响应里都没有这个数），默认值 3 是量出来的——同时发 4 个，第 4 个收到
@@ -902,7 +1020,7 @@ export async function CodarPlugin(input) {
           return { outcome: "failed", message: scrub(whyOf(e), token) || "签到失败" }
         }
 
-        const code = Number(r?.code)
+        const code = numOf(r?.code) // an object code must not throw (see pointsOf)
         // 成功的判据与厂商客户端一致（app.asar 的 k0 只调 ft）：数字码不是
         // 200 才算拒绝，没带 code 的应答算领到了——今天的成功应答带 code:200，
         // 但这个厂商的活动接口就是不带 code 的（只有 {data,message,success}），
@@ -1065,7 +1183,7 @@ export async function CodarPlugin(input) {
         // false}} 会被画成「现在可以领」——厂商自己这时只会说查询失败。
         // 这一行是附加信息，画不出来就不画，卡片照报点数。
         const status = statusR.status === "fulfilled" ? statusR.value : null
-        const statusCode = Number(status?.code)
+        const statusCode = numOf(status?.code) // an object code must not throw (see pointsOf)
         const data = Number.isFinite(statusCode) && statusCode !== 200 ? undefined : status?.data
         // a boolean or a plain object, as the vendor's client reads it: an
         // array is an object too, and drawing a row over one says "今天还没
@@ -1183,8 +1301,13 @@ export async function CodarPlugin(input) {
           const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl })
           const list = catalogOf(body)
           if (!list) return Object.assign(given, { [Symbol.for("magpie.fellBack")]: true })
-          // 厂商哪天在目录里说了并发数，就按它排队（见上面 vendorConcurrency）
-          vendorConcurrency = publishedConcurrency(body)
+          // 厂商哪天在目录里说了并发数，就按它排队（见上面 vendorConcurrency）。
+          // 只在目录真的说了个数时才改：publishedConcurrency 对「没说」的目录
+          // 答 0，无条件赋值会把它抹回默认的 3，于是一个已经给出过 7 的厂商
+          // 只要某次目录里少了这个字段（代理拼的目录、厂商灰度），限额就被
+          // 悄悄降回 3。说了 0 个字段不等于说了「1」或「3」。
+          const statedConcurrency = publishedConcurrency(body)
+          if (statedConcurrency) vendorConcurrency = statedConcurrency
           // 厂商的目录对自家的模型说了算；用户自己往这个供应商里加的条目
           // （内嵌目录里没有的 id）在刷新后留着，config 钩子也是这么合并的。
           // 每个模型去哪发，沿用宿主已经解析好的地址（用户设过的 api，可能是
@@ -1284,6 +1407,6 @@ export async function CodarPlugin(input) {
   }
 }
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, request, appToken, configPath, cleanText, magicKeys: MAGIC_KEYS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, request, readAnswer, appToken, configPath, shownPath, cleanText, magicKeys: MAGIC_KEYS, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
 
 export default CodarPlugin

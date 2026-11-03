@@ -11,7 +11,7 @@ import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, payloadOf, request, appToken, configPath, cleanText } = testables
+const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, MAX_MODELS, MAX_ANSWER_BYTES } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -3771,4 +3771,185 @@ test("the first balance read's agent figure wins over the second one", async () 
     async () => p.auth.usage(auth),
   )
   assert.equal(u.balance, "500 点 · Agent 4000 点 可用", "the first read's figure, as the vendor's client merges them")
+})
+
+test("cut reads only the first 2n units of a vendor's string", () => {
+  // A vendor sentence is cut to 120/400 characters, but the walk used to
+  // flatten the whole string into an array first: 32 MB of text cost ~1 s
+  // and ~350 MB of heap, in a host every plugin shares. n code points take
+  // at most 2n UTF-16 units, so nothing the answer keeps is past 2n.
+  const big = Buffer.alloc(16 * 1024 * 1024, 0x61).toString("latin1")
+  const t = process.hrtime.bigint()
+  const out = cut(big, 400)
+  const ms = Number(process.hrtime.bigint() - t) / 1e6
+  assert.equal(out.length, 400, "still 400 characters")
+  assert.ok(ms < 200, `16 MB took ${ms.toFixed(1)} ms; the walk should not touch the tail of the string`)
+})
+
+test("a character straddling the 2n boundary is not cut in half", () => {
+  // The early slice can end inside a surrogate pair; that lone surrogate is
+  // always the code point after the n taken, so it never reaches the answer.
+  for (const s of ["a" + "😀".repeat(6), "😀".repeat(6) + "b", "ab😀cd", "x😀y😀z"]) {
+    const byChar = [...s]
+    for (let k = 0; k <= byChar.length + 1; k++) {
+      const out = cut(s, k)
+      assert.equal(out, byChar.slice(0, k).join(""), `${JSON.stringify(s)} cut to ${k} is the same as the code-point cut`)
+      assert.doesNotMatch(out, /[\uD800-\uDBFF]$/, `${k}: no lone high surrogate`)
+      assert.doesNotMatch(out, /^[\uDC00-\uDFFF]/, `${k}: no lone low surrogate`)
+    }
+  }
+})
+
+test("catalogOf stops looking after MAX_MODELS records, kept or not", () => {
+  // The cap was on records kept; a list whose every record is unusable — a
+  // shape the vendor could send by accident — was walked to the end, entry
+  // by entry. The counter reads each element through a getter to show where
+  // the walk stopped.
+  const junk = []
+  let reads = 0
+  for (let i = 0; i < MAX_MODELS * 3; i++) {
+    Object.defineProperty(junk, i, { get() { reads++; return null }, enumerable: true, configurable: true })
+  }
+  assert.equal(junk.length, MAX_MODELS * 3)
+  assert.equal(catalogOf({ data: junk }), null, "nothing usable is still a fallback, not an empty catalog")
+  assert.ok(reads <= MAX_MODELS + 1, `examined ${reads} of ${MAX_MODELS * 3} records; the scan stops at MAX_MODELS`)
+})
+
+test("a vendor code that is an object does not throw out of the hooks", () => {
+  // Number({toString: 1}) calls the field and throws (it is not a function),
+  // so {"code":{"toString":1}} — plain JSON a server can send — took the
+  // usage hook, the check-in and the activity filter down with it. numOf
+  // answers NaN, which every caller already reads as "no code stated".
+  const odd = { toString: 1 }
+  return (async () => {
+    const p = await CodarPlugin()
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: odd, token: 500, agent_token: null } },
+        "/v1/agent/balance": { body: { code: odd, data: { agent_balance: 3 } } },
+        "/v1/daily-sign/status": { body: { code: odd, data: { isSigned: true } } },
+        "/api/codar/activities/mine": {
+          body: {
+            code: odd,
+            data: [{ status: "active", name: "免费", model_ids: ["a"], free_until: Math.floor(Date.now() / 1000) + 3600, remaining_quota: null }],
+          },
+        },
+      },
+      async () => p.auth.usage(auth),
+    )
+    assert.equal(u.error, undefined, "the card still builds")
+    assert.match(u.balance, /^500 点/, "the balance is read, not lost to the object")
+    assert.match(u.balance, /Agent 3 点/, "and so is the second endpoint's, which speaks only through an object code")
+    assert.ok(u.windows.some((w) => w.name.startsWith("免费模型")), "the activity is drawn, not dropped")
+    assert.match(u.windows.find((w) => w.name === "每日签到").display, /今天已领/, "and the sign state is read past its object code")
+    const r = await withFetch({ "/v1/daily-sign": { body: { code: odd } } }, async () => p.auth.checkin(auth))
+    assert.equal(r.outcome, "claimed", "an unreadable code is not a refusal")
+  })()
+})
+
+test("a catalog that says nothing about concurrency does not undo the last number", async () => {
+  const p = await CodarPlugin()
+  const route = (extra) => ({
+    "/v1/codar/models": { body: { data: [{ id: "x", protocol: { type: "openai_chat_completions" }, ...extra }] } },
+  })
+  await withFetch(route({ max_concurrency: 7 }), async () => p.provider.models({ models: {} }, { auth: await auth() }))
+  assert.equal(p.auth.maxConcurrency, 7)
+  await withFetch(route({}), async () => p.provider.models({ models: {} }, { auth: await auth() }))
+  assert.equal(p.auth.maxConcurrency, 7, "a catalog with no number is not a statement to go back to 3")
+})
+
+test("a credential echoed without its eyJ head, or as its signature alone, is cut", () => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const header = b64({ alg: "HS256", typ: "JWT" })
+  const payload = b64({ username: "user_1", exp: 1900000000 })
+  const sig = "Kq3zX9bLmN2pR7tY4vW1cD8fG5hJ0kQ6sA9eU2iO7pZ"
+  const jwt = `${header}.${payload}.${sig}`
+  for (const echo of [jwt, jwt.slice(1), jwt.slice(4), sig, `${header}.${payload}`]) {
+    assert.equal(scrubLine(`bad key ${echo}`, ""), "bad key …", `${echo.slice(0, 12)}… is cut`)
+  }
+  // shapes that only look like one are left alone
+  for (const text of [
+    "model deepseek-v4.1-flash is not available",
+    "see https://api.speedai.com/v1/codar/models for details",
+    "contact support@speedai.example.com please",
+    "cannot read ~/.codar/config.json",
+    "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "the quota_exceeded_for_this_account_and_model_please_upgrade_plan error",
+  ]) {
+    assert.equal(scrubLine(text, ""), text, "not a credential")
+  }
+})
+
+test("the sign-in's failure text says ~ instead of this machine's home", () => {
+  // The dialog can end up in a screenshot or an issue; the home directory
+  // carries the account name.
+  const absent = join(homedir(), ".codar", "codar-plugin-test-absent.json")
+  const r = appToken(absent)
+  assert.match(r.error, /没找到/)
+  assert.ok(!r.error.includes(homedir()), `no home directory in the message: ${r.error}`)
+  assert.ok(r.error.includes("~"), "but the file is still pointed at")
+  assert.equal(shownPath(absent), "~/.codar/codar-plugin-test-absent.json")
+  // a path the user chose (CODAR_HOME, a temp dir) is said as it is
+  assert.equal(shownPath("/tmp/codar-x/config.json"), "/tmp/codar-x/config.json")
+})
+
+test("CODAR_HOME is used as the app uses it, whitespace and all", () => {
+  // `codar config path` with CODAR_HOME="  /tmp/x  " answers
+  // "  /tmp/x  /config.json" (measured against the installed app): the
+  // sidecar does not trim, so a plugin that trimmed would read a file the
+  // app never wrote.
+  const had = process.env.CODAR_HOME
+  process.env.CODAR_HOME = "  /tmp/codar-home-probe  "
+  try {
+    assert.equal(configPath(), join("  /tmp/codar-home-probe  ", "config.json"))
+  } finally {
+    if (had === undefined) delete process.env.CODAR_HOME
+    else process.env.CODAR_HOME = had
+  }
+})
+
+test("a vendor answer past the cap is refused while it is read", async () => {
+  const big = new Response("x".repeat(MAX_ANSWER_BYTES + 1))
+  await assert.rejects(() => readAnswer(big), /超过 8 MB/)
+})
+
+test("an answer split into chunks is decoded whole, even inside a character", async () => {
+  // chunk boundaries fall anywhere; decoding each chunk on its own would
+  // turn a character split across two into U+FFFD
+  const bytes = new TextEncoder().encode("点数 ok")
+  const split = new ReadableStream({
+    start(c) {
+      c.enqueue(bytes.slice(0, 1))
+      c.enqueue(bytes.slice(1, 2))
+      c.enqueue(bytes.slice(2))
+      c.close()
+    },
+  })
+  const { text } = await readAnswer(new Response(split))
+  assert.equal(text, "点数 ok")
+})
+
+test("a multi-megabyte vendor sentence does not throw or stall the cleaners", () => {
+  // scrubLine and cleanText run global regexes, and V8's engine recurses
+  // while matching them: a 8 MB run of "eyJ"+"a " (or one long word, or a
+  // bare signature) threw RangeError "Maximum call stack size exceeded" out
+  // of the usage hook, and an 8 MB name of newlines took 2.5 s to fold — in
+  // a host every plugin shares. Both clean only their first MAX_SCRUB_CHARS
+  // characters now; nothing past them could reach a card or a log line.
+  const shapes = {
+    "one long word": "a".repeat(MAX_ANSWER_BYTES),
+    "eyJ and spaces": "eyJ" + "a ".repeat(MAX_ANSWER_BYTES / 2),
+    "a bare signature": "Kq3zX9bLmN2pR7tY4vW1cD8fG5hJ0kQ6sA9eU2iO7pZ" + "a".repeat(MAX_ANSWER_BYTES),
+    "newlines": "a\n".repeat(MAX_ANSWER_BYTES / 2),
+    "control characters": "​".repeat(MAX_ANSWER_BYTES / 2),
+  }
+  for (const [label, text] of Object.entries(shapes)) {
+    const t = process.hrtime.bigint()
+    const line = scrubLine(text, "")
+    const clean = cleanText(text)
+    const ms = Number(process.hrtime.bigint() - t) / 1e6
+    assert.equal(typeof line, "string", `${label}: scrubLine answers`)
+    assert.ok(clean.length <= 120, `${label}: cleanText is still a card line`)
+    assert.ok(ms < 500, `${label}: ${MAX_ANSWER_BYTES} bytes took ${ms.toFixed(0)} ms`)
+  }
 })

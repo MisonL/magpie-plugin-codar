@@ -183,7 +183,15 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   balance that fell (the app spending) is not subtracted from it. A string
   shown on a card — a model's name, a message — is cut to fit by the code
   point, not by the UTF-16 unit, so a name or a message full of emoji cannot
-  end in half a character.
+  end in half a character. The cut reads only the first 2n UTF-16 units of a
+  vendor's string (n code points never take more), so a megabyte-long
+  sentence costs an answer-sized read rather than an array of the whole
+  string in a host every plugin shares. An answer larger than 8 MiB is
+  refused while it is read, not held first, and the cleaners look at a
+  string's first 8 KiB: the global regexes they run recurse in V8's engine,
+  and a multi-megabyte sentence of the wrong shape was a `RangeError` out of
+  the hook. Nothing past the first 8 KiB could reach a 120-character name or
+  a 400-character message anyway.
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card
@@ -262,8 +270,11 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   what the row says.
 - The "read from this machine" sign-in follows `CODAR_HOME` when it is set:
   the app honours it (`codar config path` answers `$CODAR_HOME/config.json`),
-  so the plugin reads the same file the app writes. Without it, the home
-  directory above is used.
+  so the plugin reads the same file the app writes. The value is taken as
+  written, whitespace and all, because the app's sidecar does not trim it
+  either (`CODAR_HOME="  /tmp/x  "` answers `  /tmp/x  /config.json`); an
+  empty value is "not set". Without it, the home directory above is used.
+  Its failure messages write the home directory as `~`.
 - Codar's own gateway has had short outages (its catalog answered 500 to
   every client, the desktop app included); when that happens the plugin
   keeps the points on the card and drops only what could not be read.
