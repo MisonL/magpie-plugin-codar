@@ -624,7 +624,7 @@ test("activities that are still running become windows; a failed read does not s
   // it and the GUI has no field for it — while any window with `models` keeps
   // the whole card out of quotas.json (quota_last.go keepLast).
   assert.equal(free[0].models, undefined, "no models on the window: it would cost the card its last reading on disk")
-  assert.equal(free[0].used, 0, "an unlimited activity has no share to tell")
+  assert.equal(free[0].used, undefined, "an unlimited activity has no share to tell: the host reads used: 0 as a share of 0%, not as 'not said'")
   assert.equal(free[0].amount, undefined, "and no invented count")
 
   const capped = await withFetch(
@@ -2067,7 +2067,7 @@ test("an activity whose numbers are not finite says no share, not Infinity", asy
   const free = u.windows.find((w) => w.name.startsWith("免费模型"))
   assert.ok(free, "the activity is still drawn")
   assert.doesNotMatch(free.display, /Infinity|NaN/, "the card says a usable thing")
-  assert.equal(free.used, 0, "no share invented from numbers nobody can use")
+  assert.equal(free.used, undefined, "no share invented from numbers nobody can use — and 'no share' is not the number 0")
 })
 
 test("a claim row whose time no calendar can state carries no resetsAt, not 1970", async () => {
@@ -2899,7 +2899,7 @@ test("the embedded catalog is a well-formed model list", async () => {
 // the plugin's own catalogOf; these drive its main() with a stubbed fetch and
 // its outside world injected, so the tool that writes the file is itself
 // pinned, offline.
-const { recordsOf, render, parseCatalog, main, sortRows } = await import("../scripts/catalog.mjs")
+const { recordsOf, render, parseCatalog, main, sortRows, configPathOf } = await import("../scripts/catalog.mjs")
 
 // genRun drives the generator against a stub vendor and a scratch directory.
 const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFetch } = {}) => {
@@ -3952,4 +3952,36 @@ test("a multi-megabyte vendor sentence does not throw or stall the cleaners", ()
     assert.ok(clean.length <= 120, `${label}: cleanText is still a card line`)
     assert.ok(ms < 500, `${label}: ${MAX_ANSWER_BYTES} bytes took ${ms.toFixed(0)} ms`)
   }
+})
+
+test("the generator refuses a vendor answer past the plugin's own cap", async () => {
+  // The plugin reads a body through a stream and gives up past
+  // MAX_ANSWER_BYTES (index.mjs's readAnswer). The generator read it with
+  // res.json(), which holds the whole answer first, whatever its size — the
+  // same shape the plugin had before. It goes through the plugin's reader now.
+  const body = '{"data":[{"id":"x","display_name":"' + "a".repeat(MAX_ANSWER_BYTES) + '"}]}'
+  const { exit, logs, after } = await genRun({ body })
+  assert.equal(exit, 2, "a read that could not finish is exit 2, not 'out of date'")
+  assert.ok(logs.some((l) => l.includes("超过 8 MB")), `and it says why: ${JSON.stringify(logs)}`)
+  assert.equal(after, null, "nothing was written")
+})
+
+test("the generator reads the app's file where the plugin does, whitespace and all", () => {
+  // Both readers take CODAR_HOME as the app's sidecar does: verbatim, with an
+  // empty value meaning "not set". A trim on one side would point the two at
+  // different files — the generator would say "sign in again" about a config
+  // the plugin had just read fine, or the other way round.
+  const had = process.env.CODAR_HOME
+  try {
+    for (const v of ["  /tmp/codar-gen-probe  ", "/tmp/codar-gen-plain", ""]) {
+      process.env.CODAR_HOME = v
+      assert.equal(configPathOf(process.env), configPath(), `${JSON.stringify(v)}: one path for both readers`)
+    }
+  } finally {
+    if (had === undefined) delete process.env.CODAR_HOME
+    else process.env.CODAR_HOME = had
+  }
+  assert.equal(configPathOf({ CODAR_HOME: "  /tmp/x  " }), join("  /tmp/x  ", "config.json"), "verbatim, as the sidecar answers it")
+  assert.equal(configPathOf({ CODAR_HOME: "   " }), join("   ", "config.json"), "whitespace is a value, as it is to the app")
+  assert.equal(configPathOf({}), join(homedir(), ".codar", "config.json"), "an empty value is 'not set'")
 })

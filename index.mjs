@@ -1253,13 +1253,18 @@ export async function CodarPlugin(input) {
             // 是两个数在说两件事（厂商报的是池子，不是这次活动），相减只会造出
             // 一个 0，卡片写「已用 0 / 100」而厂商说还剩 150——不如把剩下的照说。
             const used = cap != null && quotaLeft != null && quotaLeft <= cap ? cap - quotaLeft : null
-            const share = used != null && cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0
+            // used 是份额（0–100），宿主按字面读它；算不出份额的窗口就不报这个
+            // 字段，而不是报 0%——宿主的契约把两者分得很清楚（"left out: the
+            // plugin didn't say, which is no share and not 0%"），报 0 等于说
+            // 「已用 0%」，而这里要说的恰恰是「没有份额可说」。不报的时候这一
+            // 行和签到那行一样画成文字。
+            const share = used != null && cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : null
             // 活动的结束时间（也是秒数）读不出来就不带 resetsAt：活动
             // 本身照报——它确实在跑，只是没说何时结束（safeTime 给 0）。
             const freeUntil = safeTime(secsOf(a.free_until) * 1000)
             windows.push({
               name: ids.length ? `免费模型 · ${ids.slice(0, 2).join("、")}${ids.length > 2 ? ` 等 ${ids.length} 个` : ""}` : "免费模型",
-              used: share,
+              ...(share != null ? { used: share } : {}),
               ...(freeUntil ? { resetsAt: freeUntil } : {}),
               // 说得出总额就说总额：remaining_quota 没给，不代表活动「不限量」
               // ——厂商的 user_quota_limit 白纸黑字写了多少。只有两个数都没有

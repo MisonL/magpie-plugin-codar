@@ -77,8 +77,12 @@ const pluginOf = async () => {
 
 // configPathOf is where the app keeps its own config, the same place the
 // plugin's read-from-this-machine sign-in looks (index.mjs's configPath).
+// The value is taken as the app's sidecar takes it: verbatim, not trimmed
+// (`CODAR_HOME="  /tmp/x  "` answers `  /tmp/x  /config.json`), with an
+// empty value meaning "not set" — a trim here would read a file the app never
+// wrote, and would read a different one from the plugin.
 export const configPathOf = (env = process.env) => {
-  const home = String(env?.CODAR_HOME ?? "").trim()
+  const home = String(env?.CODAR_HOME ?? "")
   return join(home || join(homedir(), ".codar"), "config.json")
 }
 
@@ -181,7 +185,12 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
   try {
     const res = await fetchImpl(`${API}${CATALOG_PATH}`, { headers: { Authorization: `Bearer ${sent}`, "User-Agent": "node" } })
     if (!res.ok) return fail(`GET ${CATALOG_PATH} → HTTP ${res.status}`)
-    body = await res.json()
+    // 用插件自己的有上限读法（index.mjs 的 readAnswer）：它边读流边计数，
+    // 超过 MAX_ANSWER_BYTES 就放弃。res.json() 会把整份应答先收进内存，无论
+    // 多大——和插件在钩子里踩过的坑是同一个。开头的 BOM 也照 request() 去掉：
+    // JSON.parse 遇到它会把整份应答判成不是 JSON。
+    const { text } = await rules.readAnswer(res)
+    body = JSON.parse(text.replace(/^\uFEFF/, ""))
   } catch (e) {
     // a thrown fetch and an unparseable body are the same failure: the vendor
     // did not answer with a list, so there is nothing here to compare. The

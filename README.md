@@ -264,7 +264,10 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   real pair of numbers. A stated total without a readable remainder says the
   total ("免费使用中，共 N") rather than calling the activity unlimited, a
   remainder past the total is said as it is, and only an activity with
-  neither number shows as "不限量".
+  neither number shows as "不限量". A window with no share to tell sends no
+  `used` at all rather than `used: 0` — the host keeps "not said" and "0%"
+  apart ("left out: the plugin didn't say, which is no share and not 0%"),
+  and such a row is drawn as its text, like the check-in's.
 - The daily check-in is a text row, not a percentage: a check-in is not an
   allowance that runs out, so the plugin sends no `used` and magpie shows
   what the row says.
@@ -305,7 +308,11 @@ spells as a string is a size on both paths; a name is a cleaned card line on
 both). `--check` compares the records field by field, so a reordered key or a
 reworded comment is not drift. Its error messages cut a credential out by the
 token's shape, as the plugin's own messages do, so a server that wraps the
-token or quotes back only part of it cannot get it into a CI log. Its exit
+token or quotes back only part of it cannot get it into a CI log. It reads
+the vendor's answer through the plugin's own bounded reader (`readAnswer`,
+the same 8 MiB cap), and it takes `CODAR_HOME` exactly as the app's sidecar
+does — verbatim, with an empty value meaning "not set" — so the generator
+and the plugin always look at the same file. Its exit
 codes keep the two failures apart: 0
 is "nothing moved", 1 means a record moved and the file wants regenerating,
 and 2 is "the vendor or the file could not be read" — a run that fails to
