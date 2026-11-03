@@ -52,15 +52,26 @@ const UA_DESKTOP = "node"
 // 时间：magpie 的 Go 侧给一次用量读取 20 秒（plugin_usage.go 的
 // context.WithTimeout），给一次签到 2 分钟（workbuddy_checkin.go）。插件的
 // 超时要先到：宿主先掐断的话，卡片上是宿主的超时，而不是插件自己的「请求
-// 超时」。用量三路并行，最坏是一个 TIMEOUT_MS；签到三次串行，最坏是三个。
-// 预算是总上限，单次超时取 min(TIMEOUT_MS, 预算剩下的)，预算先用完时后面
-// 的请求只剩 1 秒。测试不读这几个常量，而是从 request() 真正设过的定时器上
-// 量每个请求拿到的超时值，所以「某条路改用别的数」会被抓住。
+// 超时」。
 //
-// 用量那三路是同一瞬间发的（Promise.allSettled 的数组字面量里连着取三次
+// 那 20 秒不止包住这个钩子：宿主在调它之前先跑 fresh() 和 infoOf()，而
+// infoOf 在缓存冷的时候会跑一遍 models 钩子（host.js 的 info() 没给 limit
+// 时没有时限），插件的用量预算从钩子内部才起算，管不到这一段。所以用量钩子
+// 的最坏耗时必须留得下这 8 秒：四条读数（两条余额 + 签到状态 + 活动）在同一
+// 瞬间发出，最坏是一个 TIMEOUT_MS，而不是两个。厂商自己的客户端也是这么发
+// 的（app.asar 的 S0 用 allSettled 跑 /v1/gettoken、/v1/agent/balance、
+// /api/user/self）；串行再补一次会把最坏值翻倍——8 秒前置加 16 秒钩子就顶破
+// 了 20 秒，卡片上会是宿主的截止时间而不是插件的话。
+//
+// 签到三次串行，最坏是三个 TIMEOUT_MS（25 秒预算，宿主的 2 分钟也留得下）。
+// 预算是总上限，单次超时取 min(TIMEOUT_MS, 预算剩下的)，预算先用完时后面的
+// 请求只剩 1 秒。测试不读这几个常量，而是从 request() 真正设过的定时器上量
+// 每个请求拿到的超时值，所以「某条路改用别的数」会被抓住。
+//
+// 用量那四路是同一瞬间发的（Promise.allSettled 的数组字面量里连着取四次
 // opts()，中间没有 await），所以 left() 今天永远取到整个 TIMEOUT_MS——用量这
 // 条路上的预算和 1 秒下限都夹不到谁，它们是天花板，不是会被走到的分支（把
-// 下限改成 0 也一样全绿，不是漏测）。这条路上真正要钉的是「三路各拿到那个
+// 下限改成 0 也一样全绿，不是漏测）。这条路上真正要钉的是「四路各拿到那个
 // cap」，测试从 request() 设过的定时器上量。真正用到「预算剩下的」是签到的
 // 串行三问：前一次读得慢，后面的就只剩小的那份，最少 1 秒。
 const TIMEOUT_MS = 8000
@@ -243,13 +254,18 @@ const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
 const controlChars =
   /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\ufff9-\ufffb]/g
 
+// cut is a string clipped to at most n code points: never longer than the card
+// reads, and never ending in half a character. The length check is the UTF-16
+// one first — when that already fits, no cut is needed and the array work is
+// skipped — then the clip walks code points, so a string that ends on an emoji
+// is not broken into a lone surrogate (JSON.stringify writes one as \ud83d and
+// the host's decoder reads it as U+FFFD). A vendor name and a vendor message
+// both come through here, so they break at the same place.
+const cut = (s, n) => (s.length <= n ? s : Array.from(s).slice(0, n).join(""))
+
 // cleanText is a vendor string as a card can show it: control characters
 // out, one line (runs of spaces folded), and never longer than a card reads.
-// The cut is by code point, not by code unit: 120 UTF-16 units can end in the
-// middle of a surrogate pair, and a lone high surrogate is a character no one
-// wrote — JSON.stringify writes it as \ud83d and the host's decoder reads it
-// as U+FFFD.
-const cleanText = (s) => Array.from(String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim()).slice(0, 120).join("")
+const cleanText = (s) => cut(String(s).replace(controlChars, " ").replace(/\s{2,}/g, " ").trim(), 120)
 
 // jwtShape is a credential as a server might quote it back. Every Codar token
 // is a JWT, and every JWT segment is base64url. A server can wrap the token
@@ -781,8 +797,9 @@ const scrubLine = (said, key) => {
 // token scrubbed: a server that quotes the credential back would otherwise
 // put it on the card and in magpie's log. The token itself is cut where it
 // is known; a credential-shaped string is cut by its shape, which covers the
-// path where the sign-in threw and there is no token to cut by.
-const scrub = (said, token) => scrubLine(said, String(token ?? "")).slice(0, 400)
+// path where the sign-in threw and there is no token to cut by. The cut is by
+// code point (see cut): a message full of emoji does not end in half of one.
+const scrub = (said, token) => cut(scrubLine(said, String(token ?? "")), 400)
 const signMessage = (r, token) => scrub(saidBy(r), token)
 
 export async function CodarPlugin(input) {
@@ -995,10 +1012,15 @@ export async function CodarPlugin(input) {
         const left = () => Math.max(1000, deadline - Date.now())
         const opts = () => ({ fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
 
-        // 三处读取互不依赖，一起发：卡片等最慢的那个，而不是三个之和。点数
-        // 读不到整张卡就是错的（余额是主项）；另两个是附加信息，读不到就不报。
-        const [pointsR, statusR, actsR] = await Promise.allSettled([
+        // 四条读取互不依赖，一起发（厂商自己的客户端也是这么发的：app.asar 的
+        // S0 用 allSettled 跑 /v1/gettoken、/v1/agent/balance、/api/user/self）：
+        // 卡片等最慢的那个，而不是四个之和，最坏也只是一个 TIMEOUT_MS——插件的
+        // 用量预算管不到宿主在钩子之前跑的那一段（见文件头的时间注释），钩子越
+        // 慢，留给它的就越少。点数读不到整张卡就是错的（余额是主项）；另两个是
+        // 附加信息，读不到就不报。
+        const [pointsR, agentR, statusR, actsR] = await Promise.allSettled([
           pointsOf(token, username, opts()),
+          agentPointsOf(token, username, opts()),
           request(`${ACCOUNT}${SIGN_STATUS_PATH}`, { method: "POST", body: { username }, token, ...opts() }),
           request(`${API}${ACTIVITIES_PATH}`, { method: "GET", token, ...opts() }),
         ])
@@ -1010,19 +1032,20 @@ export async function CodarPlugin(input) {
         let points
         if (pointsR.status === "fulfilled") {
           points = pointsR.value
-          // 通用点数与 Agent 点数是两处读数，厂商自己的客户端也是分开取的
-          // （app.asar 的 S0）：这一处没给 Agent 数时问另一条余额接口。
-          if (points.agent == null) points.agent = await agentPointsOf(token, username, opts()).catch(() => null)
+          // 通用点数与 Agent 点数是两条读数：gettoken 给的就用它，没给才用
+          // /v1/agent/balance（S0 里 i.agentPoints ?? cm 那个值）。另一条读不
+          // 到就当一个没说，不影响 gettoken 自己答出的东西。
+          if (points.agent == null && agentR.status === "fulfilled") points.agent = agentR.value
         } else {
           const e = pointsR.reason
           // 登录过期是整张卡的答案：另两处也会这么说，换谁重试都没用，用户
           // 要做的只有重新登录。这一条是原来那一句，别改成码。
           if (signedOut(e)) return { error: "登录已过期，请重新登录", signIn: "expired" }
-          // 厂商自己的客户端在这一处读不到时会去问另一条余额接口（S0 的
-          // allSettled）：这里照样问一次。读到了就照画签到行、活动和 Agent
-          // 点数——钱包那一行不画，通用点数这一回没说，编一个 0 会让路由把
-          // 一个有钱的账号排到最后。两条都读不到，才是整张卡的一句错误。
-          const agent = await agentPointsOf(token, username, opts()).catch(() => null)
+          // 通用点数这一处没读到：另一条余额接口若答出了 Agent 数就照画签到
+          // 行、活动和 Agent 点数——钱包那一行不画，通用点数这一回没说，编一
+          // 个 0 会让路由把一个有钱的账号排到最后。两条都读不到，才是整张卡的
+          // 一句错误。
+          const agent = agentR.status === "fulfilled" ? agentR.value : null
           if (agent == null) return { error: scrub(whyOf(e), token) || "点数查询失败", signIn: "" }
           points = { general: null, agent }
         }
@@ -1037,8 +1060,8 @@ export async function CodarPlugin(input) {
         //
         // 状态按厂商 App 自己的读法（app.asar 的 um）：data 可以是那个布尔，
         // 也可以是写着它的对象（四种写法）；两种形状都画这一行，其余形状不画。
-        // 先过它的 code 关：厂商调状态接口时也是先 Jo（数字码不是 200 就当
-        // 失败），再 ayt 读应答。只认 data 的话，{code: 500, data:{isSigned:
+        // 先过它的 code 关：厂商调状态接口时也是先 ft（数字码不是 200 就当
+        // 失败），再 um 读应答。只认 data 的话，{code: 500, data:{isSigned:
         // false}} 会被画成「现在可以领」——厂商自己这时只会说查询失败。
         // 这一行是附加信息，画不出来就不画，卡片照报点数。
         const status = statusR.status === "fulfilled" ? statusR.value : null

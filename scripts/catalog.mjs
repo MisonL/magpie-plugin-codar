@@ -44,7 +44,7 @@ export const OUT_PATH = join(HERE, "..", "catalog.mjs")
 // that is already current produces no diff at all.
 const HEAD = `// catalog is Codar's model list as its own client keeps it: the answer to
 // GET /v1/codar/models, reduced to what magpie reads (id, name, context,
-// maxOutput, modalities, protocol, reasoning) — the vendor's prices stay out
+// maxOutput, input, output, protocol, reasoning) — the vendor's prices stay out
 // of it, as the plugin reports none (see README). maxOutput is the reply
 // ceiling the vendor's own request schema states (max_tokens.maximum), 0
 // where it states none. Kept as the list the provider has before the vendor

@@ -12,7 +12,7 @@ the usage card.
 | `config` / `provider` | Adds a `codar` provider with Codar's model list (17 models: the `auto` router plus DeepSeek, GLM, GPT and Claude families). The list is embedded from the app's own catalog and refreshed from `GET /v1/codar/models` when signed in. |
 | `auth.methods` | Two ways to sign in: "读取本机科搭令牌" (keyless — the plugin reads `~/.codar/config.json` itself, read only) and pasting the "科搭访问令牌". |
 | `auth.checkin` | `POST /v1/daily-sign` once a day. The answer says whether it claimed or was already claimed, and how long until the next one — including `until` (magpie ≥ 0.1.1795), so magpie re-asks exactly when Codar's rolling 24 hours open again instead of every 30 minutes before noon. A wait it cannot use — missing, zero, past year 9999, or longer than a week (this day rolls every 24 hours, so 31 years is not a next-claim time) — gets a 30-minute trust floor instead: "done with no `until`" would settle the whole day in magpie, and a rolling window would lose the next claim. |
-| `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The three reads go out together. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". An agent figure this read leaves out — or the whole read failing — is asked of the vendor's second balance endpoint (`/v1/agent/balance`), as its own client does; a card that got the agent figure is still drawn, just without the wallet row. |
+| `auth.usage` | Points (`/v1/gettoken`: general + agent), today's claim state, and any free-model activity still running, with when it ends. The four reads (the two balances, the state, the activities) go out together, as the vendor's own client asks them. The points also go out as a wallet reading, so routing has a figure for the account instead of "what's left not known yet". An agent figure the first balance leaves out — or the whole first read failing — is taken from the vendor's second balance endpoint (`/v1/agent/balance`), which is asked in the same breath; a card that got the agent figure is still drawn, just without the wallet row. |
 | `chat.headers` | Sends the desktop client's `User-Agent` on Codar's own requests, so the gateway sees the app's traffic shape. The hook runs for every provider's requests, so it filters by provider id and leaves the others alone. |
 
 Chat itself goes straight from magpie to Codar's gateway
@@ -181,9 +181,9 @@ Settings (设置) → 额度 (Quota) → 预热与签到 (warm-up & check-in) �
   the sum of both balances' increases between its two reads — the vendor says
   a claim grants "点数奖励" without saying which balance holds it — and a
   balance that fell (the app spending) is not subtracted from it. A string
-  shown on a card — a model's name, a message — is cut to fit by the
-  character, not by the UTF-16 unit, so a name full of emoji never ends in
-  half a character.
+  shown on a card — a model's name, a message — is cut to fit by the code
+  point, not by the UTF-16 unit, so a name or a message full of emoji cannot
+  end in half a character.
 - When the token has run out the plugin asks the vendor nothing: the model
   list stays as it is (`catalog.mjs`'s), and is **not** marked as fallen
   back — magpie marks that only after it really tried and failed. The card

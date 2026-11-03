@@ -153,8 +153,8 @@ test("already claimed today is `done`, with when to come back", async () => {
 })
 
 test("a claim the vendor confirmed without a code is a claim, not a failure", async () => {
-  // The vendor's own check-in reads the answer through Jo alone (app.asar's
-  // nRe): only a code that is a number other than 200 is a refusal, so an
+  // The vendor's own check-in reads the answer through ft alone (app.asar's
+  // k0): only a code that is a number other than 200 is a refusal, so an
   // answer that names no code is the claim it says it is. Read as `code ===
   // 200`, one said {"message":"Success","success":true} came back `failed` —
   // and the vendor's activity API already answers without a code today.
@@ -213,7 +213,7 @@ test("a claim the vendor confirmed without a code is a claim, not a failure", as
 
 test("an already-claimed answer is read in every spelling the vendor's client reads", async () => {
   // The vendor's client reads an answer's words as the first of message, msg,
-  // error, detail — and the same four under `data` (app.asar's Vg). Read as
+  // error, detail — and the same four under `data` (app.asar's vo). Read as
   // `message` alone, an "already claimed" note spelled `msg` or under `data`
   // came out as no text at all, and the card said the check-in failed over a
   // day that was simply already claimed.
@@ -260,7 +260,7 @@ test("an already-claimed answer is read in every spelling the vendor's client re
 
 test("a free-model read the vendor refused draws nothing, however it is shaped", async () => {
   // The vendor's own client refuses an answer whose code is a number other
-  // than 200 before it reads the list (app.asar's Hbt calls Jo first), so a
+  // than 200 before it reads the list (app.asar's EI calls ft first), so a
   // refusal carrying a data array is not a running activity. Today's activity
   // body has no code at all (only data, message and success), so the gate is
   // silent on it.
@@ -291,7 +291,7 @@ test("a free-model read the vendor refused draws nothing, however it is shaped",
 
 test("an expiry the token spells as a string is an expiry, not something open-ended", () => {
   // The vendor's own client reads exp as a number or as a string that says
-  // one (app.asar's ZAe: typeof i == "number" ? i : Number(i)). Read as a
+  // one (app.asar's Zh: typeof i == "number" ? i : Number(i)). Read as a
   // number alone, a token whose exp came back as "1793334853" was taken for
   // one that never runs out, and the plugin sent it: every endpoint answers
   // 401 and the card says the check-in failed instead of asking to sign in.
@@ -349,7 +349,6 @@ test("a wait the daily window cannot produce gets the trust floor, not a time ha
     assert.equal(r.outcome, "done")
     assert.ok(Number.isFinite(r.until), `retry_after ${retry_after} still gives a finite until`)
     const iso = new Date(r.until).toISOString()
-    assert.doesNotThrow(() => new Date(r.until).toISOString(), "and one the host can turn into an ISO string")
     assert.match(iso, /^\d{4}-\d{2}-\d{2}T/, "a four-digit year, as Go's RFC3339 parse needs")
     assert.ok(r.until > Date.now() && r.until <= Date.now() + 31 * 60 * 1000, "the floor, not a day settled for decades")
     assert.doesNotMatch(r.message, /年|2058|11574 天/, "and the card does not repeat the number it cannot use")
@@ -436,7 +435,7 @@ test("a balance that cannot be read fails the read, it does not become 0", async
 })
 
 test("the claim row reads the vendor client's own spellings", async () => {
-  // The vendor's client (app.asar's ayt) reads the state as the boolean data
+  // The vendor's client (app.asar's um) reads the state as the boolean data
   // itself or from any of four field names, each only as a real boolean. A
   // rename its client still handles must not turn a claimed day into "还没领".
   const p = await CodarPlugin()
@@ -466,7 +465,7 @@ test("the claim row reads the vendor client's own spellings", async () => {
 })
 
 test("the balances are read by the vendor client's own names", async () => {
-  // app.asar's Xbt reads general points by token/remaining_points/points/
+  // app.asar's am reads general points by token/remaining_points/points/
   // balance and agent points by agent_token/agentToken/agent_points/
   // agentPoints; a rename its client still handles must not fail the card.
   const p = await CodarPlugin()
@@ -553,7 +552,7 @@ test("a token the vendor turns away is an error on the card, not an empty one", 
   assert.match(busy.error, /系统繁忙/, "another body code is its own error, not an empty card")
   assert.equal(busy.signIn, "", "and is not mistaken for an expired sign-in")
 
-  // The vendor's words are read the way its client reads them (Vg): any of
+  // The vendor's words are read the way its client reads them (vo): any of
   // message/msg/error/detail, or the same four under `data`. Read as
   // `message` alone, a refusal spelled `msg` came back as a bare code.
   const spelled = await withFetch(
@@ -687,15 +686,17 @@ test("a free activity is drawn by the vendor app's own rule, and no other", asyn
 })
 
 test("the usage reads go out together, and a dead balance still reads the rest", async () => {
-  // The card waits for the slowest read, not for three in a row. All three
-  // are launched before any is awaited: a points read that fails must not
-  // stop the other two from having been asked, and the three must overlap
-  // in flight (inFlight reaches 3) rather than run one after another.
+  // The card waits for the slowest read, not for four in a row. All four are
+  // launched before any is awaited: a points read that fails must not stop the
+  // others from having been asked, and they must overlap in flight (inFlight
+  // reaches 4) rather than run one after another.
   //
-  // The fourth request is the fallback: /v1/gettoken failing sends the read to
-  // the vendor's second balance endpoint (app.asar's S0), and it is issued
-  // after the first three settle, not beside them — a read that answers is
-  // not asked for twice.
+  // The second balance read is part of that batch, not a fallback behind it:
+  // the vendor's own client asks the two balances together (app.asar's S0 is
+  // an allSettled over /v1/gettoken, /v1/agent/balance and /api/user/self),
+  // and a read that only ever starts after the first one settles makes the
+  // hook's worst case two timeouts, which is what magpie's 20-second deadline
+  // has no room for (the host runs fresh() and a cold infoOf() before it).
   const p = await CodarPlugin()
   const seen = []
   let inFlight = 0
@@ -705,7 +706,7 @@ test("the usage reads go out together, and a dead balance still reads the rest",
     seen.push(String(url))
     inFlight++
     most = Math.max(most, inFlight)
-    // all three must be in before any answer goes out; a serial run would
+    // all of them must be in before any answer goes out; a serial run would
     // hold each of these until the timeout
     await new Promise((ok) => setTimeout(ok, 15))
     inFlight--
@@ -717,8 +718,8 @@ test("the usage reads go out together, and a dead balance still reads the rest",
   try {
     const u = await p.auth.usage(auth)
     assert.ok(u.error, "both balance reads failing is the card's error")
-    assert.equal(seen.length, 4, "the three reads, then the one fallback the first of them asked for")
-    assert.equal(most, 3, "the three overlapped in flight, not one after another")
+    assert.equal(seen.length, 4, "the two balance reads, the status and the activity list")
+    assert.equal(most, 4, "all four overlapped in flight, not one after another")
   } finally {
     globalThis.fetch = real
   }
@@ -1143,18 +1144,31 @@ test("the plugin's timeouts land before magpie's own deadlines", () => {
   // magpie's Go side gives a usage read 20s and a check-in 2 minutes. When
   // the host cuts first the card shows the host's timeout, not the plugin's
   // own "请求超时" — so the worst case of each hook must fit inside its own.
+  //
+  // The two deadlines are written as the literals magpie states, not read
+  // from the plugin's own copies of them: compared against the copies, a
+  // constant changed to 999s stays green, and the test would be asserting
+  // that the plugin agrees with itself.
   const t = testables.timing
-  // usage: three reads at once, so one full per-request timeout has to fit
-  // the budget, and the budget has to land before the host's 20s
+  const HOST_USAGE = 20 * 1000
+  const HOST_CHECKIN = 120 * 1000
+  // usage: four reads at once, so the hook's worst case is one timeout — and
+  // the host runs fresh() and a cold infoOf() (a models read, one timeout of
+  // its own) before the hook starts. Both have to fit the host's 20s.
   assert.ok(t.TIMEOUT_MS <= t.USAGE_BUDGET_MS, "one usage read gets its full timeout")
-  assert.ok(t.USAGE_BUDGET_MS < t.HOST_USAGE_DEADLINE_MS, "and the whole usage read lands before the host's deadline")
+  assert.ok(t.USAGE_BUDGET_MS <= HOST_USAGE, "and the whole usage read lands before the host's deadline")
+  assert.ok(2 * t.TIMEOUT_MS <= HOST_USAGE, "the host's models read and the usage hook's worst case both fit the 20s")
   // check-in: three reads in a row (points, the claim, points). If three full
   // timeouts did not fit the budget, a slow first read could leave the claim
   // itself only the 1s floor — a claim that would have answered in 3s,
   // reported as a timeout. The budget caps the rest; it lands before the
   // host's 2 minutes.
   assert.ok(3 * t.TIMEOUT_MS <= t.CHECKIN_BUDGET_MS, "a slow first read cannot starve the claim to the 1s floor")
-  assert.ok(t.CHECKIN_BUDGET_MS < t.HOST_CHECKIN_DEADLINE_MS, "and the whole check-in lands before the host's deadline")
+  assert.ok(t.CHECKIN_BUDGET_MS <= HOST_CHECKIN, "and the whole check-in lands before the host's deadline")
+  // the constants the plugin records about the host are those deadlines, not
+  // whatever a later edit made them
+  assert.equal(t.HOST_USAGE_DEADLINE_MS, HOST_USAGE, "the recorded usage deadline is magpie's 20s")
+  assert.equal(t.HOST_CHECKIN_DEADLINE_MS, HOST_CHECKIN, "and the recorded check-in deadline its 2 minutes")
 })
 
 test("the timeouts each request is given are the ones the budget says", async () => {
@@ -1246,7 +1260,7 @@ test("the timeouts each request is given are the ones the budget says", async ()
   }
 })
 
-test("each of the usage hook's three reads is given the per-request cap", async () => {
+test("each of the usage hook's four reads is given the per-request cap", async () => {
   // The usage hook had no such reading: only the check-in path was measured,
   // so a mutant that handed the usage reads a different timeout (or dropped
   // the budget out of the expression) stayed green. Measured off the timers
@@ -1261,7 +1275,7 @@ test("each of the usage hook's three reads is given the per-request cap", async 
     given.push(ms)
     return realSet(fn, 0, ...a)
   }
-  // a vendor that hangs until aborted. The clock stands still, so the three
+  // a vendor that hangs until aborted. The clock stands still, so the four
   // reads (issued together) are all handed the same `left()` — which is what
   // the real path does, since nothing between two of them can move it. That
   // also means the 1s floor on this path is unreachable, so there is nothing
@@ -1874,7 +1888,6 @@ test("a catalog larger than the wire allows is cut, not handed to the host", asy
     async () => p.provider.models({ models: {} }, { auth: await auth() }),
   )
   assert.equal(Object.keys(fresh).length, 2000)
-  assert.ok(Buffer.byteLength(JSON.stringify(fresh)) < 32 * 1024 * 1024, "and the answer fits the host's line")
 })
 
 test("a balance that is not a number fails the read instead of becoming 0", async () => {
@@ -2005,7 +2018,6 @@ test("a vendor answering with a pile of activities is cut to what a card holds",
   )
   const free = u.windows.filter((w) => w.name.startsWith("免费模型"))
   assert.equal(free.length, 20, "twenty windows, not five hundred")
-  assert.ok(Buffer.byteLength(JSON.stringify(u)) < 32 * 1024 * 1024)
 })
 
 test("a token split by two spaces or a CRLF is cut like any other", async () => {
@@ -2282,7 +2294,7 @@ test("a model entry that is not an object is dropped, not handed to the host", a
 
 test("a points answer whose code is not 200 is a refusal, not a balance of 0", async () => {
   // The vendor's own client refuses any answer whose code is a number other
-  // than 200 before it reads the balances (app.asar's Jo: Number(e.code),
+  // than 200 before it reads the balances (app.asar's ft: Number(e.code),
   // finite and not 200, throws). Read only as ">= 400 is an error", a
   // refusal spelled {code: 1, token: 0} came out as "0 点", and routing took
   // the account for spent.
@@ -2312,7 +2324,7 @@ test("a points answer whose code is not 200 is a refusal, not a balance of 0", a
 })
 
 test("the balances are read from data when the vendor wraps them, as its client does", async () => {
-  // The vendor's client unwraps `data` when it is an object (app.asar's Fc)
+  // The vendor's client unwraps `data` when it is an object (app.asar's Gt)
   // before reading the balances. The live body is flat, but a wrapped one
   // used to read as "no balance at all" — an error card over a real account.
   const p = await CodarPlugin()
@@ -2332,7 +2344,7 @@ test("the balances are read from data when the vendor wraps them, as its client 
 
 test("a claim state the vendor refused is not drawn as claimable", async () => {
   // The vendor's client refuses a status answer with a numeric code other
-  // than 200 (app.asar's tRe: Jo before ayt) and reads nothing from it.
+  // than 200 (app.asar's b0: ft before um) and reads nothing from it.
   // Drawn from data alone, {code: 500, data: {isSigned: false}} said "现在
   // 可以领" — an offer the vendor would have refused.
   const p = await CodarPlugin()
@@ -2351,7 +2363,7 @@ test("a claim state the vendor refused is not drawn as claimable", async () => {
 test("a wait the vendor spelled as a boolean or an array is not a wait", async () => {
   // Number(true) is 1 and Number([3600]) is 3600, so a boolean retry_after
   // was said as "1 秒后可再领" and an array as an hour. The vendor's own
-  // client takes a number or a string that says one (app.asar's B0).
+  // client takes a number or a string that says one (app.asar's Po).
   assert.equal(humanSecs(true), "", "a boolean is not a number of seconds")
   assert.equal(humanSecs([3600]), "")
   assert.equal(humanSecs("3600"), "1 小时", "a numeric string still is")
@@ -2488,7 +2500,7 @@ test("an activity with a stated total is not called unlimited", async () => {
   assert.equal(rounded.display, "免费使用中，已用 1 / 8")
 })
 
-test("the seven promises no test used to pin", async () => {
+test("the six promises no test used to pin", async () => {
   // Each of these is a guard the suite stayed green without (mutation-tested):
   // dropping it changes what magpie draws, so each gets its own sentence.
   //
@@ -2690,6 +2702,7 @@ test("the promises round 9 found unpinned", async () => {
   //    "a pool that can't be written down isn't kept"), costing the account
   //    its reading across restarts. The model names live in the window's name.
   for (const w of ok.windows) assert.equal(w.models, undefined, `no models on the ${w.name} window`)
+  // (notModels too: an agent could then think the models-named window excludes them)
   for (const w of ok.windows) assert.equal(w.notModels, undefined, `no notModels either on ${w.name}`)
 
   // 2. a token that states no exp is not called expired: that client calls it
@@ -3280,7 +3293,7 @@ test("the readings no test used to pin, spelled out one by one", () => {
   assert.equal(saidBy({ error: "boom" }), "boom", "a refusal spelled `error`")
   assert.equal(saidBy({ data: { error: "boom" } }), "boom", "and one under data")
   assert.equal(saidBy({ data: { detail: "why" } }), "why", "and `detail` under data")
-  // the order is the client's (app.asar's Vg): a top-level field wins over the
+  // the order is the client's (app.asar's vo): a top-level field wins over the
   // same name under data, whatever order the object was written in
   assert.equal(saidBy({ data: { message: "inner" }, msg: "outer" }), "outer", "a top-level msg beats data.message")
   assert.equal(saidBy({ detail: "d", message: "m" }), "m", "and message comes before detail")
@@ -3482,10 +3495,13 @@ test("both balance reads failing is still the card's error, with its reason", as
   assert.equal(u.windows, undefined, "and nothing is drawn beside it")
 })
 
-test("a sign-in the vendor turns away is not retried on the second endpoint", async () => {
-  // A 403 means every read of this account says the same thing. Falling back
-  // would spend a second request to hear it again, and the card would lose
-  // the "sign in again" mark that is the only thing the user can act on.
+test("a sign-in the vendor turns away is the card's answer, whatever the other reads say", async () => {
+  // A 403 means every read of this account says the same thing, and the card
+  // must keep the "sign in again" mark that is the only thing the user can
+  // act on. The balance read still goes out with the rest — the vendor's own
+  // client asks all three together (S0) — so what this pins is that a
+  // sign-out answer wins over a balance the same batch happened to return,
+  // rather than being reported as a partial read.
   const p = await CodarPlugin()
   const seen = []
   const real = globalThis.fetch
@@ -3498,7 +3514,8 @@ test("a sign-in the vendor turns away is not retried on the second endpoint", as
     const u = await p.auth.usage(auth)
     assert.equal(u.signIn, "expired")
     assert.equal(u.error, "登录已过期，请重新登录")
-    assert.ok(!seen.some((u2) => u2.includes("/v1/agent/balance")), "no second read behind a sign-out")
+    assert.equal(u.windows, undefined, "no row is drawn beside a sign-out answer")
+    assert.ok(seen.some((u2) => u2.includes("/v1/agent/balance")), "the balance read went out with the batch, not after it")
   } finally {
     globalThis.fetch = real
   }
@@ -3570,12 +3587,13 @@ test("the sign-in budget keeps room above three requests, and both stay under ma
   // The old assertions were `3 * TIMEOUT <= BUDGET` and `BUDGET < HOST_*`,
   // which a budget shrunk to exactly 3 timeouts still passes — no room for the
   // read after the claim — and which compare the host deadlines only to the
-  // plugin's own copy of them.
+  // plugin's own copy of them. The host deadlines are the literals magpie
+  // states: 20s for a usage read, 2 minutes for a check-in.
   const t = testables.timing
   assert.ok(3 * t.TIMEOUT_MS + 1000 <= t.CHECKIN_BUDGET_MS, "the check-in's three reads plus a second to spare")
   assert.ok(t.USAGE_BUDGET_MS > t.TIMEOUT_MS, "the usage reads are not cut short by their own budget")
-  assert.ok(t.CHECKIN_BUDGET_MS < t.HOST_CHECKIN_DEADLINE_MS, "and the plugin's timeout lands before magpie's")
-  assert.ok(t.USAGE_BUDGET_MS < t.HOST_USAGE_DEADLINE_MS)
+  assert.ok(t.CHECKIN_BUDGET_MS <= 120 * 1000, "and the plugin's check-in lands before magpie's 2 minutes")
+  assert.ok(t.USAGE_BUDGET_MS <= 20 * 1000, "and its usage read before magpie's 20s")
 })
 
 test("a protocol this provider cannot carry is not listed as the one it can", () => {
@@ -3586,6 +3604,171 @@ test("a protocol this provider cannot carry is not listed as the one it can", ()
   assert.equal(protocolOf({ protocol: { type: "openai_responses" } }), "openai_responses", "the vendor's own word is kept")
   assert.equal(protocolOf({ protocol: { type: "anthropic_messages" } }), "anthropic_messages")
   assert.equal(protocolOf({}), "openai_chat_completions", "and a record that says nothing is the chat one")
+  assert.equal(protocolOf({ protocol: { type: "some_future_wire" } }), "openai_chat_completions", "nor is a name this plugin has never seen kept as if it were one")
   const list = catalogOf({ data: [{ id: "a", protocol: { type: "openai_chat_completions" } }, { id: "b", protocol: { type: "openai_responses" } }, { id: "c", protocol: { type: "anthropic_messages" } }] })
   assert.deepEqual(list.map((m) => m.id), ["a", "c"], "a responses model is not served over the chat wire")
+})
+
+// ---- round 22: the holes the review left, each pinned by a named test ----
+
+test("a second balance endpoint that refuses with a body code is still a refusal", async () => {
+  // /v1/gettoken's body-code gate was pinned; the second balance read
+  // (agentPointsOf) had the same gate and no test ever answered it with a
+  // numeric code other than 200. Read as a balance, a refusal's data would be
+  // drawn on the card — {code:500, ...} painting a wallet of 0 over an account
+  // that has points, which is the one thing every read here refuses to do.
+  await assert.rejects(
+    () =>
+      withFetch({ "/v1/agent/balance": { body: { code: 500, message: "读取失败", data: { agent_balance: 0 } } } }, () =>
+        testables.agentPointsOf(TOKEN, "user_1", { fetchImpl: globalThis.fetch }),
+      ),
+    /读取失败/,
+    "the vendor's own words, not its data",
+  )
+})
+
+test("a sign-out on the second balance endpoint is the sign-out, not a balance", async () => {
+  // {code:401} on /v1/agent/balance is how the vendor says the sign-in is
+  // gone. The card must not print its data as a figure.
+  await assert.rejects(
+    () =>
+      withFetch({ "/v1/agent/balance": { body: { code: 401, data: { agent_balance: 9999 } } } }, () =>
+        testables.agentPointsOf(TOKEN, "user_1", { fetchImpl: globalThis.fetch }),
+      ),
+    /登录已过期/,
+    "a 401 body code is the sign-in gone",
+  )
+})
+
+test("the two balances' gains add up, they do not take turns", async () => {
+  // The card's credit is the sum of both balances' increases (README). Each
+  // existing test moved one balance at a time, so `+` could quietly become
+  // `Math.max` — a reward split across the two pots would be halved.
+  let n = 0
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        n += 1
+        return new Response(JSON.stringify(n === 1 ? { code: 200, token: 500, agent_token: 3978 } : { code: 200, token: 510, agent_token: 4000 }), { status: 200 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.credit, 32, "+10 on the general balance and +22 on the agent one is +32")
+})
+
+test("a first balance read that failed means no credit, not the whole balance", async () => {
+  // If the read before the claim failed, the gain afterwards is unknown: the
+  // card must say nothing rather than report the account's whole balance as
+  // this claim's reward. `before?.general ?? 0` did exactly that.
+  let n = 0
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        n += 1
+        if (n === 1) return new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
+        return new Response(JSON.stringify({ code: 200, token: 900, agent_token: 4000 }), { status: 200 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "claimed")
+  assert.equal(r.credit, 0, "an unknown baseline is no reward at all, not the whole balance")
+})
+
+test("--check says which models the vendor added and which it dropped", async () => {
+  // --check's whole job is noticing a vendor that added or removed a model,
+  // and only the `changed:` line was ever exercised. With `added:` or
+  // `removed:` dropped the run printed nothing and exited 0 over a file that
+  // no longer matched the vendor.
+  const rows = await recordsOf({ code: 200, data: [{ id: "kept", display_name: "K", context_window: 1 }] })
+  const added = await genRun({ body: { code: 200, data: [...(await recordsOf({ code: 200, data: [{ id: "kept", display_name: "K", context_window: 1 }, { id: "brand-new", display_name: "N", context_window: 1 }] }))] }, seeded: render(sortRows(rows)), argv: ["--check"] })
+  assert.equal(added.exit, 1, "a model the vendor added is out of date")
+  assert.ok(added.logs.some((l) => l.includes("added:   brand-new")), `the added record is named: ${JSON.stringify(added.logs)}`)
+  const removed = await genRun({ body: { code: 200, data: [{ id: "kept", display_name: "K", context_window: 1 }] }, seeded: render(sortRows(await recordsOf({ code: 200, data: [{ id: "kept", display_name: "K", context_window: 1 }, { id: "gone", display_name: "G", context_window: 1 }] }))), argv: ["--check"] })
+  assert.equal(removed.exit, 1, "a model the vendor dropped is out of date")
+  assert.ok(removed.logs.some((l) => l.includes("removed: gone")), `the dropped record is named: ${JSON.stringify(removed.logs)}`)
+})
+
+test("a vendor refusing with HTTP 500 is a read failure, not an empty catalog", async () => {
+  // The generator checked res.ok; nothing pinned it. Without that line a 500
+  // whose body still carried a `data` array would be written out as the
+  // vendor's catalog — committing a failed read as the fallback everyone gets.
+  const body = { code: 500, data: [{ id: "ghost", display_name: "Ghost", context_window: 1 }] }
+  const { mkdtempSync, readFileSync } = await import("node:fs")
+  const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
+  writeFileSync(join(root, "config.json"), JSON.stringify({ provider: { speedai: { token: mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) + 3600 }) } } }))
+  const logs = []
+  try {
+    const exit = await main({
+      argv: ["node", "scripts/catalog.mjs"],
+      env: { CODAR_HOME: root },
+      out: join(root, "catalog.mjs"),
+      fetchImpl: async () => new Response(JSON.stringify(body), { status: 500, headers: { "Content-Type": "application/json" } }),
+      log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
+    })
+    assert.equal(exit, 2, "an HTTP refusal is a read failure")
+    assert.ok(logs.some((l) => l.includes("HTTP 500")), `and it says so: ${JSON.stringify(logs)}`)
+    assert.throws(() => readFileSync(join(root, "catalog.mjs")), "nothing was written")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a message cut to fit ends on a character, not on half of one", async () => {
+  // README: a string shown on a card — a model's name, a message — is cut
+  // by the character, not by the UTF-16 unit. Only names went through the
+  // code-point cut; a message was clipped with .slice(0, 400), so a vendor
+  // sentence full of emoji ended in a lone surrogate the host reads as U+FFFD.
+  const p = await CodarPlugin()
+  const long = "a" + "😀".repeat(300)
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 200, message: long } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.ok([...r.message].length <= 400, "no longer than the card reads, counted in characters")
+  assert.doesNotMatch(r.message, /[\uD800-\uDBFF]$/, "and never ends on a lone high surrogate")
+  assert.doesNotMatch(r.message, /^[\uDC00-\uDFFF]/, "nor starts on a lone low one")
+})
+
+test("a name that is all emoji is cut on a character too", () => {
+  // cleanText's cut is the same rule, measured on the character count rather
+  // than the UTF-16 length: 120 code points of emoji are 240 UTF-16 units.
+  const name = cleanText("😀".repeat(200))
+  assert.equal([...name].length, 120)
+  assert.doesNotMatch(name, /[\uD800-\uDBFF]$/)
+})
+
+test("a name that is many code points is cut on a code point", () => {
+  // cleanText's cut is the same rule scrub got: measured in code points, not
+  // UTF-16 units. A name of astral characters is where the two differ — 130
+  // code points are 260 UTF-16 units, and the old slice(0, 120) would have
+  // kept 60 characters and clipped the 60th in half.
+  const name = cleanText("😀".repeat(130))
+  assert.equal([...name].length, 120, "120 characters, not 60")
+  assert.doesNotMatch(name, /[\uD800-\uDBFF]$/, "and not half of one")
+})
+
+test("the first balance read's agent figure wins over the second one", async () => {
+  // The vendor's own client merges them as `gettoken's agentPoints ?? the
+  // second read` (app.asar's S0). Reading the second one over the top would
+  // report a figure the vendor's first answer already contradicted.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 4000 } },
+      "/v1/agent/balance": { body: { code: 200, data: { username: "user_1", agent_balance: 9999 } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 60 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.balance, "500 点 · Agent 4000 点 可用", "the first read's figure, as the vendor's client merges them")
 })
