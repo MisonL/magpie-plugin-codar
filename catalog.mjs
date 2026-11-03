@@ -89,7 +89,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
@@ -103,7 +104,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
@@ -117,7 +119,8 @@ export const CATALOG = [
     "context": 1000000,
     "maxOutput": 128000,
     "input": [
-      "text"
+      "text",
+      "image"
     ],
     "output": [
       "text"
