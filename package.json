@@ -21,7 +21,7 @@
     "test/plugin.test.mjs",
     "test/style.test.mjs",
     "README.md",
-    "README.zh-CN.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [

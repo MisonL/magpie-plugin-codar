@@ -58,7 +58,7 @@ test("the tree walk finds the files it is meant to guard", () => {
     assert.ok(JS.includes(rel), `the walk missed ${rel}`)
   }
   assert.ok(MD.length >= 2, `the walk found only ${MD.length} .md files`)
-  assert.ok(MD.includes("README.md") && MD.includes("README.zh-CN.md"), "the walk missed a README")
+  assert.ok(MD.includes("README.md") && MD.includes("CONTRIBUTING.md"), "the walk missed a documentation file")
 })
 
 test("every JS file is LF, with no CR anywhere", () => {

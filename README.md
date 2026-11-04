@@ -12,8 +12,9 @@ A [magpie](https://github.com/yetone/magpie) plugin for **Codar (科搭)**, the 
 ## Install
 
 ```bash
-magpie plugin add github:MisonL/magpie-plugin-codar   # from GitHub
-# magpie plugin add "$PWD"                            # or from a checkout
+magpie plugin add magpie-plugin-codar                  # from npm
+# magpie plugin add github:MisonL/magpie-plugin-codar  # or from GitHub
+# magpie plugin add "$PWD"                             # or from a checkout
 magpie plugin login codar      # pick "读取本机科搭令牌", or paste the token
 ```
 
@@ -62,6 +63,8 @@ node scripts/catalog.mjs          # regenerate it from the signed-in app
 The suite also pins the formatting in `.editorconfig` (LF, one final newline, no trailing whitespace, two-space indent) — `test/style.test.mjs` walks the tree, so a new file is covered the moment it lands. `CONTRIBUTING.md` has the invariants the tests defend.
 
 CI runs the suite on Node 18–24, on Bun across Linux / macOS / Windows, and on Node on Windows and macOS — the plugin reads a file under the home directory, and that is where per-platform differences show up.
+
+Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html); [CHANGELOG.md](CHANGELOG.md) records every release, and the release process is described in `CONTRIBUTING.md`.
 
 ## Licence
 

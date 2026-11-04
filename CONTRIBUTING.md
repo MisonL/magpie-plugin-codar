@@ -65,14 +65,32 @@ functions in `app.asar` each reader follows. When a shape changes, widen the
 reader and add a test that sends the new shape; run
 `node scripts/catalog.mjs --check` after a catalog change.
 
-## Publishing
+## Documentation
 
-The package is not on npm yet. When it is, this is the whole of it:
+Everything a reader sees is English: the README, this file, `CHANGELOG.md`,
+GitHub release notes and the npm metadata. Code that quotes the vendor's own
+Chinese strings keeps them — they are behaviour, not prose.
+
+## Versioning and releases
+
+The version in `package.json` is the single source of truth; git tags are
+`v<version>`, and `CHANGELOG.md` holds one dated section per version in
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) form. The project
+follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with the
+pre-1.0 reading: a new feature or a behaviour change is a minor bump, a fix is
+a patch, and 1.0.0 is reserved for the point where the plugin's reader
+contract is stable.
+
+Every user-visible change lands under `## [Unreleased]` first, in one of
+Added / Changed / Fixed / Removed. A release moves that section under the new
+version with the release date, then:
 
 ```bash
-node --test          # the suite, no network
-npm publish          # prepublishOnly runs the suite again
+npm version <patch|minor|major> -m "release: v%s"   # bumps package.json, commits, tags
+git push --follow-tags
+npm publish                                         # prepublishOnly runs the suite
+gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
 ```
 
 `npm pack --dry-run` lists what ships: the plugin, the catalog and its
-generator, both test files, both READMEs, the licence.
+generator, both test files, the README, the changelog and the licence.
