@@ -5,7 +5,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, sep } from "node:path"
 
 import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
@@ -3890,7 +3890,10 @@ test("the sign-in's failure text says ~ instead of this machine's home", () => {
   assert.match(r.error, /没找到/)
   assert.ok(!r.error.includes(homedir()), `no home directory in the message: ${r.error}`)
   assert.ok(r.error.includes("~"), "but the file is still pointed at")
-  assert.equal(shownPath(absent), "~/.codar/codar-plugin-test-absent.json")
+  // shownPath keeps the platform's own separator, as the path it shortens
+  // does — the expected value is built the same way instead of being written
+  // with "/", which is only this suite's platform's (Windows says ~\.codar\…).
+  assert.equal(shownPath(absent), `~${sep}${join(".codar", "codar-plugin-test-absent.json")}`)
   // a path the user chose (CODAR_HOME, a temp dir) is said as it is
   assert.equal(shownPath("/tmp/codar-x/config.json"), "/tmp/codar-x/config.json")
 })
