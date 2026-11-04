@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-codar",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Codar (科搭) for magpie — its models as a provider, the daily check-in, and the account's points on the card",
   "author": "MisonL",
   "type": "module",
