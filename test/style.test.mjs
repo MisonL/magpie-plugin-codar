@@ -53,8 +53,8 @@ test("the tree walk finds the files it is meant to guard", () => {
   // below pass without looking at anything — the same "denominator is zero,
   // call it ok" failure the runtime probes guard against. Pin the floor and
   // the files that must be in it, including this one.
-  assert.ok(JS.length >= 5, `the walk found only ${JS.length} .mjs files`)
-  for (const rel of ["index.mjs", "catalog.mjs", "scripts/catalog.mjs", "test/plugin.test.mjs", "test/style.test.mjs"]) {
+  assert.ok(JS.length >= 6, `the walk found only ${JS.length} .mjs files`)
+  for (const rel of ["index.mjs", "internal.mjs", "catalog.mjs", "scripts/catalog.mjs", "test/plugin.test.mjs", "test/style.test.mjs"]) {
     assert.ok(JS.includes(rel), `the walk missed ${rel}`)
   }
   assert.ok(MD.length >= 2, `the walk found only ${MD.length} .md files`)

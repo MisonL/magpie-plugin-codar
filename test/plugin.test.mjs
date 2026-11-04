@@ -7,7 +7,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join, sep } from "node:path"
 
-import CodarPlugin, { testables } from "../index.mjs"
+import CodarPlugin from "../index.mjs"
+import { testables } from "../internal.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
@@ -2833,7 +2834,7 @@ test("a regeneration that put a __proto__ id in the catalog does not become the 
   const here = fileURLToPath(new URL("..", import.meta.url))
   const root = mkdtempSync(join(tmpdir(), "codar-cat-"))
   try {
-    for (const f of ["index.mjs", "catalog.mjs", "package.json"]) cpSync(join(here, f), join(root, f))
+    for (const f of ["index.mjs", "internal.mjs", "catalog.mjs", "package.json"]) cpSync(join(here, f), join(root, f))
     const cat = readFileSync(join(root, "catalog.mjs"), "utf8")
     writeFileSync(join(root, "catalog.mjs"), cat.replace(/export const CATALOG = \[/, 'export const CATALOG = [\n  { "id": "__proto__", "name": "E", "context": 1, "maxOutput": 1, "input": ["text"], "output": ["text"], "protocol": "openai_chat_completions", "reasoning": false },') )
     const { default: Other } = await import(pathToFileURL(join(root, "index.mjs")).href)
@@ -4066,4 +4067,15 @@ test("the magic keys are exactly the names a model map is not allowed to carry",
   // model would have.
   assert.deepEqual([...magicKeys].sort(), ["__proto__", "constructor", "prototype"])
   assert.equal(magicKeys.has("name"), false, "a name a model could carry is not one of them")
+})
+
+test("the auth hook carries a loader, and it hands the request the account's key", async () => {
+  // The repo's rule for a provider served through config: an auth hook of
+  // { provider, loader, methods }. magpie falls back to the stored key
+  // without one, but OpenCode's own entry points read the loader; an account
+  // with no usable key answers {} rather than a made-up one.
+  const p = await CodarPlugin()
+  assert.deepEqual(await p.auth.loader(async () => auth()), { apiKey: TOKEN })
+  assert.deepEqual(await p.auth.loader(async () => ({ type: "api", key: "  " })), {}, "no key, no credential")
+  assert.deepEqual(await p.auth.loader(async () => undefined), {}, "and no auth at all is the same")
 })

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-04
+
+### Changed
+
+- The test hooks moved out of the entry module: `index.mjs` now exports only
+  the plugin function, and every reader plus the `testables` object lives in
+  `internal.mjs`. OpenCode 1.x takes every export of `main` for a plugin and
+  refused the package over `testables`.
+- The auth hook gained a `loader`, as the provider contract expects for a
+  provider served through config: a request for the account carries the
+  stored key, and an account with no usable key answers `{}`.
+
 ### Added
 
 - `CHANGELOG.md`, shipped with the package.
@@ -45,5 +57,6 @@ Initial release.
 - A test suite (187 tests) on Node 18–24 and Bun across Linux, macOS and
   Windows, including a formatting test that pins `.editorconfig`.
 
-[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.1.1
 [0.1.0]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.1.0

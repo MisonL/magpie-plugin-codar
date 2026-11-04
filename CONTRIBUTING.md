@@ -6,12 +6,14 @@ trips one is a change to argue for, not to route around.
 
 ## The rules the suite defends
 
-**Export no function except the plugin itself.** magpie's loader takes *every*
-function a module exports as a plugin entry (`servers()` in the host walks
-`Object.values(mod)`), so a helper exported for a test would run as a second
-plugin in every magpie the package is installed into. Pure helpers live on the
-`testables` object, which the loader skips. `test/plugin.test.mjs` pins the
-export list.
+**The entry module exports only plugin functions.** magpie's loader takes
+*every* function a module exports as a plugin entry (`servers()` in the host
+walks `Object.values(mod)`), and OpenCode 1.x refuses the whole package when
+`main` exports anything that is not a plugin — `testables` in `index.mjs` did
+exactly that. So `index.mjs` exports only `CodarPlugin`; the readers and the
+`testables` object live in `internal.mjs`, which the plugin and the tests
+import. `test/plugin.test.mjs` pins the entry module's export list, and
+magpie-community/plugins' `scripts/check.mjs` is the fuller gate.
 
 **Never print the token.** Error messages pass through `scrubLine`, which cuts
 the token where it is known and any JWT-shaped string where it is not; answers
@@ -60,7 +62,7 @@ Node on Windows and macOS.
 ## Against the real API
 
 The vendor's endpoints are unversioned, and its own desktop client is the
-authority on how each field is read — the comments in `index.mjs` name the
+authority on how each field is read — the comments in `internal.mjs` name the
 functions in `app.asar` each reader follows. When a shape changes, widen the
 reader and add a test that sends the new shape; run
 `node scripts/catalog.mjs --check` after a catalog change.

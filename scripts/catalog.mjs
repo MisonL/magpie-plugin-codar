@@ -65,18 +65,18 @@ const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
 
 // plugin is loaded once, when it is first needed: the top-level import is what
 // this file must not depend on. A published package ships scripts/catalog.mjs
-// with index.mjs beside it, but a run from a checkout where the plugin is not
+// with internal.mjs beside it, but a run from a checkout where the plugin is not
 // resolvable — or a Node that refuses a bare dynamic import of a file beside
 // the script — should get the exit code and the sentence, not a module-loader
 // stack before main() can say anything.
 let plugin = null
 const pluginOf = async () => {
-  if (!plugin) plugin = (await import(new URL("../index.mjs", import.meta.url).href)).testables
+  if (!plugin) plugin = (await import(new URL("../internal.mjs", import.meta.url).href)).testables
   return plugin
 }
 
 // configPathOf is where the app keeps its own config, the same place the
-// plugin's read-from-this-machine sign-in looks (index.mjs's configPath).
+// plugin's read-from-this-machine sign-in looks (internal.mjs's configPath).
 // The value is taken as the app's sidecar takes it: verbatim, not trimmed
 // (`CODAR_HOME="  /tmp/x  "` answers `  /tmp/x  /config.json`), with an
 // empty value meaning "not set" — a trim here would read a file the app never
@@ -90,7 +90,7 @@ export const configPathOf = (env = process.env) => {
 // catalogOf, then one record per id with a later one winning — exactly what
 // the runtime's `Object.fromEntries` over the same list leaves in the model
 // map. Then the ids that name a property of every object are dropped, as the
-// runtime drops them (index.mjs's noMagicKeys): a record named `__proto__` is
+// runtime drops them (internal.mjs's noMagicKeys): a record named `__proto__` is
 // never served, so a file that carried one would be a fallback the live path
 // does not have. null means the answer named no list we could read
 // (catalogOf's own "unreadable", not "empty").
@@ -168,13 +168,13 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
   try {
     rules = await pluginOf()
   } catch (e) {
-    // index.mjs itself could not be loaded (no plugin beside this script, or
+    // internal.mjs itself could not be loaded (no plugin beside this script, or
     // its own catalog.mjs missing): without the plugin's rules there is no
     // token to check and no record to build, so this is a read failure —
     // never "out of date".
-    return fail(`读不了插件的目录规则（${whyOf(e)}）：确认 index.mjs 和 catalog.mjs 都在这份脚本旁边`)
+    return fail(`读不了插件的目录规则（${whyOf(e)}）：确认 internal.mjs 和 catalog.mjs 都在这份脚本旁边`)
   }
-  // The sign-in's own gate (index.mjs's tokenOf): a token with a newline, a
+  // The sign-in's own gate (internal.mjs's tokenOf): a token with a newline, a
   // NUL or anything else that is not visible ASCII cannot go in a header, and
   // fetch refuses one by quoting the whole header — the token — in its error,
   // which this script would then print. Refused here, before it is sent.
@@ -185,7 +185,7 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
   try {
     const res = await fetchImpl(`${API}${CATALOG_PATH}`, { headers: { Authorization: `Bearer ${sent}`, "User-Agent": "node" } })
     if (!res.ok) return fail(`GET ${CATALOG_PATH} → HTTP ${res.status}`)
-    // 用插件自己的有上限读法（index.mjs 的 readAnswer）：它边读流边计数，
+    // 用插件自己的有上限读法（internal.mjs 的 readAnswer）：它边读流边计数，
     // 超过 MAX_ANSWER_BYTES 就放弃。res.json() 会把整份应答先收进内存，无论
     // 多大——和插件在钩子里踩过的坑是同一个。开头的 BOM 也照 request() 去掉：
     // JSON.parse 遇到它会把整份应答判成不是 JSON。
@@ -196,12 +196,12 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
     // did not answer with a list, so there is nothing here to compare. The
     // token is cut from what is said, in case an error names it anyway.
     // 按形状切，不只按这把令牌精确切：服务器可能把令牌折行、插空格，或只回显
-    // payload 段地引回来，精确子串匹配挡不住（见 index.mjs 的 jwtShape）。
+    // payload 段地引回来，精确子串匹配挡不住（见 internal.mjs 的 jwtShape）。
     return fail(`GET ${CATALOG_PATH} 没读成（${rules.scrubLine(whyOf(e), sent)}）：这是取数的失败，不是目录过时`)
   }
 
   const rows = await recordsOf(body)
-  if (!rows) return fail("应答里没有一份读得出的模型列表：厂商可能换了形状（先核对 index.mjs 的 catalogOf），也可能是一次故障")
+  if (!rows) return fail("应答里没有一份读得出的模型列表：厂商可能换了形状（先核对 internal.mjs 的 catalogOf），也可能是一次故障")
   // The file is the fallback for the plugin, not one account's answer, and it
   // is committed. An answer that names no models is not allowed to empty it.
   if (!rows.length) return fail("厂商这次答了 0 个模型：这份目录是所有人的回退，不拿一次的答案把它清空（确认后手动改 catalog.mjs）")

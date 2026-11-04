@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-codar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codar (科搭) for magpie — its models as a provider, the daily check-in, and the account's points on the card",
   "author": "MisonL",
   "type": "module",
@@ -16,6 +16,7 @@
   "exports": "./index.mjs",
   "files": [
     "index.mjs",
+    "internal.mjs",
     "catalog.mjs",
     "scripts/catalog.mjs",
     "test/plugin.test.mjs",
