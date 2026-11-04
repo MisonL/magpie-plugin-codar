@@ -11,7 +11,7 @@ import CodarPlugin, { testables } from "../index.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, MAX_MODELS, MAX_ANSWER_BYTES } = testables
+const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, MAX_MODELS, MAX_ANSWER_BYTES } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -3986,4 +3986,81 @@ test("the generator reads the app's file where the plugin does, whitespace and a
   assert.equal(configPathOf({ CODAR_HOME: "  /tmp/x  " }), join("  /tmp/x  ", "config.json"), "verbatim, as the sidecar answers it")
   assert.equal(configPathOf({ CODAR_HOME: "   " }), join("   ", "config.json"), "whitespace is a value, as it is to the app")
   assert.equal(configPathOf({}), join(homedir(), ".codar", "config.json"), "an empty value is 'not set'")
+})
+
+// ---- the readers the balances sit on, pinned directly ---------------------
+
+test("balanceOf reads a balance the way the vendor client does, and nothing it would not", () => {
+  // Three readers used to carry the whole balance path with no test of their
+  // own: every suite that reached them went through a vendor answer already
+  // shaped to fit, so the edges below were only reachable by writing the
+  // answer that would expose them. A balance is what numOf read — a number or
+  // a string that says one — and non-negative and finite. Each refusal here
+  // is a value routing would otherwise read as the account's money.
+  assert.equal(balanceOf(5), 5)
+  assert.equal(balanceOf(0), 0, "a real 0 is a balance, not 'not stated'")
+  assert.equal(balanceOf("12"), 12, "the vendor writes some numbers as strings (see numOf)")
+  assert.equal(balanceOf(" 12 "), 12, "and its strings come padded")
+  assert.equal(balanceOf(-5), null, "a negative is not a balance: the host clamps a wallet to 0")
+  assert.equal(balanceOf(-0), -0, "negative zero is still zero")
+  assert.equal(balanceOf("NaN"), null, "Number('NaN') is NaN")
+  assert.equal(balanceOf(""), null)
+  assert.equal(balanceOf("   "), null, "a blank string says nothing")
+  assert.equal(balanceOf("no points"), null)
+  assert.equal(balanceOf(NaN), null)
+  assert.equal(balanceOf(Infinity), null)
+  assert.equal(balanceOf(-Infinity), null)
+  for (const notANumber of [true, false, null, undefined, [], [5], {}, { valueOf: () => 5 }]) {
+    // numOf reads numbers and non-blank strings only, so a JSON body's other
+    // types never reach Number(): Number([]) is 0 and an object's valueOf is
+    // its own answer. Each of these read as a balance would be a made-up one.
+    assert.equal(balanceOf(notANumber), null, `${JSON.stringify(notANumber) ?? String(notANumber)} is not a balance`)
+  }
+})
+
+test("pickOf walks the names in order and stops at the first that says a balance", () => {
+  // The vendor client tries its names in turn (app.asar's Dn). Order is the
+  // contract: a name that reads as nothing must not shadow a later one, and a
+  // name that reads as 0 is an answer — the walk stops there, it does not look
+  // for a bigger number behind it. Reading `token` first and falling through
+  // on 0 would report an empty account as funded.
+  assert.equal(pickOf({ points: 5, token: 3 }, ["token", "points"]), 3, "the first name that reads, not the largest")
+  assert.equal(pickOf({ token: -1, points: 5 }, ["token", "points"]), 5, "a name that is not a balance falls through")
+  assert.equal(pickOf({ token: "no points", balance: 7 }, ["token", "balance"]), 7, "as does one that is not a number")
+  assert.equal(pickOf({ token: 0, points: 5 }, ["token", "points"]), 0, "but a real 0 is an answer, and the walk stops")
+  assert.equal(pickOf({}, ["token", "points"]), null, "no name present is no balance")
+  assert.equal(pickOf({ token: 3 }, []), null, "and no name asked for is none either")
+  assert.equal(pickOf(null, ["token"]), null, "a body of null is no balance, not a throw")
+  assert.equal(pickOf(undefined, ["token"]), null)
+})
+
+test("unwrapped takes data only when it is an object, and the body itself otherwise", () => {
+  // app.asar's Gt: the live points body is flat, and a wrapped one is what
+  // that client prefers if the vendor starts sending it. `data` that is a
+  // string, a number or null is not a wrapper — unwrapping it would hand the
+  // readers a scalar to look names up in, and the balance read would answer
+  // "no balance" over a body that plainly has one.
+  const wrapped = { code: 200, data: { token: 7, agent_token: 3 } }
+  assert.equal(unwrapped(wrapped), wrapped.data, "an object data is unwrapped")
+  const flat = { code: 200, token: 7 }
+  assert.equal(unwrapped(flat), flat, "a flat body is its own answer")
+  const nulled = { code: 200, data: null }
+  assert.equal(unwrapped(nulled), nulled, "a null data is not a wrapper")
+  const texty = { code: 200, data: "ok" }
+  assert.equal(unwrapped(texty), texty, "nor is a string")
+  const numbered = { code: 200, data: 0 }
+  assert.equal(unwrapped(numbered), numbered, "nor a number")
+  assert.equal(unwrapped(null), null, "and no body at all has nothing to unwrap")
+})
+
+test("the magic keys are exactly the names a model map is not allowed to carry", () => {
+  // noMagicKeys and scripts/catalog.mjs both import this set, so the ids the
+  // runtime drops and the ids a regeneration drops stay one list: a record
+  // named `__proto__` never reaches magpie as a model (the host's
+  // `out.models[key] = …` would set a prototype), and one written into the
+  // fallback would be an id the live path would never serve. The set is small
+  // and named for a reason — pin it, so it cannot quietly grow a name a real
+  // model would have.
+  assert.deepEqual([...magicKeys].sort(), ["__proto__", "constructor", "prototype"])
+  assert.equal(magicKeys.has("name"), false, "a name a model could carry is not one of them")
 })
