@@ -12,8 +12,8 @@
 ## 安装
 
 ```bash
-magpie plugin add "$PWD"       # 尚未发布；先从这个目录装
-# magpie plugin add github:MisonL/magpie-plugin-codar   # 发布之后
+magpie plugin add github:MisonL/magpie-plugin-codar   # 从 GitHub 安装
+# magpie plugin add "$PWD"                            # 或从本地目录安装
 magpie plugin login codar     # 选「读取本机科搭令牌」，或粘贴令牌
 ```
 
@@ -57,6 +57,8 @@ node scripts/catalog.mjs           # 按本机已登录的 App 重新生成
 ```
 
 `catalog.mjs` 使用插件自身的 `catalogOf` 生成，回退列表与实时列表按同一套规则构建。退出码：`0` 无变化，`1` 记录有变动（仅 `--check`），`2` 厂商或文件不可读——取数失败不写文件、不清空回退。该命令需要已登录的 App，因此作为本地命令而非 CI 步骤。
+
+测试套件同时钉住 `.editorconfig` 的格式约定（LF、唯一末尾换行、无行尾空格、两空格缩进）——`test/style.test.mjs` 从文件树自动发现文件，新文件落地即受检。测试守护的硬契约见 `CONTRIBUTING.md`。
 
 CI 在 Node 18–24、Bun（Linux / macOS / Windows）、以及 Windows / macOS 的 Node 上运行——插件读取主目录下的文件，平台差异在此暴露。
 

@@ -12,8 +12,8 @@ A [magpie](https://github.com/yetone/magpie) plugin for **Codar (科搭)**, the 
 ## Install
 
 ```bash
-magpie plugin add "$PWD"        # not published yet; install from this folder
-# magpie plugin add github:MisonL/magpie-plugin-codar   # once published
+magpie plugin add github:MisonL/magpie-plugin-codar   # from GitHub
+# magpie plugin add "$PWD"                            # or from a checkout
 magpie plugin login codar      # pick "读取本机科搭令牌", or paste the token
 ```
 
@@ -58,6 +58,8 @@ node scripts/catalog.mjs          # regenerate it from the signed-in app
 ```
 
 `catalog.mjs` is generated with the plugin's own reader (`catalogOf`), so the fallback and the live list are built by the same rules. Its exit codes keep failures apart: `0` nothing moved, `1` a record moved (`--check` only), `2` the vendor or the file could not be read — a failed run writes nothing and never empties the fallback. It needs a signed-in app, so it is a local command, not a CI step.
+
+The suite also pins the formatting in `.editorconfig` (LF, one final newline, no trailing whitespace, two-space indent) — `test/style.test.mjs` walks the tree, so a new file is covered the moment it lands. `CONTRIBUTING.md` has the invariants the tests defend.
 
 CI runs the suite on Node 18–24, on Bun across Linux / macOS / Windows, and on Node on Windows and macOS — the plugin reads a file under the home directory, and that is where per-platform differences show up.
 
