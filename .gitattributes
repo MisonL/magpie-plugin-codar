@@ -1,0 +1,28 @@
+# Keep the repository's text as it was written: LF, everywhere.
+#
+# The style test (test/style.test.mjs) asserts that every text file is LF and
+# ends with one newline — and a checkout that turned its lines into CRLF,
+# which is what git's core.autocrlf=true does by default on Windows, would
+# fail it before the plugin's own tests even run. `eol=lf` is what holds that
+# line on every platform: it applies even where core.autocrlf=true, so a
+# Windows checkout sees the same bytes the repository stores and the style
+# test reads the same text on every runner. CI runs the suite on Windows, so
+# this file is load-bearing there, not cosmetic.
+#
+# The binary list is what keeps a format git cannot sniff correctly from
+# being converted as if it were text.
+* text=auto eol=lf
+
+# Explicitly binary: never convert, never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip binary
+*.gz binary
+*.tgz binary
