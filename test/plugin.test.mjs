@@ -2682,8 +2682,8 @@ test("a model the vendor names __proto__ is dropped, not handed on as a prototyp
   assert.equal(Object.getPrototypeOf(fresh), Object.prototype, "the list's own prototype is untouched")
 })
 
-// Three promises the README makes that the suite stayed green without
-// (mutation-tested in round 9: each change below left 102/102 passing).
+// Three promises of the plugin's own contract that the suite stayed green
+// without (mutation-tested in round 9: each change below left 102/102 passing).
 test("the promises round 9 found unpinned", async () => {
   const p = await CodarPlugin()
   const until = Math.floor(Date.now() / 1000) + 3600
@@ -3641,9 +3641,11 @@ test("a sign-out on the second balance endpoint is the sign-out, not a balance",
 })
 
 test("the two balances' gains add up, they do not take turns", async () => {
-  // The card's credit is the sum of both balances' increases (README). Each
-  // existing test moved one balance at a time, so `+` could quietly become
-  // `Math.max` — a reward split across the two pots would be halved.
+  // The card's credit is the sum of both balances' increases (the check-in's
+  // contract: the vendor says a claim grants "点数奖励" without saying which
+  // balance holds it). Each existing test moved one balance at a time, so `+`
+  // could quietly become `Math.max` — a reward split across the two pots would
+  // be halved.
   let n = 0
   const p = await CodarPlugin()
   const r = await withFetch(
@@ -3720,10 +3722,10 @@ test("a vendor refusing with HTTP 500 is a read failure, not an empty catalog", 
 })
 
 test("a message cut to fit ends on a character, not on half of one", async () => {
-  // README: a string shown on a card — a model's name, a message — is cut
-  // by the character, not by the UTF-16 unit. Only names went through the
-  // code-point cut; a message was clipped with .slice(0, 400), so a vendor
-  // sentence full of emoji ended in a lone surrogate the host reads as U+FFFD.
+  // A string shown on a card — a model's name, a message — is cut by the
+  // character, not by the UTF-16 unit. Only names went through the code-point
+  // cut; a message was clipped with .slice(0, 400), so a vendor sentence full
+  // of emoji ended in a lone surrogate the host reads as U+FFFD.
   const p = await CodarPlugin()
   const long = "a" + "😀".repeat(300)
   const r = await withFetch(
