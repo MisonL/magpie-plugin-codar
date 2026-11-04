@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-04
+
+### Fixed
+
+- The suite now passes from the npm tarball: the style test pinned
+  `CONTRIBUTING.md`, which is not shipped with the package, so running
+  `node --test` inside a fresh tarball failed 1 of 188 tests. The required
+  documentation files are now the ones the package actually carries
+  (`README.md` and `CHANGELOG.md`), verified by unpacking a tarball and
+  running the full suite inside it (188/188).
+
 ## [0.1.1] - 2026-11-04
 
 ### Changed
@@ -57,6 +68,7 @@ Initial release.
 - A test suite (187 tests) on Node 18–24 and Bun across Linux, macOS and
   Windows, including a formatting test that pins `.editorconfig`.
 
-[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.1.2
 [0.1.1]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.1.1
 [0.1.0]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.1.0
