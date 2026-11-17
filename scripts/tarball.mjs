@@ -13,12 +13,17 @@
 //
 //   node scripts/tarball.mjs                 # exit 0 when the packed suite passes
 //   node scripts/tarball.mjs --require-bun   # …and Bun must run it too
+//   node scripts/tarball.mjs --require-builds
+//                                            # …and the install check must run
+//                                            # (a tree without native/bin is an
+//                                            # error; without it, a skip)
 //
 // The install check needs the source tree's builds (`native/bin`, from
-// `npm run native:all`): without them the gate exits 2 rather than passing on
-// a check it did not run. Inside a packed run of the suite (CODAR_TARBALL_GATE)
-// there are no builds to stage and the packed suite is already running, so the
-// install check is skipped there.
+// `npm run native:all`). Without them it is skipped and says so, unless
+// `--require-builds` is passed — a release run (`prepublishOnly`) passes it,
+// so a release cannot ship on a check that did not run. Inside a packed run
+// of the suite (CODAR_TARBALL_GATE) there are no builds to stage and the
+// packed suite is already running, so the install check is skipped there.
 
 import { execFileSync, spawn } from "node:child_process"
 import { createServer } from "node:http"
@@ -34,6 +39,7 @@ import { platformPackages, stagePackages, checkPackages } from "./native-package
 // elsewhere.
 const pkgRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const requireBun = process.argv.includes("--require-bun")
+const requireBuilds = process.argv.includes("--require-builds")
 // npm and tar are .cmd shims on Windows, which execFileSync only finds
 // through the shell. cmd.exe receives the arguments joined, not quoted, and a
 // temp directory can carry a space (a Windows profile folder commonly does),
@@ -70,7 +76,10 @@ export const run = (cmd, args, { throughShell = shell, ...opts } = {}) => {
     // status error. Both mean "could not run here", not "the gate ran and
     // failed", so the exit code is 2 on either platform.
     const missing = e?.code === "ENOENT" || (throughShell && (e?.status === 9009 || e?.status === 127))
-    if (missing) { const miss = new Error(`${cmd} was not found in PATH; this check needs it`); miss.exitCode = 2; throw miss }
+    // missingProgram is what the Bun half reads to tell "not installed" (a
+    // skip, or exit 2 under --require-bun) from "ran and failed"; it was never
+    // set, so a machine without Bun never skipped the Bun half at all.
+    if (missing) { const miss = new Error(`${cmd} was not found in PATH; this check needs it`); miss.exitCode = 2; miss.missingProgram = true; throw miss }
     // A program that ran and failed (npm cannot pack, tar cannot unpack) is
     // also "nothing usable came of the run" — 2 — not "the packed suite
     // failed" — 1. execFileSync reports the child's status as .status, and
@@ -259,8 +268,8 @@ console.log(JSON.stringify(out))
 
 const main = async () => {
   const options = process.argv.slice(2)
-  const unknown = options.filter((a) => a !== "--require-bun")
-  if (unknown.length) throw usage(`unrecognized argument ${unknown.join(" ")} (only --require-bun is accepted)`)
+  const unknown = options.filter((a) => a !== "--require-bun" && a !== "--require-builds")
+  if (unknown.length) throw usage(`unrecognized argument ${unknown.join(" ")} (only --require-bun and --require-builds are accepted)`)
   let root
   try {
     root = mkdtempSync(join(tmpdir(), "codar-tarball-"))
@@ -334,11 +343,12 @@ const main = async () => {
       if (report.proxy !== `${mine.name}/bin/${mine.file}`) throw new Error(`the installed plugin opened ${report.proxy ?? "no platform package"}`)
       if (!report.started) throw new Error(`the installed plugin did not start ${mine.name}'s build`)
       console.log(`install: ${manager} installed ${mine.name} and the plugin started it`)
-    } else {
-      // No builds here: there is no install path to check, and a pass would
-      // say there was. Run `npm run native:all` first — a release cannot be
-      // checked without it.
+    } else if (requireBuilds) {
+      // No builds on a release run: there is no install path to check, and a
+      // pass would say there was. `prepublishOnly` passes --require-builds.
       throw usage(`no builds in ${bin}: the install check needs them (run \`npm run native:all\` first)`)
+    } else {
+      console.log("install: skipped, no builds in this tree (--require-builds makes this an error)")
     }
     const suite = (cmd, args) => {
       try {

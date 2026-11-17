@@ -6434,18 +6434,52 @@ test("a missing Bun is a skip, and --require-bun makes it exit 2", { skip: proce
   // Two different answers: a machine without Bun simply skips that half, and a
   // release run that requires Bun has not run the check at all — 2 ("could not
   // run here"), not 1 ("the packed suite failed"). The old code answered 1 for
-  // both because a shell 127 never carried ENOENT.
-  const { existsSync, mkdtempSync, rmSync } = await import("node:fs")
+  // both because a shell 127 never carried ENOENT. The packed suite's Bun half
+  // is not this test's subject, so the gate is shown a packed run
+  // (CODAR_TARBALL_GATE), which is also how the suite inside a tarball avoids
+  // running this gate again.
+  const { existsSync } = await import("node:fs")
   const { spawnSync } = await import("node:child_process")
   const { fileURLToPath } = await import("node:url")
   const dirs = (process.env.PATH || "").split(":").filter((d) => d && !existsSync(join(d, "bun")))
-  const env = { ...process.env, PATH: dirs.join(":") }
+  const env = { ...process.env, PATH: dirs.join(":"), CODAR_TARBALL_GATE: "1" }
   const here = fileURLToPath(new URL("..", import.meta.url))
   const optional = spawnSync(process.execPath, [join(here, "scripts", "tarball.mjs")], { env, encoding: "utf8", timeout: 110000 })
   assert.equal(optional.status, 0, `a missing Bun is a skip: ${optional.stdout}${optional.stderr}`)
   assert.match(optional.stdout + optional.stderr, /skipped/)
   const required = spawnSync(process.execPath, [join(here, "scripts", "tarball.mjs"), "--require-bun"], { env, encoding: "utf8", timeout: 110000 })
   assert.equal(required.status, 2, `a required Bun that is missing is "could not run": ${required.stdout}${required.stderr}`)
+})
+
+test("the gate fails a release run without builds, and skips the check otherwise", { skip: process.platform === "win32" || Boolean(process.env.CODAR_TARBALL_GATE), timeout: 120000 }, async () => {
+  // The install check needs native/bin, and a tree without it used to report
+  // the platform packages as "not installed" and exit 0: a dry run and a fresh
+  // clone both passed a check they never ran. A release run
+  // (prepublishOnly) passes --require-builds, and no builds there is exit 2.
+  // Windows is left out: the suite's Bun half counts as missing there (the
+  // gate is shown a packed run), and the install check needs no builds only
+  // up to that point.
+  const { cpSync, mkdtempSync, rmSync } = await import("node:fs")
+  const { spawnSync } = await import("node:child_process")
+  const { fileURLToPath } = await import("node:url")
+  const here = fileURLToPath(new URL("..", import.meta.url))
+  const tree = mkdtempSync(join(tmpdir(), "codar-nobuilds-"))
+  try {
+    for (const f of ["package.json", "CHANGELOG.md", "README.md", "LICENSE", "index.mjs"]) cpSync(join(here, f), join(tree, f))
+    for (const d of ["lib", "scripts", "native", "test"]) cpSync(join(here, d), join(tree, d), { recursive: true })
+    rmSync(join(tree, "native", "bin"), { recursive: true, force: true })
+    // This test runs inside a tarball's own suite too: the nested gate must not
+    // be told that is a packed run, or its install check would be skipped.
+    const { CODAR_TARBALL_GATE: _packed, ...env } = process.env
+    const required = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs"), "--require-builds"], { env, encoding: "utf8", timeout: 110000 })
+    assert.equal(required.status, 2, `no builds on a release run is "could not check": ${required.stdout}${required.stderr} tree=${tree}`)
+    assert.match(required.stderr + required.stdout, /no builds in .*native[\\/]bin/)
+    const loose = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs")], { env, encoding: "utf8", timeout: 110000 })
+    assert.equal(loose.status, 0, `without --require-builds the install check is a skip: ${loose.stdout}${loose.stderr}`)
+    assert.match(loose.stdout + loose.stderr, /install: skipped, no builds in this tree/)
+  } finally {
+    rmSync(tree, { recursive: true, force: true })
+  }
 })
 
 test("the tarball gate refuses an argument it does not know", async () => {
