@@ -1615,15 +1615,17 @@ export async function CodarPlugin(input) {
       const models = modelsOf(CATALOG, api)
       // The loader's address, as magpie's pluginRequestBase reads it
       // (plugins.go): the loader's baseURL, else the model's own URL, else
-      // the provider's api — and then, for an Anthropic request, the SDK's
-      // "/v1" taken off the request path and joined on. The loader answers
-      // the provider's address as it is written down, "/v1" included: an
-      // OpenAI client joins "/chat/completions" onto it and asks
-      // ".../v1/chat/completions", and an Anthropic one takes "/v1" off
-      // ".../v1/messages" and joins "/messages" back onto it, so both arrive
-      // at the same path. Answering the bare base put the OpenAI client's
-      // request at "/chat/completions", which nginx answers with a 405 page
-      // (issue #3, measured 2026-11-16).
+      // the provider's api — and then pluginFetch joins the SDK's request
+      // path with magpie's "/v1" taken off it, so "/v1/chat/completions"
+      // and "/v1/messages" both go under the base as "/chat/completions" and
+      // "/messages". The loader answers the provider's address as it is
+      // written down, "/v1" included: an OpenAI client joins
+      // "/chat/completions" onto it and asks ".../v1/chat/completions", and
+      // an Anthropic one's "/v1" is taken off the same way, so both arrive
+      // at ".../v1/..." rather than ".../v1/v1/...". Answering the bare base
+      // put the OpenAI client's request at "/chat/completions", which nginx
+      // answers with a 405 page (issue #3, measured 2026-11-16). Read it in
+      // magpie's internal/provider/plugins.go (pluginRequestBase, pluginFetch).
       loaderBase = api
       // If models itself is not an object (an array is also an "object" but
       // yields no model by id), treat it as absent.

@@ -5837,6 +5837,13 @@ test("the auth hook carries a loader, and it hands the request the account's key
   const first = await p.auth.loader(async () => auth())
   assert.equal(first.apiKey, TOKEN)
   assert.equal(first.baseURL, "https://api.claw.speedai.com/v1", "the address a request's /v1 is joined under")
+  // magpie joins under this base with its own "/v1" taken off the path
+  // (plugins.go's pluginFetch), so no client asks "/v1/v1/...". The join is
+  // pinned here as magpie does it, so a base that loses its "/v1" fails for
+  // both protocols rather than only the one the host happens to be asked for.
+  const under = (rest) => new URL(first.baseURL.replace(/\/+$/, "") + (rest.startsWith("/v1/") ? rest.slice(3) : rest)).href
+  assert.equal(under("/v1/chat/completions"), "https://api.claw.speedai.com/v1/chat/completions")
+  assert.equal(under("/v1/messages"), "https://api.claw.speedai.com/v1/messages")
   assert.equal(typeof first.fetch, "function", "the loader answers a fetch the host can use")
   const withProxy = await CodarPlugin()
   await withProxy.config({ provider: { codar: { api: "https://proxy.example/v1" } } })

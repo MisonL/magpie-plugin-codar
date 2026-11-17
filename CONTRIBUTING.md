@@ -145,7 +145,12 @@ contract is stable.
 
 Every user-visible change lands under `## [Unreleased]` first, in one of
 Added / Changed / Fixed / Removed. A release moves that section under the new
-version with the release date, then:
+version with the release date: rename `## [Unreleased]` to
+`## [X.Y.Z] - YYYY-MM-DD` with the version `npm version` is about to write
+(and leave a fresh empty `## [Unreleased]` above it). A release that ships a
+registry package with no CHANGELOG entry for its own version is a mistake
+nobody catches later — the file records why a version exists, and a missing
+one cannot be filled in faithfully after the fact. Then:
 
 ```bash
 npm run native:all                                  # the five platform builds
