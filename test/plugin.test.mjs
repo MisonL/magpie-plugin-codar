@@ -5997,6 +5997,10 @@ test("an address without a path gets the vendor's /v1, as the gateway does", () 
   assert.equal(baseURL("https://proxy.example/gateway"), "https://proxy.example/gateway/v1", "an address with a path keeps the vendor's rule under it")
   assert.equal(baseURL("https://proxy.example/gateway/v1"), "https://proxy.example/gateway/v1", "and one that already ends in /v1 is left as it is")
   assert.equal(baseURL("http://127.0.0.1:8080"), "http://127.0.0.1:8080/v1", "a local proxy is the same rule")
+  // The path is edited, not the string: an address carrying a query kept its
+  // path and had "/v1" written into the query value.
+  assert.equal(baseURL("https://proxy.test/gateway?route=chat"), "https://proxy.test/gateway/v1?route=chat", "a query stays a query")
+  assert.equal(baseURL("https://proxy.test/gateway#frag"), "https://proxy.test/gateway/v1#frag", "a fragment stays a fragment")
 })
 
 test("a credential that is not a JWT is cut by its shape", () => {

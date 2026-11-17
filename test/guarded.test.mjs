@@ -133,6 +133,45 @@ test("a URL or a Request is an address like a string", async () => {
   assert.deepEqual(asked.filter((a) => a.url === `${vendor}/v1/chat/completions`).length, 2, "neither address was sent")
 })
 
+test("fetch's own method rules decide what a redirect asks for", async () => {
+  // A 303 asks for a GET unless the request was a GET or a HEAD; a 301/302
+  // does that only after a POST (a PUT stays a PUT); 307/308 keep everything.
+  // The hop to a GET carries none of the headers the body brought.
+  const hop = async (method, status) => {
+    const seen = []
+    const transport = async (url, init) => {
+      const headers = new Headers(init.headers ?? {})
+      seen.push({ method: init.method, type: headers.get("content-type"), body: init.body === undefined ? "none" : await new Response(init.body).text() })
+      return seen.length === 1 ? new Response(null, { status, headers: { location: "/next" } }) : new Response("ok")
+    }
+    const body = method === "GET" || method === "HEAD" ? undefined : "{}"
+    const res = await guardedFetch(`${vendor}/start`, { method, headers: { "content-type": "application/json", "x-keep": "1" }, ...(body === undefined ? {} : { body }) }, { transport })
+    assert.equal(res.status, 200)
+    return seen
+  }
+  assert.deepEqual((await hop("POST", 303)).map((s) => [s.method, s.type]), [["POST", "application/json"], ["GET", null]], "a 303 after a POST is a GET with no body headers")
+  assert.deepEqual((await hop("HEAD", 303)).map((s) => s.method), ["HEAD", "HEAD"], "a 303 after a HEAD stays a HEAD")
+  assert.deepEqual((await hop("PUT", 301)).map((s) => s.method), ["PUT", "PUT"], "a 301 after a PUT stays a PUT")
+  assert.deepEqual((await hop("PUT", 302)).map((s) => s.method), ["PUT", "PUT"], "a 302 after a PUT stays a PUT")
+  assert.deepEqual((await hop("POST", 307)).map((s) => [s.method, s.body]), [["POST", "{}"], ["POST", "{}"]], "a 307 re-sends the POST")
+})
+
+test("a Request handed to guardedFetch is sent with what it holds, and the init's where it states it", async () => {
+  // fetch replaces the header collection when the init has one and keeps the
+  // init's signal when it has one; the body read from a Request is a stream,
+  // and a stream request is only built with duplex.
+  const seen = []
+  const controller = new AbortController()
+  const transport = (url, init) => {
+    const headers = new Headers(init.headers)
+    seen.push({ authorization: headers.get("authorization"), accept: headers.get("accept"), signal: init.signal === controller.signal, builds: (() => { try { new Request(url, init); return true } catch { return false } })() })
+    return Promise.resolve(new Response("ok"))
+  }
+  const fromRequest = new Request(`${vendor}/v1/chat/completions`, { method: "POST", headers: { authorization: "Bearer SYNTH", "x-keep": "1" }, body: "{}" })
+  await guardedFetch(fromRequest, { headers: { accept: "application/json" }, signal: controller.signal }, { transport })
+  assert.deepEqual(seen, [{ authorization: null, accept: "application/json", signal: true, builds: true }], "the init's headers replace the Request's, its signal is used, and the stream body builds")
+})
+
 test("a bytes body is sent as it was when the call began", async () => {
   // The bytes are taken once: changing the array afterwards changes nothing.
   // The hop is a 307, which keeps the body (a 302 after a POST asks for a GET).

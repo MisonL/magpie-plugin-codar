@@ -111,7 +111,9 @@ users. The Windows job runs the gate too (without Bun), which is where its
 `.cmd` and CRLF branches are exercised: an argument it does not know is
 exit 2 and a misspelt `--require-bun` cannot silently skip the Bun half. `prepublishOnly` runs the same gate
 before every publish; a bare `npm pack` does not run it, so use
-`node scripts/tarball.mjs` when checking an artifact by hand. Every CI job has
+`node scripts/tarball.mjs` when checking an artifact by hand (add
+`--require-builds` to make a tree without `native/bin` an error rather than a
+named skip). Every CI job has
 a 15-minute timeout, so a hung vendor or a stalled child process cannot hold a
 runner for hours.
 
@@ -158,7 +160,7 @@ npm version <patch|minor|major> -m "release: v%s"   # bumps package.json, commit
 node scripts/native-packages.mjs --publish          # the five platform packages, first
 node scripts/tarball.mjs                            # the packed suite, before it ships
 git push --follow-tags
-npm publish                                         # prepublishOnly: the five builds must exist (--strict), the platform packages must be staged at this version (--check), and the packed suite and its install check must pass
+npm publish                                         # prepublishOnly: the five builds must exist (--strict), the packed suite and its install check must pass (tarball.mjs --require-builds), and the platform packages must be staged at this version (--check)
 gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
 ```
 
@@ -168,11 +170,11 @@ version, so publishing it first would install with an optional dependency npm
 cannot find — an install that quietly has no proxy. `node
 scripts/native-packages.mjs --publish` stages all five from `native/bin` and
 publishes them; `--check` says what is staged and refuses a version that is not
-the main package's. A release whose `native/bin` is stale must not publish: `prepublishOnly` starts
-with `node scripts/build-native.mjs --check --strict`, which refuses a package
-that would fall back to fetch on every platform, and runs the tarball gate,
-which installs the packed main package in a scratch project and requires it to
-land this machine's platform package. Neither check can tell a fresh build from
+the main package's. `prepublishOnly` starts with
+`node scripts/build-native.mjs --check --strict`, which refuses a release that
+has no build (or only a stub where one belongs) for any platform, and then runs
+the tarball gate with `--require-builds`, which installs the packed main package
+in a scratch project and requires it to land this machine's platform package. Neither check can tell a fresh build from
 an old one: `--strict` reads presence, headers and the executable bit, and the
 staged packages are whatever `native/bin` held. Running `npm run native:all`
 first is the release step that keeps them current, and a build made before the
