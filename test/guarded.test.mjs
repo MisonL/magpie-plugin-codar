@@ -61,15 +61,17 @@ test("a hop that leaves https is not taken", async () => {
 test("a body that cannot be sent twice stops at the redirect", async () => {
   // A one-shot body is read by the request that carries it. The transport reads
   // it here; if the rule sent a hop with the spent stream, that would throw.
+  // The redirect is a 307 — a 302 after a POST asks for a GET, which carries
+  // no body and needs no replay (the next test pins that).
   const asked = []
   const transport = async (url, init) => {
     asked.push(String(url))
     await new Response(init?.body).arrayBuffer()
-    return new Response(null, { status: 302, headers: { location: nextId(String(url)) } })
+    return new Response(null, { status: 307, headers: { location: nextId(String(url)) } })
   }
   const body = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1])); c.close() } })
   const res = await guardedFetch(`${vendor}/chain?n=0`, { method: "POST", body, duplex: "half" }, { transport })
-  assert.equal(res.status, 302)
+  assert.equal(res.status, 307)
   assert.equal(asked.length, 1, "a body sent once is not sent twice")
 })
 
@@ -109,8 +111,8 @@ test("a Location on the request's own origin is a hop", async () => {
   assert.equal(res.status, 200)
   assert.deepEqual(seen, [
     { url: `${vendor}/v1/chat/completions`, method: "POST", redirected: "manual" },
-    { url: `${vendor}/v1/models`, method: "POST", redirected: "manual" },
-  ])
+    { url: `${vendor}/v1/models`, method: "GET", redirected: "manual" },
+  ], "a 302 after a POST is asked for with a GET, as fetch asks it")
 })
 
 test("a scheme written in another case is https", async () => {
@@ -133,15 +135,125 @@ test("a URL or a Request is an address like a string", async () => {
 
 test("a bytes body is sent as it was when the call began", async () => {
   // The bytes are taken once: changing the array afterwards changes nothing.
+  // The hop is a 307, which keeps the body (a 302 after a POST asks for a GET).
   const body = new Uint8Array([123, 125])
   const sent = []
   const transport = (url, init) => {
     sent.push([...init.body])
     body[0] = 91
-    return Promise.resolve(new Response(null, { status: 302, headers: { location: `${vendor}/next` } }))
+    return Promise.resolve(new Response(null, { status: 307, headers: { location: `${vendor}/next` } }))
   }
   await guardedFetch(`${vendor}/start`, { method: "POST", body }, { transport })
   assert.deepEqual(sent, [[123, 125], [123, 125]])
+})
+
+test("a Request handed in is sent as it was written", async () => {
+  // fetch takes a Request as an address, and its method, headers and body
+  // belong to it: the rule sent the URL alone and the Request was never sent.
+  const seen = []
+  const transport = async (url, init) => {
+    const body = init?.body === undefined ? "none" : await new Response(init.body).text()
+    seen.push({ url: String(url), method: init?.method, body, authorization: init?.headers?.get?.("authorization") })
+    return new Response("ok")
+  }
+  const request = new Request(`${vendor}/v1/chat/completions`, { method: "POST", headers: { authorization: "Bearer SYNTH" }, body: "{}" })
+  const res = await guardedFetch(request, {}, { transport })
+  assert.equal(await res.text(), "ok")
+  const fromRequest = await guardedFetch(new Request(`${vendor}/v1/models`), {}, { transport })
+  assert.equal(await fromRequest.text(), "ok")
+  assert.deepEqual(seen, [
+    { url: `${vendor}/v1/chat/completions`, method: "POST", body: "{}", authorization: "Bearer SYNTH" },
+    { url: `${vendor}/v1/models`, method: "GET", body: "none", authorization: null },
+  ], "a GET Request is a GET, with no body")
+})
+
+test("every byte body is copied, and a DataView is one", async () => {
+  // A Buffer's slice() and an ArrayBuffer itself share their memory with the
+  // caller, and a DataView has no slice at all: the call threw for a body
+  // fetch accepts. Each is read once, at the call.
+  const sent = []
+  const transport = (url, init) => {
+    sent.push([...new Uint8Array(init.body instanceof DataView ? init.body.buffer : init.body)])
+    if (init.body instanceof DataView) new Uint8Array(init.body.buffer)[0] = 9
+    if (Buffer.isBuffer(init.body)) init.body[0] = 9
+    return Promise.resolve(new Response(null, { status: 307, headers: { location: `${vendor}/next` } }))
+  }
+  const view = new DataView(new Uint8Array([1, 2]).buffer)
+  await guardedFetch(`${vendor}/a`, { method: "POST", body: view }, { transport })
+  assert.deepEqual(sent, [[1, 2], [1, 2]], "a DataView body is sent, and its bytes are the call's")
+  sent.length = 0
+  await guardedFetch(`${vendor}/a`, { method: "POST", body: Buffer.from([1, 2]) }, { transport })
+  assert.deepEqual(sent, [[1, 2], [1, 2]], "a Buffer body is sent, and its bytes are the call's")
+})
+
+test("a 303 asks for the location with a GET, as fetch does", async () => {
+  // fetch answers a 303, and a 301/302 after a POST, by asking the Location
+  // for a GET with no body. The rule re-sent the POST with the body, which a
+  // result endpoint that takes a GET answers with a refusal.
+  const seen = []
+  const transport = async (url, init) => {
+    // The body as the transport sends it: read, not kept, because a stream is
+    // sent once and a test that looked at it afterwards would be too late.
+    const body = init?.body === undefined ? "none" : await new Response(init.body).text()
+    seen.push({ url: String(url), method: init?.method ?? "GET", body })
+    const first = seen.length === 1
+    return first ? new Response(null, { status: 303, headers: { location: "/result" } }) : new Response("done")
+  }
+  const res = await guardedFetch(`${vendor}/submit`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }, { transport })
+  assert.equal(await res.text(), "done")
+  assert.deepEqual(seen, [
+    { url: `${vendor}/submit`, method: "POST", body: "{}" },
+    { url: `${vendor}/result`, method: "GET", body: "none" },
+  ])
+})
+
+test("a 307 keeps the method and the body", async () => {
+  const seen = []
+  const transport = async (url, init) => {
+    const body = init?.body === undefined ? "none" : await new Response(init.body).text()
+    seen.push({ url: String(url), method: init?.method ?? "GET", body })
+    return seen.length === 1 ? new Response(null, { status: 307, headers: { location: "/next" } }) : new Response("ok")
+  }
+  await guardedFetch(`${vendor}/submit`, { method: "POST", body: "{}" }, { transport })
+  assert.deepEqual(seen, [
+    { url: `${vendor}/submit`, method: "POST", body: "{}" },
+    { url: `${vendor}/next`, method: "POST", body: "{}" },
+  ])
+})
+
+test("a Location that names a user in its authority is not a hop", () => {
+  // The origin ignores userinfo: "https://evil.example@vendor" is the vendor
+  // to the URL parser, and following it would hand whatever the client puts
+  // in its own cookies to the vendor under another name. The vendor's own
+  // QR-image rule refuses userinfo the same way.
+  const at = vendor + "/v1/chat/completions"
+  assert.equal(hopOf(vendor, at, "https://evil.example@api.claw.speedai.com/v1/y"), null)
+  assert.equal(hopOf(vendor, at, "https://user:pw@api.claw.speedai.com/v1/y"), null)
+})
+
+test("a redirect body that is not the answer is drained", async () => {
+  // A hop leaves the redirect's own body unread; the connection it holds is
+  // released when it is cancelled, not when the collection happens to run.
+  let cancelled = 0
+  const body = (status, location) => ({
+    status,
+    headers: new Headers({ location }),
+    body: new ReadableStream({
+      pull() {},
+      cancel() {
+        cancelled++
+      },
+    }),
+  })
+  const transport = (url) => Promise.resolve(seenPush(String(url)) ? new Response(null, { status: 200 }) : body(302, "/next"))
+  const answer = []
+  const seenPush = (u) => {
+    answer.push(u)
+    return answer.length > 1
+  }
+  const res = await guardedFetch(`${vendor}/start`, {}, { transport })
+  assert.equal(res.status, 200)
+  assert.equal(cancelled, 1, "the redirect's body was cancelled")
 })
 
 test("the rule keeps the origin it was given, port included", () => {

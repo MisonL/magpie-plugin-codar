@@ -8,14 +8,16 @@ trips one is a change to argue for, not to route around.
 
 **Where each file lives.**
 `index.mjs` at the root is the entry magpie's `main`/`exports` point at, and
-the only module it loads from here is `lib/internal.mjs`. Everything else the
-plugin runs lives in `lib/`: the reader and the `testables` object
-(`lib/internal.mjs`), the sign-in page (`lib/signinpage.mjs`), the native
-transport (`lib/native.mjs`), and the fallback catalog (`lib/catalog.mjs`).
+it loads three modules from here, one line each: `lib/internal.mjs` (the
+reader and the `testables` object), `lib/catalog.mjs` (the fallback catalog)
+and `lib/guarded.mjs` (the ordinary fetch the plugin falls back on, held to the
+proxy's redirect rule). Everything else the plugin runs lives in `lib/`: the
+sign-in page (`lib/signinpage.mjs`) and the native transport
+(`lib/native.mjs`).
 `scripts/` holds the tools a developer or a release runs (`catalog.mjs` writes
 `lib/catalog.mjs`), `test/` the suite, and `native/` the Go proxy with its
 per-platform builds. A new module belongs in `lib/` unless it is a tool or a
-test; keep the import in the entry module to one line so the load path stays
+test; keep the entry module's imports to one line each so the load path stays
 obvious.
 
 **The entry module exports only plugin functions.** magpie's loader takes
@@ -181,7 +183,7 @@ Node's architecture and the binary inside keeps Go's.
 
 `npm pack --dry-run` lists what ships: the plugin modules, the catalog and
 its generator, the tarball gate, the build script and the platform-package
-stager, the Go proxy with its own tests, the three test files, the README, the
+stager, the Go proxy with its own tests, the four test files, the README, the
 changelog and the licence — and no `native/bin`: the builds travel in the
 platform packages, and a main package carrying them again is five builds
 shipped twice. The tarball gate ships because `test:tarball` is in

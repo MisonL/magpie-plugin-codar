@@ -4121,7 +4121,7 @@ test("a base the user wrote with spaces and slashes is cleaned on either path", 
     ["https://proxy.example/v1/", "https://proxy.example/v1", "https://proxy.example"],
     ["  https://proxy.example/v1  ", "https://proxy.example/v1", "https://proxy.example"],
     ["https://proxy.example/v1//", "https://proxy.example/v1", "https://proxy.example"],
-    ["https://proxy.example", "https://proxy.example", "https://proxy.example"],
+    ["https://proxy.example", "https://proxy.example/v1", "https://proxy.example"],
     ["   ", "https://api.claw.speedai.com/v1", "https://api.claw.speedai.com"],
     ["/", "https://api.claw.speedai.com/v1", "https://api.claw.speedai.com"],
     ["///", "https://api.claw.speedai.com/v1", "https://api.claw.speedai.com"],
@@ -5975,6 +5975,21 @@ test("an address the plugin will send a key to is an http(s) URL or the gateway"
   assert.equal(baseURL("https:/v1"), "https://api.claw.speedai.com/v1", "nor is one written with a single slash")
   assert.equal(baseURL("https://user:pw@proxy.example/v1"), "https://user:pw@proxy.example/v1", "credentials in the authority are the user's business")
   assert.equal(baseURL(""), "https://api.claw.speedai.com/v1", "and nothing said is the vendor's gateway")
+})
+
+test("an address without a path gets the vendor's /v1, as the gateway does", () => {
+  // The vendor's gateway is written without /v1 and the plugin answers
+  // ".../v1" beside it, because an OpenAI client joins "/chat/completions" on
+  // and an Anthropic one keeps its own "/v1" (the loader's comment, issue #3).
+  // A user's own address without a path was handed back as written, so the
+  // same clients asked "host/chat/completions": /v1 was there only when the
+  // user happened to write it. The default address and a user's bare one now
+  // follow one rule.
+  assert.equal(baseURL("https://proxy.example"), "https://proxy.example/v1", "a bare host is given the vendor's /v1")
+  assert.equal(baseURL("https://proxy.example/"), "https://proxy.example/v1", "a trailing slash is no path either")
+  assert.equal(baseURL("https://proxy.example/gateway"), "https://proxy.example/gateway/v1", "an address with a path keeps the vendor's rule under it")
+  assert.equal(baseURL("https://proxy.example/gateway/v1"), "https://proxy.example/gateway/v1", "and one that already ends in /v1 is left as it is")
+  assert.equal(baseURL("http://127.0.0.1:8080"), "http://127.0.0.1:8080/v1", "a local proxy is the same rule")
 })
 
 test("a credential that is not a JWT is cut by its shape", () => {

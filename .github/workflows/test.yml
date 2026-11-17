@@ -87,7 +87,9 @@ jobs:
           node-version: "24"
       - run: node --test
       # npm and tar are .cmd shims here, and the tarball carries CRLF paths:
-      # this is the only job that runs the gate's Windows branches
+      # this job runs the gate's Windows branches. It has no builds to stage,
+      # so the install check is a skip here (the gate says so); the packed
+      # suite is what this job checks.
       - run: node scripts/tarball.mjs
 
   macos:

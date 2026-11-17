@@ -13,6 +13,12 @@
 //
 //   node scripts/tarball.mjs                 # exit 0 when the packed suite passes
 //   node scripts/tarball.mjs --require-bun   # …and Bun must run it too
+//
+// The install check needs the source tree's builds (`native/bin`, from
+// `npm run native:all`): without them the gate exits 2 rather than passing on
+// a check it did not run. Inside a packed run of the suite (CODAR_TARBALL_GATE)
+// there are no builds to stage and the packed suite is already running, so the
+// install check is skipped there.
 
 import { execFileSync, spawn } from "node:child_process"
 import { createServer } from "node:http"
@@ -329,7 +335,10 @@ const main = async () => {
       if (!report.started) throw new Error(`the installed plugin did not start ${mine.name}'s build`)
       console.log(`install: ${manager} installed ${mine.name} and the plugin started it`)
     } else {
-      console.log("install: no native/bin in this tree, so the platform packages were not installed")
+      // No builds here: there is no install path to check, and a pass would
+      // say there was. Run `npm run native:all` first — a release cannot be
+      // checked without it.
+      throw usage(`no builds in ${bin}: the install check needs them (run \`npm run native:all\` first)`)
     }
     const suite = (cmd, args) => {
       try {
