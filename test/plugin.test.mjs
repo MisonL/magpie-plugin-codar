@@ -339,6 +339,55 @@ test("the listener holds its own resend cooldown, so a script on the path cannot
   }
 })
 
+test("the cooldown is taken before the vendor is asked, and given back when the vendor refuses", async () => {
+  // The cooldown was read before an await and written after it, so every
+  // concurrent /send passed the check, and a script holding the page's solved
+  // captcha could send SMS as often as it liked. A send the vendor refuses
+  // must not leave the person waiting out a cooldown for a code that never
+  // went.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const sent = []
+  let refuse = false
+  const sms = await startSignIn({
+    // A send that takes a moment: the check used to run before this await,
+    // so every POST that arrived while the first was in flight passed it.
+    sendCode: async (phone) => {
+      sent.push(phone)
+      await new Promise((r) => setTimeout(r, 50))
+      if (refuse) throw new Error("验证码发送失败")
+    },
+    verifyCode: async () => ({ token: TOKEN, username: "user_1" }),
+  })
+  const post = (rest, body) => fetch(`${sms.url}${rest}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  const send = { phone: "13800138000", captcha: { lot_number: "lot", captcha_output: "out", pass_token: "pass", gen_time: "123" } }
+  try {
+    const burst = await Promise.all([0, 1, 2, 3, 4].map(() => post("send", send)))
+    assert.equal(burst.filter((r) => r.status === 200).length, 1, "one of five simultaneous sends went through")
+    assert.equal(burst.filter((r) => r.status === 429).length, 4, "the other four were refused by the cooldown")
+    assert.equal(sent.length, 1, "the vendor was asked once")
+    // a refused send gives the cooldown back
+    let freshRefuse = true
+    const fresh = await startSignIn({
+      sendCode: async (phone) => {
+        sent.push(phone)
+        if (freshRefuse) throw new Error("验证码发送失败")
+      },
+      verifyCode: async () => ({ token: TOKEN }),
+    })
+    try {
+      const refusedAt = await fetch(`${fresh.url}send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(send) })
+      assert.equal(refusedAt.status, 400, "the vendor's refusal is the answer")
+      freshRefuse = false
+      const second = await fetch(`${fresh.url}send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(send) })
+      assert.equal(second.status, 200, "a refused send does not hold the cooldown")
+    } finally {
+      fresh.close()
+    }
+  } finally {
+    sms.close()
+  }
+})
+
 test("a page stops trading codes after its submit budget, refusals included", async () => {
   // A wrong code costs an attempt: five of them end the page's code trading
   // at the listener, before the vendor is asked again.
