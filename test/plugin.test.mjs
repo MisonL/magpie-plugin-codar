@@ -547,6 +547,137 @@ test("an IP-check handover is used once, expires, and is cleared by another sign
   assert.match(await titleOf(), /登录科搭 Codar/, "a token sign-in cleared the handover")
 })
 
+test("a wrapped refusal is a refusal, and a token the plugin cannot keep is not saved", async () => {
+  // `{"code":200,"data":{"code":201,"status":"ip_verify_required","token":…}}`
+  // passed the top-level business gate, and its temp token — good for
+  // /v1/user/verify_ip alone — was returned as a finished sign-in. A token
+  // with a newline, or one whose own exp has passed, was saved the same way
+  // and then failed every request.
+  const { login } = testables
+  const wrapped = { "POST /v1/login": { body: { code: 200, data: { code: 201, status: "ip_verify_required", token: "TEMP" } } } }
+  await withFetch(wrapped, async () => {
+    await assert.rejects(login("user_1", "pw"), (e) => String(e.message).length > 0, "the wrapped IP check is not a sign-in")
+  })
+  const newline = { "POST /v1/login": { body: { code: 200, data: { token: "abc\ndef" } } } }
+  await withFetch(newline, async () => {
+    await assert.rejects(login("user_1", "pw"), (e) => e.code === "unusable_token")
+  })
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const gone = `${b64({ alg: "HS256" })}.${b64({ username: "user_1", exp: 1 })}.sig`
+  await withFetch({ "POST /v1/login": { body: { code: 200, data: { token: gone } } } }, async () => {
+    await assert.rejects(login("user_1", "pw"), (e) => e.code === "unusable_token", "a token that says it has expired is not kept")
+  })
+  const good = `${b64({ alg: "HS256" })}.${b64({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 3600 })}.sig`
+  await withFetch({ "POST /v1/login": { body: { code: 200, data: { token: good } } } }, async () => {
+    const got = await login("user_1", "pw")
+    assert.equal(got.token, good)
+    assert.equal(got.username, "user_1")
+  })
+})
+
+test("a vendor sentence that quotes a credential is cut before the page shows it", async () => {
+  // A QR status answer is the vendor's own words, and a message that echoed
+  // the token went into the page and into what wait() hands the host. The
+  // vendor's answer is read by wechatStatusOf, which cuts the shape there.
+  const { wechatStatusOf } = testables
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const real = `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.${b64({ username: "user_1", exp: 9999999999 })}.${"A".repeat(43)}`
+  const said = wechatStatusOf({ code: 200, data: { status: "FAILED", message: `失败 token=${real}` } })
+  assert.equal(said.state, "error")
+  assert.doesNotMatch(said.message, /eyJ/, "the token's shape is not in the sentence the page shows")
+  assert.match(said.message, /失败/, "the vendor's own words are kept")
+  // and the plugin hands exactly this read of the vendor's answer to the page
+  const p = await CodarPlugin()
+  const page = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  assert.equal(typeof page.authorize, "function")
+})
+
+test("a password attempt superseded by a newer sign-in does not leave its handover", async () => {
+  // Attempt A is still in flight; a token sign-in for another account finishes
+  // first; A comes back refused with the IP check. The handover A writes would
+  // point the next OAuth page at A's account, which is no longer the one being
+  // signed in.
+  const temp = mkToken({ username: "user_a", exp: Math.floor(Date.now() / 1000) + 600 })
+  const other = mkToken({ username: "user_other", exp: Math.floor(Date.now() / 1000) + 86400 })
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  const tokenMethod = p.auth.methods.find((x) => x.label === "科搭令牌（留空读本机）")
+  const refused = { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_a", phone: "13800138000", token: temp } } }
+  await withFetch(refused, async () => {
+    // A is in flight while the other account's token sign-in finishes: the
+    // order this pins is the one the race allows, not a real delay.
+    const a = password.authorize({ username: "user_a", password: "pw" })
+    await tokenMethod.authorize({ token: other })
+    const out = await a
+    assert.equal(out.type, "failed")
+  })
+  const ctl = new AbortController()
+  const page = await sms.authorize({}, { signal: ctl.signal })
+  try {
+    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "the stale attempt's handover is not offered")
+  } finally {
+    ctl.abort()
+  }
+})
+
+test("a sign-in cancelled before its page opens keeps the handover", async () => {
+  // The handover is taken at authorize's start, and the listener comes up a
+  // moment later. An abort in that window closed the page before its URL ever
+  // reached the host: nobody saw it and no code was asked for, so the temp
+  // token was not spent. Kept, the next OAuth attempt can still finish the
+  // check instead of asking for the password again.
+  const temp = mkToken({ username: "user_12", exp: Math.floor(Date.now() / 1000) + 600 })
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  await withFetch({ "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_12", phone: "13800138000", token: temp } } }, async () => {
+    await password.authorize({ username: "user_12", password: "pw" })
+  })
+  const ctl = new AbortController()
+  // The abort lands after authorize has run as far as its first await, which
+  // is past takePendingVerify: the setup window, not the pre-start check.
+  const attempt = sms.authorize({}, { signal: ctl.signal })
+  ctl.abort()
+  assert.equal((await attempt).type, "failed", "a cancelled attempt answers failed")
+  const next = new AbortController()
+  const page = await sms.authorize({}, { signal: next.signal })
+  try {
+    assert.match(await (await fetch(page.url)).text(), /科搭短信安全验证/, "the unspent handover is offered to the next attempt")
+  } finally {
+    next.abort()
+  }
+})
+
+test("a handover restored by a cancel does not outlive a newer sign-in", async () => {
+  // The unspent-handover restore must not become the stale-handover write it
+  // was fixed for in the password path: if a newer sign-in finished while the
+  // page was coming up, the old temp token belongs to a flow the person has
+  // already left.
+  const temp = mkToken({ username: "user_13", exp: Math.floor(Date.now() / 1000) + 600 })
+  const other = mkToken({ username: "user_other", exp: Math.floor(Date.now() / 1000) + 86400 })
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  const tokenMethod = p.auth.methods.find((x) => x.label === "科搭令牌（留空读本机）")
+  await withFetch({ "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_13", phone: "13800138000", token: temp } } }, async () => {
+    await password.authorize({ username: "user_13", password: "pw" })
+  })
+  const ctl = new AbortController()
+  const attempt = sms.authorize({}, { signal: ctl.signal })
+  const signed = await tokenMethod.authorize({ token: other })
+  assert.equal(signed.type, "success", "the newer sign-in finished while the page came up")
+  ctl.abort()
+  assert.equal((await attempt).type, "failed", "the cancelled attempt answers failed")
+  const next = new AbortController()
+  const page = await sms.authorize({}, { signal: next.signal })
+  try {
+    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "the older account's handover is not offered after a newer sign-in")
+  } finally {
+    next.abort()
+  }
+})
+
 test("a handover past its window is dropped, not finished", async (t) => {
   // The temp token lives ten minutes. Past that the vendor would refuse it
   // anyway, and the page would be verifying an account the person no longer
@@ -1021,6 +1152,56 @@ test("the QR sign-in is one method the host can open, and closes with the page",
     globalThis.fetch = realFetch
   }
   await assert.rejects(realFetch(opened.url), "the listener is closed with the sign-in")
+})
+
+test("cancelling the page stops the vendor call it had in flight", async () => {
+  // A QR poll is a long call (35 s) and an SMS check can be slow. Closing the
+  // listener on a cancel ended the page but left those calls running to their
+  // own timeout: the person had walked away and the plugin was still waiting
+  // on the vendor. Closing the page now reaches its calls' own signal.
+  const realFetch = globalThis.fetch
+  const p = await CodarPlugin()
+  const m = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const ctl = new AbortController()
+  let vendorSignal = null
+  let polling = null
+  // the page is reached through whichever fetch its listener sees: through
+  // withFetch while authorize runs, and through the stub below afterwards
+  const stub = (u, init) => {
+    const s = String(u instanceof Request ? u.url : u)
+    if (s.startsWith("http://127.0.0.1/")) return realFetch(u, init)
+    if (s.endsWith("/wechat/login/qrcode")) return json({ code: 200, data: { scene: "s-1", qr_url: "https://codar-web.speedai.com/static/qr.png" } })
+    if (s.endsWith("/wechat/login/status")) {
+      vendorSignal = init.signal
+      return new Promise((_, reject) => {
+        init.signal?.addEventListener?.("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })))
+      })
+    }
+    return json({ code: 200 })
+  }
+  const json = (body) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } })
+  globalThis.fetch = stub
+  const opened = await m.authorize({}, { signal: ctl.signal })
+  try {
+    polling = realFetch(`${opened.url}status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scene: "s-1" }),
+    }).catch(() => {})
+    for (let i = 0; i < 200 && !vendorSignal; i++) await new Promise((r) => setTimeout(r, 5))
+    assert.ok(vendorSignal, "the vendor call started")
+    assert.equal(vendorSignal.aborted, false, "and is running")
+    ctl.abort()
+    await Promise.race([
+      polling,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("the vendor call outlived the page")), 2000).unref()),
+    ])
+    assert.equal(vendorSignal.aborted, true, "closing the page aborts the vendor call it started")
+  } finally {
+    ctl.abort()
+    await opened.callback?.().catch?.(() => {})
+    globalThis.fetch = realFetch
+  }
 })
 
 test("an aborted SMS sign-in stops the page and answers nothing", async () => {

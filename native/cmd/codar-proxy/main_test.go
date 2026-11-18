@@ -183,6 +183,54 @@ func TestForwardedRequestCarriesOnlyTheDesktopsHeaders(t *testing.T) {
 	}
 }
 
+// TestForwardedRequestDropsWhatTheRequestNamesHopByHop checks the other side
+// of the Connection rule: a field an incoming Connection header names is for
+// this hop only, even when its name is on the forwarded list. Another local
+// process with the token could otherwise say `Connection: Authorization` and
+// have a value the plugin meant for the proxy reach the vendor.
+func TestForwardedRequestDropsWhatTheRequestNamesHopByHop(t *testing.T) {
+	got := make(chan http.Header, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	tr := newProviderTransport("https://api.claw.speedai.com")
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := net.Dial("tcp", strings.TrimPrefix(upstream.URL, "https://"))
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+	f := &forwarder{clients: map[string]*http.Client{"api.claw.speedai.com": {Transport: tr}}}
+
+	req := httptest.NewRequest("GET", "http://api.claw.speedai.com/v1/gettoken", nil)
+	req.Host = "api.claw.speedai.com"
+	req.Header.Set("Authorization", "Bearer local-only")
+	req.Header.Set("X-Api-Key", "sent")
+	req.Header.Set("Connection", "Authorization")
+	rec := httptest.NewRecorder()
+	f.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	s := <-got
+	if a := s.Get("Authorization"); a != "" {
+		t.Errorf("Authorization %q reached the vendor although the request named it hop-by-hop", a)
+	}
+	if k := s.Get("X-Api-Key"); k != "sent" {
+		t.Errorf("X-Api-Key %q: a field the request did not name must still pass", k)
+	}
+}
+
 // TestForwardedRequestCarriesTheChatCredentials checks the one case the
 // desktop's own requests never exercise: a chat request to an Anthropic model,
 // which authenticates with X-Api-Key and states Anthropic-Version. Forwarding
@@ -849,6 +897,62 @@ func TestAClientThatLeavesStopsTheBodyCopy(t *testing.T) {
 	case <-upstreamGone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the vendor's handler outlived the client: the request context did not reach it")
+	}
+}
+
+// TestASilentUpstreamIsSaidToHaveTimedOut checks what the head watchdog says
+// when it fires. The upstream context was cancelled and the handler returned
+// without writing a head; Go's finishRequest then wrote 200 with an empty
+// body, which the plugin read as an answered request. The silence is a
+// gateway failure with a word for it.
+func TestASilentUpstreamIsSaidToHaveTimedOut(t *testing.T) {
+	saved := headTimeout
+	headTimeout = 80 * time.Millisecond
+	defer func() { headTimeout = saved }()
+	release := make(chan struct{})
+	defer close(release)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+
+	f := &forwarder{}
+	tr := f.clientFor("api.claw.speedai.com").Transport.(*http.Transport)
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := net.Dial("tcp", strings.TrimPrefix(upstream.URL, "https://"))
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	front := httptest.NewServer(f)
+	defer front.Close()
+
+	req, err := http.NewRequest("GET", front.URL+"/v1/gettoken", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Host = "api.claw.speedai.com"
+	resp, err := front.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("a silent upstream was answered as %d %q", resp.StatusCode, body)
+	}
+	if resp.StatusCode != http.StatusGatewayTimeout || !strings.Contains(string(body), "no answer in time") {
+		t.Fatalf("got %d %q, want 504 naming the silence", resp.StatusCode, body)
 	}
 }
 

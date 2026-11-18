@@ -36,7 +36,10 @@ import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_B
 // (host.js's save), with expires from the token's own exp. A token that
 // states no exp keeps 0, which the host reads as "no renewal due". Without
 // this the sign-in is kept as a bare api key and nothing renews it.
-const signInResult = (token) => ({ type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 })
+const signInResult = (token) => {
+  signIns += 1
+  return { type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 }
+}
 
 // signInFailure says why a password sign-in did not finish, in the user's
 // words. The two vendor answers worth telling apart: a 4xx whose body code is
@@ -67,6 +70,11 @@ const signInFailure = (e) => {
 // is taken (not peeked) so one handover completes at most one sign-in.
 const PENDING_VERIFY_MS = 10 * 60 * 1000
 let pendingVerify = null
+// signIns counts completed sign-ins. A password attempt that was refused with
+// the IP check writes the handover only if no sign-in finished while it was in
+// flight: a newer sign-in (another account, a pasted token) supersedes the
+// older attempt, and the SMS page must not be pointed at the older account.
+let signIns = 0
 
 // takePendingVerify answers the handover once, if it is still good. An entry
 // past its window is dropped rather than used — the vendor would refuse its
@@ -316,37 +324,42 @@ export async function CodarPlugin(input) {
           instructions: "在打开的页面里选择扫码登录或手机号登录，完成后回到 magpie",
           async authorize(_inputs, { signal } = {}) {
             if (signal?.aborted) return { type: "failed", error: "登录已取消" }
+            const startedAt = signIns
             const pending = takePendingVerify()
             // Both vendor calls of a side are wrapped here: a refusal that
             // quotes what was sent must not print it on the page. The SMS code
             // goes out as the password field, and the verification call's
             // only credential is the temp token; the card's own cutting (scrub)
             // is used, so a vendor echo of either is cut, and no other number.
+            // Both take the page's own signal: a call the closed page started
+            // is abandoned with it.
             const smsSide = (send, verify) => ({
-              sendCode: send,
-              verifyCode: (phone, code) => verify(phone, code).catch((e) => {
+              sendCode: (phone, captcha, signal) => send(phone, captcha, signal),
+              verifyCode: (phone, code, pageSignal) => verify(phone, code, pageSignal).catch((e) => {
                 throw new Error(scrub(scrub(whyOf(e), code), pending?.tempToken ?? "") || (pending ? "安全验证失败" : "登录失败"))
               }),
             })
             const signIn = smsSide(
-              (phone, captcha) =>
+              (phone, captcha, signal) =>
                 request(`${ACCOUNT}/v1/verification-code`, {
                   method: "POST",
                   body: { phone, name: "user", type: "login", ...captcha },
                   businessCodes: true,
+                  signal,
                 }),
-              (phone, code) => login(phone, code),
+              (phone, code, signal) => login(phone, code, { signal }),
             )
             const verify = pending
               ? {
                   ...smsSide(
-                    (phone, captcha) =>
+                    (phone, captcha, signal) =>
                       request(`${ACCOUNT}/v1/verification-code`, {
                         method: "POST",
                         body: { phone, name: pending.username, type: "ip_verify", ...captcha },
                         businessCodes: true,
+                        signal,
                       }),
-                    (phone, code) => verifyIp({ username: pending.username, phone, code, tempToken: pending.tempToken }),
+                    (phone, code, signal) => verifyIp({ username: pending.username, phone, code, tempToken: pending.tempToken, signal }),
                   ),
                   // the account being verified is named: the person may have
                   // several, and this page completes whichever one the password
@@ -367,7 +380,7 @@ export async function CodarPlugin(input) {
                   // the vendor's own helper posts (web index-*.js: ft's default
                   // method is POST), and its route answers a GET with "Method
                   // Not Allowed"
-                  qrcode: async () => wechatQrOf(await request(`${ACCOUNT}${WECHAT_QR_PATH}`, { method: "POST" })),
+                  qrcode: async (signal) => wechatQrOf(await request(`${ACCOUNT}${WECHAT_QR_PATH}`, { method: "POST", signal })),
                   // the vendor's status endpoint is a long poll: it holds the
                   // request until the code's state changes, and measured 15
                   // seconds before answering "pending". The plugin's usual
@@ -376,9 +389,9 @@ export async function CodarPlugin(input) {
                   // own wait. An answer the vendor states with an HTTP status
                   // instead of a business code (404/410 for a scene that is
                   // gone) is the same expiry, not a page that stopped working.
-                  status: async (scene) => {
+                  status: async (scene, signal) => {
                     try {
-                      return wechatStatusOf(await request(`${ACCOUNT}${WECHAT_STATUS_PATH}`, { method: "POST", body: { scene }, timeoutMs: WECHAT_POLL_MS }))
+                      return wechatStatusOf(await request(`${ACCOUNT}${WECHAT_STATUS_PATH}`, { method: "POST", body: { scene }, timeoutMs: WECHAT_POLL_MS, signal }))
                     } catch (e) {
                       if (e?.status === 404 || e?.status === 410) return { state: "expired" }
                       throw e
@@ -401,15 +414,21 @@ export async function CodarPlugin(input) {
             } catch (e) {
               // The page never opened, so the handover was not spent: put it
               // back for the next attempt (it keeps its own timestamp, so it
-              // still expires on its original schedule).
-              if (pending) pendingVerify = pending
+              // still expires on its original schedule) — unless a newer
+              // sign-in finished while this one was setting up, in which case
+              // the handover belongs to a flow the person has left.
+              if (pending && signIns === startedAt) pendingVerify = pending
               return { type: "failed", error: `无法打开登录页：${whyOf(e)}` }
             }
             // A sign-in cancelled while the page was being set up must not
             // leave a listener running for its whole TTL: addEventListener on
-            // an already-aborted signal never fires, so the check is here.
+            // an already-aborted signal never fires, so the check is here. The
+            // page never reached the host and no code was asked for, so the
+            // handover was not spent: it goes back, as it does when the page
+            // fails to open at all.
             if (signal?.aborted) {
               page.close()
+              if (pending && signIns === startedAt) pendingVerify = pending
               return { type: "failed", error: "登录已取消" }
             }
             const onAbort = () => page.close()
@@ -470,6 +489,7 @@ export async function CodarPlugin(input) {
             // is not this sign-in's to finish, and must not be offered to the
             // SMS page as if it were.
             pendingVerify = null
+            const startedAt = signIns
             try {
               const got = await login(username, password)
               return signInResult(got.token)
@@ -482,7 +502,10 @@ export async function CodarPlugin(input) {
               // for the password a second time. The token is a credential, so
               // it is held in this module and nowhere else — not in the host's
               // saved account, not in a message.
-              const pending = verifyPendingOf(e, username)
+              // A sign-in that finished while this one was in flight is the
+              // newer flow: its account, not this one, is who the person is
+              // signing in as, and this refusal's handover is already stale.
+              const pending = signIns === startedAt ? verifyPendingOf(e, username) : null
               if (pending) pendingVerify = pending
               return { type: "failed", error: scrubLine(scrubLine(signInFailure(e), username), password) }
             }

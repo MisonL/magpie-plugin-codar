@@ -226,7 +226,14 @@ func main() {
 		_ = os.Remove(*address)
 	}
 	if *ready != "" {
+		// The directory is the plugin's (it made it with mkdtemp and removes
+		// it when this process exits). A plugin that was killed outright
+		// never runs that exit handler, so its directory stayed behind —
+		// empty once these two files go — for every such death. Removing an
+		// empty directory is all that is safe here: a directory holding
+		// anything else is not this proxy's to delete.
 		_ = os.Remove(*ready)
+		_ = os.Remove(filepath.Dir(*ready))
 	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		log.Printf("serve: %v", err)
@@ -490,7 +497,22 @@ func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength >= 0 {
 		req.ContentLength = r.ContentLength
 	}
+	// A Connection header on the request names further hop-by-hop fields
+	// (RFC 7230 §6.1): they belong to this hop, whatever their names are, and
+	// are not forwarded even when the name is on the list. The response side
+	// is read the same way below.
+	local := map[string]bool{}
+	for _, line := range r.Header.Values("Connection") {
+		for _, name := range strings.Split(line, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				local[http.CanonicalHeaderKey(name)] = true
+			}
+		}
+	}
 	for _, k := range forwarded {
+		if local[http.CanonicalHeaderKey(k)] {
+			continue
+		}
 		for _, v := range r.Header.Values(k) {
 			req.Header.Add(k, v)
 		}
@@ -498,7 +520,17 @@ func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := f.clientFor(host).Do(req)
 	if err != nil {
+		// Two ways this context can be done. The plugin's own connection may
+		// be gone: nothing is listening, and the handler has nothing to say.
+		// Or the head watchdog fired, and the plugin is still waiting — a
+		// handler that returns without writing a head makes net/http answer
+		// 200 with an empty body, which reads as an answered request rather
+		// than the silence it was.
+		if r.Context().Err() != nil {
+			return
+		}
 		if ctx.Err() != nil {
+			http.Error(w, "codar-proxy: no answer in time", http.StatusGatewayTimeout)
 			return
 		}
 		http.Error(w, "codar-proxy: "+err.Error(), http.StatusBadGateway)

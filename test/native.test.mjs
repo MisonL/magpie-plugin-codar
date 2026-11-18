@@ -5,7 +5,7 @@
 // spawns it, so the suite runs on a checkout with no build.
 
 import assert from "node:assert/strict"
-import { execFile, execFileSync } from "node:child_process"
+import { execFile, execFileSync, spawn } from "node:child_process"
 import { test } from "node:test"
 import { createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
@@ -527,7 +527,12 @@ test("a signal already aborted rejects as an abort before anything is sent", NO_
   }
 })
 
-test("a streamed answer is measured against the streaming cap, not the buffered one", NO_UNIX, async () => {
+// The timeout is the test's own: it moves 9 MiB through a socket, which takes
+// about 3.5 s under Bun (Node does it in 0.5 s), and Bun's default per-test
+// bound is 5 s — under load the transfer alone ran past it and the failure
+// looked like a bug in the transport. The size is the point (it is over the
+// 8 MiB buffered cap), so the bound is what gives.
+test("a streamed answer is measured against the streaming cap, not the buffered one", { ...NO_UNIX, timeout: 60_000 }, async () => {
   // A chat request streams, and its cap is STREAM_ANSWER_BYTES (64 MiB). The
   // stated-length precheck compared against the buffered cap (8 MiB), so a 9
   // MiB event stream failed with a message about a bound it never reached. The
@@ -1107,6 +1112,59 @@ test("the proxy's files live in a directory of this process's own", { skip: proc
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// The directory cleanup is the real binary's (native/cmd/codar-proxy/main.go):
+// a stand-in executable cannot say whether the proxy has one. So this runs the
+// build in this checkout, and leaves for a machine that has none.
+const localBuild = binaryPath()
+// binaryPath answers the checkout's path whether or not the file is there, so
+// the packed tree (which ships no builds) has to be told apart by a file that
+// exists: there this check is a skip, as the other build-dependent ones are.
+test(
+  "a proxy whose host was killed leaves no directory behind",
+  { skip: process.platform === "win32" || !existsSync(localBuild) || !localBuild.startsWith(join(here, "..", "native", "bin")) || process.env.CODAR_PROXY_BIN ? "needs this checkout's own build" : false, timeout: 30_000 },
+  async () => {
+    // The proxy's socket, ready file and the 0700 directory holding them are
+    // made for it by the host, which removes the directory when the proxy
+    // exits. A host killed outright (a crash, the OOM killer, a SIGKILL)
+    // never runs that handler. The proxy does exit by itself — the host's
+    // death closes the pipe it reads — and it removes its own two files;
+    // the directory, empty by then, used to stay for as long as the machine
+    // ran, one per such death.
+    const dir = mkdtempSync(join(tmpdir(), "codar-native-killed-"))
+    const home = join(dir, "home")
+    // the same shape the plugin gives the proxy: a directory of its own
+    mkdirSync(home)
+    const hostScript = join(dir, "host.mjs")
+    writeFileSync(
+      hostScript,
+      `import { spawn } from "node:child_process"
+const child = spawn(process.env.PROXY_BIN, ["-listen", "unix", "-address", process.env.HOME_DIR + "/proxy.sock", "-ready", process.env.HOME_DIR + "/ready.json"], { stdio: ["pipe", "ignore", "ignore"] })
+child.on("exit", () => process.exit(0))
+child.unref()
+setTimeout(() => {}, 60000)
+`,
+    )
+    const host = spawn(process.execPath, [hostScript], {
+      stdio: "ignore",
+      env: { ...process.env, PROXY_BIN: localBuild, HOME_DIR: home },
+    })
+    const until = async (fn) => {
+      for (let i = 0; i < 250 && !fn(); i++) await new Promise((r) => setTimeout(r, 20))
+      return fn()
+    }
+    try {
+      assert.ok(await until(() => existsSync(join(home, "ready.json"))), "the proxy did not start")
+      host.kill("SIGKILL")
+      assert.equal(await until(() => !existsSync(home)), true, "the host's death left the proxy's directory behind")
+    } finally {
+      try {
+        host.kill("SIGKILL")
+      } catch {}
+      rmSync(dir, { recursive: true, force: true })
+    }
+  },
+)
 
 test("every platform's build carries its own sidecar's GODEBUG defaults", () => {
   // read off the 0.3.13 sidecars with `go version -m`: macOS and Linux carry
