@@ -860,6 +860,23 @@ test("a release refuses a package without every platform's build", async () => {
   }
 })
 
+// the packed gate names the platform package a resolved build came from
+test("the gate names the platform package from either separator", async () => {
+  // The probe reads the path the way the machine writes it. On Windows that is
+  // backslashes, and splitting only on "/" answered null for a build that did
+  // come from the platform package — the install check would have failed there
+  // for a reason of its own. The answer is npm's spelling whatever the path was.
+  const { packagePathOf } = await import("../scripts/tarball.mjs")
+  const here = join(tmpdir(), "codar-tarball", "consumer", "node_modules")
+  assert.equal(packagePathOf(join(here, "magpie-plugin-codar-darwin-arm64", "bin", "codar-proxy-darwin-arm64"), here), "magpie-plugin-codar-darwin-arm64/bin/codar-proxy-darwin-arm64")
+  const winHere = String.raw`C:\Users\x\AppData\Local\Temp\codar-tarball\consumer\node_modules`
+  const winFound = String.raw`C:\Users\x\AppData\Local\Temp\codar-tarball\consumer\node_modules\magpie-plugin-codar-win32-x64\bin\codar-proxy-win32-amd64.exe`
+  assert.equal(packagePathOf(winFound, winHere), "magpie-plugin-codar-win32-x64/bin/codar-proxy-win32-amd64.exe")
+  // a build outside that node_modules tree is the checkout fallback, not a package
+  assert.equal(packagePathOf(join(tmpdir(), "elsewhere", "bin", "codar-proxy-darwin-arm64"), here), null)
+  assert.equal(packagePathOf(String.raw`C:\other\bin\codar-proxy-win32-amd64.exe`, winHere), null)
+})
+
 // the packed gate refuses a package that repeats the builds
 test("the tarball gate refuses a main package that carries the builds", async () => {
   const { requireNativeBin } = await import("../scripts/tarball.mjs")
@@ -1333,7 +1350,7 @@ test("the plugin opens the proxy from the platform package that was installed", 
 
 // Two spawns of npm per package (view, publish preflight) put this past the
 // runners' default five-second bound on a loaded machine.
-test("a release ships each build as its own package, and the main package names all five", { timeout: 120000 }, async () => {
+test("a release ships each build as its own package, and the main package names all five", { timeout: 120000 }, async (t) => {
   const { checkPackages, mainPackageProblems, stagePackages, took } = await import("../scripts/native-packages.mjs")
   const { packageName } = await import("../native/binary-name.mjs")
   const bin = mkdtempSync(join(tmpdir(), "codar-native-pkgs-bin-"))
@@ -1406,10 +1423,21 @@ test("a release ships each build as its own package, and the main package names 
   // rest of a version half way leaves one nobody can finish. The preflight is
   // read against the real registry: 0.3.0 is published, a version nobody has
   // taken is not, and a package that does not exist is not taken either.
+  //
+  // This is the one test that leaves the machine, so a registry that cannot be
+  // reached says nothing about the preflight: a dropped TLS connection is not
+  // a wrong answer. A network failure skips these three reads with a note; an
+  // assertion failure is still a failure.
   if (process.env.CODAR_OFFLINE !== "1") {
-    assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-x64" }], "0.3.0"), ["magpie-plugin-codar-darwin-x64"], "a taken version was not seen as taken")
-    assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-x64" }], "9.9.99"), [], "an unpublished version was seen as taken")
-    assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-artifact-not-real" }], "0.3.0"), [], "a package that does not exist was seen as taken")
+    const unreachable = /socket disconnected|socket hang up|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|ECONNREFUSED|certificate|Client network/i
+    try {
+      assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-x64" }], "0.3.0"), ["magpie-plugin-codar-darwin-x64"], "a taken version was not seen as taken")
+      assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-x64" }], "9.9.99"), [], "an unpublished version was seen as taken")
+      assert.deepEqual(took([{ name: "magpie-plugin-codar-darwin-artifact-not-real" }], "0.3.0"), [], "a package that does not exist was seen as taken")
+    } catch (e) {
+      if (!unreachable.test(String(e?.message ?? ""))) throw e
+      t.diagnostic(`the registry could not be reached (${e.message}); the preflight's own reads are tested above`)
+    }
   }
   } finally {
     for (const dir of [bin, out]) rmSync(dir, { recursive: true, force: true })

@@ -136,6 +136,20 @@ export const requireNativeBin = (unpacked) => {
   return 0
 }
 
+// packagePathOf names the platform package a resolved build came from, as a
+// package-relative path ("<package>/bin/<file>"), or null when it did not
+// come from one: a fallback into the main package's own tree (a checkout's
+// native/bin) is the old path, not what the install check is about. Both
+// spellings of a separator are split on — the resolved path is written the
+// way the machine writes paths, and a Windows one has backslashes, while the
+// answer is compared against npm's own forward-slashed package names. The
+// probe runs this function's source in its own process (it is pure).
+export const packagePathOf = (found, here) => {
+  const rel = found.startsWith(here + "/") || found.startsWith(here + "\\") ? found.slice(here.length + 1) : ""
+  const parts = rel.split(/[\\/]/)
+  return parts[0]?.startsWith("magpie-plugin-codar-") && parts.length >= 3 ? parts.slice(0, 3).join("/") : null
+}
+
 // consumerInstall installs the packed main package into a fresh project the
 // way a user does, and reports what the user gets. The release's platform
 // packages are offered by a registry served from this process: the exact
@@ -247,11 +261,9 @@ const { realpathSync } = await import("node:fs")
 const real = (p) => { try { return realpathSync(p) } catch { return p } }
 const here = real(${JSON.stringify(modules)})
 const found = real(native.binaryPath())
-// The build only counts as coming from a platform package: a fallback into
-// the main package's own tree (a checkout's native/bin) is the old path, not
-// what this check is about.
-const parts = found.startsWith(here) ? found.slice(here.length + 1).split("/") : []
-const out = { proxy: parts[0]?.startsWith("magpie-plugin-codar-") && parts.length >= 3 ? parts.slice(0, 3).join("/") : null }
+// the helper that names the package is this file's, run here as source: it is
+// pure, so the probe reports the same answer the gate compares against
+const out = { proxy: (${packagePathOf.toString()})(found, here) }
 out.started = Boolean(await native.proxy())
 try {
   ${probe.url ? `const res = await native.proxyFetch(${JSON.stringify(probe.url)}); out.answer = JSON.parse(await res.text())` : ""}
@@ -337,6 +349,10 @@ const main = async () => {
       const report = await consumerInstall({ dir: join(root, "consumer"), manager, main: join(root, tgz), platform })
       // This machine's own package, by the same naming rule the staged set was.
       const mine = platformPackages().find((p) => p.os === process.platform && p.cpu === process.arch)
+      // A machine the build table does not name (a platform npm can run on and
+      // the release does not build for) has no install path to check here: that
+      // is this check not running, not a broken artifact, so it is exit 2.
+      if (!mine) throw usage(`this machine (${process.platform}/${process.arch}) has no build in the platform table, so the install check cannot run here`)
       if (report.installed.length !== 1 || report.installed[0] !== mine.name) {
         throw new Error(`${manager} installed ${report.installed.join(", ") || "no platform package"}; this machine's is ${mine.name}`)
       }

@@ -6695,7 +6695,7 @@ test("a missing Bun is a skip, and --require-bun makes it exit 2", { skip: proce
   assert.equal(required.status, 2, `a required Bun that is missing is "could not run": ${required.stdout}${required.stderr}`)
 })
 
-test("the gate fails a release run without builds, and skips the check otherwise", { skip: process.platform === "win32" || Boolean(process.env.CODAR_TARBALL_GATE), timeout: 120000 }, async () => {
+test("the gate fails a release run without builds, and skips the check otherwise", { skip: process.platform === "win32" || Boolean(process.env.CODAR_TARBALL_GATE), timeout: 600000 }, async () => {
   // The install check needs native/bin, and a tree without it used to report
   // the platform packages as "not installed" and exit 0: a dry run and a fresh
   // clone both passed a check they never ran. A release run
@@ -6715,11 +6715,15 @@ test("the gate fails a release run without builds, and skips the check otherwise
     // This test runs inside a tarball's own suite too: the nested gate must not
     // be told that is a packed run, or its install check would be skipped.
     const { CODAR_TARBALL_GATE: _packed, ...env } = process.env
-    const required = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs"), "--require-builds"], { env, encoding: "utf8", timeout: 110000 })
+    // Each run packs this tree and runs the whole suite inside the tarball
+    // twice (node, then bun): about a minute alone, and several under a machine
+    // running other suites. The point of the two runs is the exit code and the
+    // message, so the bound is generous — a killed run says nothing either way.
+    const required = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs"), "--require-builds"], { env, encoding: "utf8", timeout: 280000 })
     assert.equal(required.status, 2, `no builds on a release run is "could not check": ${required.stdout}${required.stderr} tree=${tree}`)
     assert.match(required.stderr + required.stdout, /no builds in .*native[\\/]bin/)
-    const loose = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs")], { env, encoding: "utf8", timeout: 110000 })
-    assert.equal(loose.status, 0, `without --require-builds the install check is a skip: ${loose.stdout}${loose.stderr}`)
+    const loose = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs")], { env, encoding: "utf8", timeout: 280000 })
+    assert.equal(loose.status, 0, `without --require-builds the install check is a skip (status ${loose.status}, signal ${loose.signal}): ${loose.stdout}${loose.stderr}`)
     assert.match(loose.stdout + loose.stderr, /install: skipped, no builds in this tree/)
   } finally {
     rmSync(tree, { recursive: true, force: true })
