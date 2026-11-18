@@ -5997,10 +5997,13 @@ test("an address without a path gets the vendor's /v1, as the gateway does", () 
   assert.equal(baseURL("https://proxy.example/gateway"), "https://proxy.example/gateway/v1", "an address with a path keeps the vendor's rule under it")
   assert.equal(baseURL("https://proxy.example/gateway/v1"), "https://proxy.example/gateway/v1", "and one that already ends in /v1 is left as it is")
   assert.equal(baseURL("http://127.0.0.1:8080"), "http://127.0.0.1:8080/v1", "a local proxy is the same rule")
-  // The path is edited, not the string: an address carrying a query kept its
-  // path and had "/v1" written into the query value.
-  assert.equal(baseURL("https://proxy.test/gateway?route=chat"), "https://proxy.test/gateway/v1?route=chat", "a query stays a query")
-  assert.equal(baseURL("https://proxy.test/gateway#frag"), "https://proxy.test/gateway/v1#frag", "a fragment stays a fragment")
+  // magpie and both clients join the endpoint by string concatenation, so a
+  // base ending in a query or a fragment would put "/chat/completions"
+  // inside it. The base is read by scheme, host and path; what was written
+  // after the path is not a base an endpoint can be joined onto.
+  assert.equal(baseURL("https://proxy.test/gateway?route=chat"), "https://proxy.test/gateway/v1", "a query does not become part of the path")
+  assert.equal(baseURL("https://proxy.test/gateway#frag"), "https://proxy.test/gateway/v1", "nor does a fragment")
+  assert.equal(baseURL("https://user:pw@proxy.example"), "https://user:pw@proxy.example/v1", "credentials in the authority stay in it")
 })
 
 test("a credential that is not a JWT is cut by its shape", () => {

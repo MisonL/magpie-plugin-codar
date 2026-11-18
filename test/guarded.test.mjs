@@ -150,6 +150,15 @@ test("fetch's own method rules decide what a redirect asks for", async () => {
     return seen
   }
   assert.deepEqual((await hop("POST", 303)).map((s) => [s.method, s.type]), [["POST", "application/json"], ["GET", null]], "a 303 after a POST is a GET with no body headers")
+  // Every header that describes a body goes with it, as fetch removes them.
+  const encoded = []
+  const transport = (url, init) => {
+    const h = new Headers(init.headers)
+    encoded.push({ ce: h.get("content-encoding"), cl: h.get("content-language"), ctype: h.get("content-type"), keep: h.get("x-keep") })
+    return Promise.resolve(encoded.length === 1 ? new Response(null, { status: 303, headers: { location: "/next" } }) : new Response("ok"))
+  }
+  await guardedFetch(`${vendor}/start`, { method: "POST", headers: { "content-encoding": "gzip", "content-language": "en", "content-type": "application/json", "x-keep": "1" }, body: "{}" }, { transport })
+  assert.deepEqual(encoded[1], { ce: null, cl: null, ctype: null, keep: "1" }, "a compressed, typed body leaves none of its headers on the GET")
   assert.deepEqual((await hop("HEAD", 303)).map((s) => s.method), ["HEAD", "HEAD"], "a 303 after a HEAD stays a HEAD")
   assert.deepEqual((await hop("PUT", 301)).map((s) => s.method), ["PUT", "PUT"], "a 301 after a PUT stays a PUT")
   assert.deepEqual((await hop("PUT", 302)).map((s) => s.method), ["PUT", "PUT"], "a 302 after a PUT stays a PUT")

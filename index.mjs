@@ -1149,7 +1149,9 @@ export async function CodarPlugin(input) {
           auth = await getAuth()
           token = tokenOf(auth)
         } catch (e) {
-          const why = restricted(e) ? "账号 API 访问受限（account_restricted），请联系科搭支持" : scrub(whyOf(e), token) || "用量查询失败"
+          // token is not read yet on this path (getAuth failed): the key the
+          // auth callback did answer with, as the check-in's catch cuts by.
+          const why = restricted(e) ? "账号 API 访问受限（account_restricted），请联系科搭支持" : scrub(whyOf(e), token ?? auth?.key) || "用量查询失败"
           return { error: why, signIn: restricted(e) ? "" : signedOut(e) ? "expired" : "" }
         }
         if (!token)
