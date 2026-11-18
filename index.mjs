@@ -1363,10 +1363,11 @@ export async function CodarPlugin(input) {
         // already in the window name.
         if (actsR.status === "fulfilled") {
           const running = runningActivities(actsR.value)
-          const shown = running.slice(0, MAX_ACTIVITY_WINDOWS)          // The card only fits a few rows, and this answer becomes one JSON
+          // The card only fits a few rows, and this answer becomes one JSON
           // line in the host: when the vendor reports too many activities at
           // once, take only the first few — the data must not blow past the
           // host's 32 MiB line.
+          const shown = running.slice(0, MAX_ACTIVITY_WINDOWS)
           const named = []
           for (const a of shown) {
             // The token is cut out of the raw id before cleanText truncates
