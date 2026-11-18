@@ -205,6 +205,14 @@ const isMain = (() => {
 
 function build(argv) {
   const args = new Set(argv)
+  // An argument this script does not know is exit 2, the same answer the
+  // tarball gate and the catalog generator give: a misspelt --strict used to
+  // be ignored, and a release-time check silently ran without it.
+  const unknown = [...args].filter((a) => a !== "--all" && a !== "--check" && a !== "--strict")
+  if (unknown.length) {
+    console.error(`build-native: unrecognized argument ${unknown.join(" ")} (try --all, --check or --strict)`)
+    return 2
+  }
   if (args.has("--check")) {
     const rows = checkTargets(out)
     for (const r of rows) {

@@ -178,11 +178,19 @@ function main(argv) {
     return 2
   }
   const manifest = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8"))
+  // The manifest is part of what "ready to publish" means: a package.json
+  // whose optionalDependencies no longer name a platform package installs
+  // without the proxy, and the staged set being complete does not show that.
+  const problems = mainPackageProblems(manifest)
+  if (problems.length) {
+    for (const p of problems) console.error(`package.json: ${p}`)
+  }
   if (args.has("--check")) {
     const rows = checkPackages({ dir: staged, version: manifest.version })
     for (const r of rows) console.log(r.state === "present" ? `present ${r.name}@${manifest.version}` : `broken ${r.name}: ${r.reason}`)
-    return rows.some((r) => r.state !== "present") ? 1 : 0
+    return problems.length || rows.some((r) => r.state !== "present") ? 1 : 0
   }
+  if (problems.length) return 1
   const wrote = stageFromTree()
   for (const p of wrote) console.log(`staged ${p.name}@${manifest.version} -> ${p.dir}`)
   if (!args.has("--publish")) return 0
@@ -217,17 +225,26 @@ function main(argv) {
 // npm is npm.cmd on Windows, where spawnSync finds it only through a shell,
 // and the version the registry was asked about came back wrong that way. A
 // packument is the registry's own answer, the same one `npm view` reads.
-export function took(wrote, version, { registry = "https://registry.npmjs.org" } = {}) {
+export function took(wrote, version, { registry = process.env.npm_config_registry || "https://registry.npmjs.org" } = {}) {
   const taken = []
+  const base = registry.replace(/\/$/, "")
   for (const p of wrote) {
+    // The child has its own clock and redirect cap; this one bounds even a
+    // child that never reaches them (a loader error, a runtime that hangs).
+    // A preflight that cannot get an answer must stop the publish it stands
+    // in front of, not pass it with "a version nobody could ask about".
+    const got = spawnSync(process.execPath, ["-e", readPackument, `${base}/${p.name}`, p.name], { encoding: "utf8", timeout: 30000 })
+    if (got.error || got.status !== 0) {
+      throw new Error(`${p.name}: the registry at ${base} could not be asked (${got.error?.message ?? `the child exited ${got.status}`}); nothing was published`)
+    }
     let doc
-    const got = spawnSync(process.execPath, ["-e", readPackument, `${registry.replace(/\/$/, "")}/${p.name}`, p.name], { encoding: "utf8" })
     try {
       doc = JSON.parse(String(got.stdout ?? "").trim().split("\n").at(-1))
     } catch {
       doc = undefined
     }
-    if (doc?.error && doc.error !== 404) throw new Error(`${p.name}: the registry answered ${doc.error}`)
+    if (!doc) throw new Error(`${p.name}: the registry at ${base} did not answer with a version list; nothing was published`)
+    if (doc.error && doc.error !== 404) throw new Error(`${p.name}: the registry answered ${doc.error}`)
     // versions is an array of the published versions, as the child printed it.
     if (Array.isArray(doc?.versions) && doc.versions.includes(version)) taken.push(p.name)
   }
@@ -236,18 +253,31 @@ export function took(wrote, version, { registry = "https://registry.npmjs.org" }
 
 // readPackument runs in a child process as a script: a small program rather
 // than a chain of synchronous calls, so the archive is decompressed off the
-// main thread's stack. It prints {versions: [...]} or {error: status}.
+// main thread's stack. It prints {versions: [...]} or {error: status|message}.
+// A redirect chain has a limit and every request a clock: a registry that
+// points at itself is not an answer, and a preflight that never returned
+// would hold the publish it stands in front of.
 const readPackument = `
 const [url, name] = process.argv.slice(1)
-const get = (u) => new Promise((resolve, reject) => require(u.startsWith("https:") ? "node:https" : "node:http").get(u, (res) => {
-  if (res.statusCode === 302 || res.statusCode === 301) { res.resume(); return resolve(get(res.headers.location)) }
-  const chunks = []
-  res.on("data", (c) => chunks.push(c))
-  res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }))
-}).on("error", reject))
-get(url).then(({ status, body }) => {
+const get = (u, hops) => new Promise((resolve, reject) => {
+  if (hops > 5) return reject(new Error("the registry redirected more than 5 times"))
+  const req = require(u.startsWith("https:") ? "node:https" : "node:http").get(u, (res) => {
+    if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+      res.resume()
+      const next = res.headers.location
+      if (!next) return resolve({ status: res.statusCode })
+      try { return resolve(get(new URL(next, u).href, hops + 1)) } catch (e) { return reject(e) }
+    }
+    const chunks = []
+    res.on("data", (c) => chunks.push(c))
+    res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }))
+  })
+  req.setTimeout(10000, () => req.destroy(new Error("the registry did not answer within 10 s")))
+  req.on("error", reject)
+})
+get(url, 0).then(({ status, body }) => {
   if (status !== 200) return console.log(JSON.stringify({ error: status }))
-  const doc = JSON.parse(body.toString("utf8"))
+  const doc = JSON.parse((body ?? Buffer.alloc(0)).toString("utf8"))
   console.log(JSON.stringify({ versions: Object.keys(doc.versions || {}) }))
 }).catch((e) => console.log(JSON.stringify({ error: String(e && e.message || e) })))
 `

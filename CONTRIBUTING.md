@@ -157,12 +157,24 @@ one cannot be filled in faithfully after the fact. Then:
 ```bash
 npm run native:all                                  # the five platform builds
 npm version <patch|minor|major> -m "release: v%s"   # bumps package.json, commits, tags
+node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
+node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/native-packages.mjs --publish          # the five platform packages, first
-node scripts/tarball.mjs                            # the packed suite, before it ships
 git push --follow-tags
-npm publish                                         # prepublishOnly: the five builds must exist (--strict), the packed suite and its install check must pass (tarball.mjs --require-builds), and the platform packages must be staged at this version (--check)
+npm publish                                         # prepublishOnly re-runs the same gates: --strict builds, the packed suite and install check (--require-bun --require-builds), the staged set (--check)
 gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
 ```
+
+**The gates run before the first publish, not after it.** A platform package
+published at a version cannot be replaced or withdrawn (npm refuses to
+overwrite a version), and `--publish` uploads five of them one after another:
+a gate that fails afterwards leaves half a version behind. `node
+scripts/tarball.mjs --require-bun --require-builds` packs, runs the suite on
+both runtimes, installs the main package against the staged platform packages
+with both bun and npm, and starts the proxy the install landed; `node
+scripts/native-packages.mjs --check` then says the staged set and
+`package.json`'s `optionalDependencies` agree at this version. Only then
+publish.
 
 **The platform packages are published before the main one, and at the same
 version.** The main package's `optionalDependencies` name them at its own exact
@@ -173,8 +185,9 @@ publishes them; `--check` says what is staged and refuses a version that is not
 the main package's. `prepublishOnly` starts with
 `node scripts/build-native.mjs --check --strict`, which refuses a release that
 has no build (or only a stub where one belongs) for any platform, and then runs
-the tarball gate with `--require-builds`, which installs the packed main package
-in a scratch project and requires it to land this machine's platform package. Neither check can tell a fresh build from
+the tarball gate with `--require-bun --require-builds`, which installs the
+packed main package in a scratch project with bun and with npm and requires
+each install to land this machine's platform package and start its proxy. Neither check can tell a fresh build from
 an old one: `--strict` reads presence, headers and the executable bit, and the
 staged packages are whatever `native/bin` held. Running `npm run native:all`
 first is the release step that keeps them current, and a build made before the

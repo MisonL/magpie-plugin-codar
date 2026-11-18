@@ -88,6 +88,14 @@ const pluginOf = async () => {
   if (!plugin) plugin = (await import(new URL("../lib/internal.mjs", import.meta.url).href)).testables
   return plugin
 }
+// guard is the plugin's own fallback fetch (lib/guarded.mjs), loaded the same
+// lazy way: the fallback must not follow a redirect off the vendor any more
+// than the plugin's request() may.
+let guard = null
+const guardOf = async () => {
+  if (!guard) guard = (await import(new URL("../lib/guarded.mjs", import.meta.url).href)).guardedFetch
+  return guard
+}
 
 // configPathOf is where the app keeps its own config, the same place the
 // plugin's read-from-this-machine sign-in looks (internal.mjs's configPath).
@@ -261,10 +269,12 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
     // Go client the way it answers the Codar app, and a maintainer's plain fetch
     // is the fingerprint the plugin exists to avoid. No binary, a host the proxy
     // will not forward, a proxy that could not start: the ordinary fetch, as the
-    // plugin's own request() falls back.
+    // plugin's own request() falls back — the guarded one, which reads a
+    // redirect off the vendor's origin as the answer instead of following it.
     const res = await ask.catch(async (e) => {
       if (e?.name !== "NativeUnavailable") throw e
-      return fetchImpl(`${rules.API}${rules.CATALOG_PATH}`, { headers: { Authorization: `Bearer ${sent}`, "User-Agent": rules.UA_DESKTOP }, signal: AbortSignal.timeout(timeoutMs) })
+      const guarded = await guardOf()
+      return guarded(`${rules.API}${rules.CATALOG_PATH}`, { headers: { Authorization: `Bearer ${sent}`, "User-Agent": rules.UA_DESKTOP }, signal: AbortSignal.timeout(timeoutMs) }, { transport: fetchImpl })
     })
     // The signal only stops the response headers from hanging. A vendor that
     // sends headers and then goes quiet would still hold the run for ever

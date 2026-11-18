@@ -359,7 +359,7 @@ export async function CodarPlugin(input) {
                         businessCodes: true,
                         signal,
                       }),
-                    (phone, code, signal) => verifyIp({ username: pending.username, phone, code, tempToken: pending.tempToken, signal }),
+                    (phone, code, signal) => verifyIp({ username: pending.username, phone, code, tempToken: pending.tempToken }, { signal }),
                   ),
                   // the account being verified is named: the person may have
                   // several, and this page completes whichever one the password
@@ -1363,11 +1363,12 @@ export async function CodarPlugin(input) {
         // already in the window name.
         if (actsR.status === "fulfilled") {
           const running = runningActivities(actsR.value)
-          // The card only fits a few rows, and this answer becomes one JSON
+          const shown = running.slice(0, MAX_ACTIVITY_WINDOWS)          // The card only fits a few rows, and this answer becomes one JSON
           // line in the host: when the vendor reports too many activities at
           // once, take only the first few — the data must not blow past the
           // host's 32 MiB line.
-          for (const a of running.slice(0, MAX_ACTIVITY_WINDOWS)) {
+          const named = []
+          for (const a of shown) {
             // The token is cut out of the raw id before cleanText truncates
             // it (a 134-character token became 120 characters on the card when
             // the order was reversed), and only the two the name shows are
@@ -1426,7 +1427,7 @@ export async function CodarPlugin(input) {
             // resetsAt: still report the activity — it is running, it just
             // did not say when it ends (safeTime yields 0).
             const freeUntil = safeTime(secsOf(a.free_until) * 1000)
-            windows.push({
+            const window = {
               name: ids.length ? `免费模型 · ${ids.join("、")}${idCount > 2 ? ` 等 ${idCount} 个` : ""}` : "免费模型",
               ...(share != null ? { used: share } : {}),
               ...(freeUntil ? { resetsAt: freeUntil } : {}),
@@ -1438,7 +1439,25 @@ export async function CodarPlugin(input) {
               display: quotaLeft == null ? (cap == null ? "免费使用中（不限量）" : `免费使用中，共 ${cap}`) : used == null ? `免费使用中，还剩 ${quotaLeft}` : `免费使用中，已用 ${used} / ${cap}`,
               ...(used != null ? { amount: used, limit: cap } : {}),
               aside: true,
-            })
+            }
+            windows.push(window)
+            named.push({ window, ids, idCount })
+          }
+          // A split echo is not confined to one activity. Spread over enough
+          // activities, each holding two or three characters, no activity's
+          // own join is long enough for the per-activity check to see — but
+          // the card reads the names in activity order, and spells the token.
+          // The names that survived the per-activity read are joined in that
+          // same order and read for the longest run of the token they carry:
+          // a card of 20 activities may spell a long prefix rather than the
+          // whole thing, which is still the token to a reader. A hit turns
+          // every name into "…", as a split inside one activity already does.
+          // The rows stay, the fragments do not.
+          const spelled = named.flatMap((r) => r.ids.filter((x) => x !== "…")).join("")
+          if (token && (echoesKey(spelled, token) || splitAcross(spelled, token) || splitFields(named.flatMap((r) => r.ids), token))) {
+            for (const r of named) {
+              if (r.ids.length) r.window.name = `免费模型 · ${r.ids.map(() => "…").join("、")}${r.idCount > 2 ? ` 等 ${r.idCount} 个` : ""}`
+            }
           }
         }
 

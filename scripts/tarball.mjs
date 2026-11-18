@@ -23,7 +23,9 @@
 // `--require-builds` is passed — a release run (`prepublishOnly`) passes it,
 // so a release cannot ship on a check that did not run. Inside a packed run
 // of the suite (CODAR_TARBALL_GATE) there are no builds to stage and the
-// packed suite is already running, so the install check is skipped there.
+// packed suite is already running, so the install check is skipped there —
+// unless `--require-builds` is passed too: a run that was told to check the
+// install path answers "could not do it" (exit 2) rather than a skip.
 
 import { execFileSync, spawn } from "node:child_process"
 import { createServer } from "node:http"
@@ -278,6 +280,36 @@ console.log(JSON.stringify(out))
   return { manager, installed, ...JSON.parse(said.trim().split("\n").at(-1)) }
 }
 
+// requiredFiles is every packed file the suite loads: the test files import
+// the plugin, the generator script, both tests' helpers and the docs the
+// style test reads; the Go sources are what the native job's `go test` reads
+// in the checkout and what a reader of the tarball needs to rebuild. A file
+// dropped from `files` fails here with this message rather than deep inside
+// the suite as "node --test failed". Exported so the suite can keep it the
+// same size as `files` (LICENSE aside: nothing installs it).
+export const requiredFiles = [
+  "index.mjs",
+  "lib/internal.mjs",
+  "lib/signinpage.mjs",
+  "lib/native.mjs",
+  "lib/guarded.mjs",
+  "native/binary-name.mjs",
+  "lib/catalog.mjs",
+  "scripts/catalog.mjs",
+  "scripts/tarball.mjs",
+  "scripts/build-native.mjs",
+  "scripts/native-packages.mjs",
+  "native/go.mod",
+  "native/cmd/codar-proxy/main.go",
+  "native/cmd/codar-proxy/main_test.go",
+  "test/plugin.test.mjs",
+  "test/style.test.mjs",
+  "test/native.test.mjs",
+  "test/guarded.test.mjs",
+  "README.md",
+  "CHANGELOG.md",
+]
+
 const main = async () => {
   const options = process.argv.slice(2)
   const unknown = options.filter((a) => a !== "--require-bun" && a !== "--require-builds")
@@ -308,11 +340,8 @@ const main = async () => {
     const tgz = tarballOf(root)
     run("tar", ["-xzf", join(root, tgz), "-C", root], { stdio: "inherit" })
     const pkg = join(root, "package")
-    // Every file the packed suite loads: the test files import the plugin, the
-    // generator script, both tests' helpers and the docs the style test reads.
-    // A file dropped from `files` fails here with this message rather than
-    // deep inside the suite as "node --test failed".
-    for (const file of ["index.mjs", "lib/internal.mjs", "lib/signinpage.mjs", "lib/native.mjs", "lib/guarded.mjs", "native/binary-name.mjs", "lib/catalog.mjs", "scripts/catalog.mjs", "scripts/tarball.mjs", "scripts/build-native.mjs", "native/go.mod", "test/plugin.test.mjs", "test/style.test.mjs", "test/native.test.mjs", "test/guarded.test.mjs", "README.md", "CHANGELOG.md"]) {
+    // Every file the packed suite loads, from the list above.
+    for (const file of requiredFiles) {
       if (!existsSync(join(pkg, file))) throw new Error(`the tarball is missing ${file}, which the suite needs`)
     }
     // The main package must not carry the builds: each is its own platform
@@ -328,16 +357,35 @@ const main = async () => {
     // in the package) and nothing cheap to install twice, so it is skipped
     // there — the gate one level up has already done it.
     const bin = join(pkgRoot, "native", "bin")
-    const packedRun = process.env.CODAR_TARBALL_GATE === "1"
+    // The packed marker says the suite is running inside this check's own
+    // tarball, where a checkout's builds are not and the gate one level up has
+    // already done the install. It is not a licence to skip a check the caller
+    // asked for by name: with --require-builds, a run that cannot do it says so
+    // (2) instead of reporting a skip as a pass.
+    const packedRun = process.env.CODAR_TARBALL_GATE === "1" && !requireBuilds
     if (packedRun) console.log("install: skipped, this is a packed run of the suite (see CODAR_TARBALL_GATE)")
     else if (existsSync(bin) && readdirSync(bin).length) {
       const version = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8")).version
       const staged = join(root, "packages")
-      const wrote = stagePackages({ bin, out: staged, version })
+      let wrote
+      try {
+        wrote = stagePackages({ bin, out: staged, version })
+      } catch (e) {
+        // A bin directory holding something that is not a build (a stray
+        // .DS_Store, a half-made copy) is a tree this check cannot run on,
+        // not a broken artifact: 2, as a missing tool is.
+        const cannot = usage(e.message)
+        cannot.exitCode = 2
+        throw cannot
+      }
       const broken = checkPackages({ dir: staged, version }).filter((r) => r.state !== "present")
       if (broken.length) throw new Error(`a staged platform package is unusable: ${broken.map((r) => `${r.name} ${r.reason}`).join("; ")}`)
       const platform = wrote.map((p) => packedPackage(p.dir, join(root, "platform-tgz")))
-      const manager = ["bun", "npm"].find((cmd) => {
+      // Both runtimes magpie loads plugins on, not whichever happens to be
+      // first: bun and npm each resolve optionalDependencies and the os/cpu
+      // filter by their own rules, and the check exists to see that each of
+      // them lands this machine's package and can start it.
+      const managers = ["bun", "npm"].filter((cmd) => {
         try {
           execFileSync(cmd, ["--version"], { stdio: "ignore" })
           return true
@@ -345,20 +393,22 @@ const main = async () => {
           return false
         }
       })
-      if (!manager) throw usage("neither bun nor npm is on PATH; the install check needs one")
-      const report = await consumerInstall({ dir: join(root, "consumer"), manager, main: join(root, tgz), platform })
+      if (!managers.length) throw usage("neither bun nor npm is on PATH; the install check needs one")
       // This machine's own package, by the same naming rule the staged set was.
       const mine = platformPackages().find((p) => p.os === process.platform && p.cpu === process.arch)
       // A machine the build table does not name (a platform npm can run on and
       // the release does not build for) has no install path to check here: that
       // is this check not running, not a broken artifact, so it is exit 2.
       if (!mine) throw usage(`this machine (${process.platform}/${process.arch}) has no build in the platform table, so the install check cannot run here`)
-      if (report.installed.length !== 1 || report.installed[0] !== mine.name) {
-        throw new Error(`${manager} installed ${report.installed.join(", ") || "no platform package"}; this machine's is ${mine.name}`)
+      for (const manager of managers) {
+        const report = await consumerInstall({ dir: join(root, `consumer-${manager}`), manager, main: join(root, tgz), platform })
+        if (report.installed.length !== 1 || report.installed[0] !== mine.name) {
+          throw new Error(`${manager} installed ${report.installed.join(", ") || "no platform package"}; this machine's is ${mine.name}`)
+        }
+        if (report.proxy !== `${mine.name}/bin/${mine.file}`) throw new Error(`the installed plugin opened ${report.proxy ?? "no platform package"} under ${manager}`)
+        if (!report.started) throw new Error(`the installed plugin did not start ${mine.name}'s build under ${manager}`)
+        console.log(`install: ${manager} installed ${mine.name} and the plugin started it`)
       }
-      if (report.proxy !== `${mine.name}/bin/${mine.file}`) throw new Error(`the installed plugin opened ${report.proxy ?? "no platform package"}`)
-      if (!report.started) throw new Error(`the installed plugin did not start ${mine.name}'s build`)
-      console.log(`install: ${manager} installed ${mine.name} and the plugin started it`)
     } else if (requireBuilds) {
       // No builds on a release run: there is no install path to check, and a
       // pass would say there was. `prepublishOnly` passes --require-builds.

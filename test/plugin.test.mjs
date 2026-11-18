@@ -413,6 +413,27 @@ test("a page stops trading codes after its submit budget, refusals included", as
   }
 })
 
+test("a vendor error sentence that quotes a credential does not reach the page", async () => {
+  // The route handler put the thrown sentence on the page as it came: a vendor
+  // 500 whose message quoted a token showed the token in the page and its JS,
+  // against the module's own "the token never reaches the page at all". Every
+  // route's failure answer is shape-scrubbed now.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const sms = await startSignIn({
+    sendCode: async () => {},
+    verifyCode: async () => { throw new Error(`系统错误 token=${TOKEN}`) },
+  })
+  try {
+    const res = await fetch(`${sms.url}verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ phone: "13800138000", code: "123456" }) })
+    const text = await res.text()
+    assert.equal(res.status, 400)
+    assert.ok(!text.includes(TOKEN), `the page is not shown the token: ${text}`)
+    assert.match(text, /系统错误/, "the sentence itself is kept")
+  } finally {
+    sms.close()
+  }
+})
+
 test("the page module is lib/signinpage.mjs and the plugin imports it from there", async () => {
   // The page's module moved into lib/ with the rest of the runtime. The
   // plugin's own import is what matters: a path left behind would fail at
@@ -906,6 +927,17 @@ test("the scan status reads the vendor's words as the page's own states", () => 
   assert.equal(wechatStatusOf({ code: 200, message: "查询成功", data: { status: "pending" } }).message, "")
   assert.equal(wechatStatusOf({ code: 200, message: "系统维护中", data: { status: "pending" } }).message, "系统维护中", "an unusual sentence still reaches the person")
   assert.equal(wechatStatusOf({ data: { status: "SUCCESS" } }).state, "error", "a success with no token is not a sign-in")
+  // Nor is one whose token the plugin cannot keep: the host would save it and
+  // the card would then say the token cannot be read, after a page that said
+  // the sign-in succeeded.
+  const unreadable = wechatStatusOf({ data: { status: "SUCCESS", token: "ab cd" } })
+  assert.equal(unreadable.state, "error", "a success carrying an unusable token is not a sign-in")
+  assert.match(unreadable.message, /令牌/)
+  assert.equal(
+    wechatStatusOf({ data: { status: "SUCCESS", token: mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 10 }) } }).state,
+    "error",
+    "an expired token is no sign-in either",
+  )
   assert.equal(wechatStatusOf({}).state, "waiting", "an answer that says nothing is not done")
   assert.deepEqual(wechatQrOf({ data: { scene: "s1", qr_url: "https://codar-web.speedai.com/qr/s1.png" } }), { scene: "s1", qrUrl: "https://codar-web.speedai.com/qr/s1.png" })
   assert.equal(wechatQrOf({ data: { scene: "s1" } }), null, "a code without an image is no code")
@@ -1197,6 +1229,66 @@ test("cancelling the page stops the vendor call it had in flight", async () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error("the vendor call outlived the page")), 2000).unref()),
     ])
     assert.equal(vendorSignal.aborted, true, "closing the page aborts the vendor call it started")
+  } finally {
+    ctl.abort()
+    await opened.callback?.().catch?.(() => {})
+    globalThis.fetch = realFetch
+  }
+})
+
+test("cancelling the security-check page stops the verify call it had in flight", async () => {
+  // The IP-check step's own vendor call is abandoned with the page, as the
+  // SMS sign-in and the QR poll are: index.mjs once carried the page's signal
+  // inside verifyIp's fields object, where the function never reads it, so a
+  // cancelled page still ran /v1/user/verify_ip to its own timeout.
+  const temp = mkToken({ username: "user_v", exp: Math.floor(Date.now() / 1000) + 600 })
+  const p = await CodarPlugin()
+  await withFetch(
+    { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_v", phone: "13800138000", token: temp } } },
+    async () => {
+      const out = await p.auth.methods.find((x) => x.label === "科搭账号密码登录").authorize({ username: "user_v", password: "pw" })
+      assert.equal(out.type, "failed")
+    },
+  )
+  const realFetch = globalThis.fetch
+  const json = (body) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } })
+  const ctl = new AbortController()
+  let vendorSignal = null
+  let verifyPost = null
+  globalThis.fetch = (u, init) => {
+    const s = String(u instanceof Request ? u.url : u)
+    if (s.startsWith("http://127.0.0.1")) return realFetch(u, init)
+    if (s.includes("/v1/verification-code")) return Promise.resolve(json({ code: 200 }))
+    if (s.includes("/v1/user/verify_ip")) {
+      vendorSignal = init?.signal
+      return new Promise((_, reject) => {
+        init?.signal?.addEventListener?.("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })))
+      })
+    }
+    return Promise.resolve(json({ code: 200 }))
+  }
+  const opened = await p.auth.methods.find((x) => x.label === "科搭OAuth登录").authorize({}, { signal: ctl.signal })
+  try {
+    const sent = await realFetch(`${opened.url}send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: "13800138000", captcha: { lot_number: "l", captcha_output: "o", pass_token: "p", gen_time: "1" } }),
+    })
+    assert.equal(sent.status, 200)
+    verifyPost = realFetch(`${opened.url}verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: "13800138000", code: "123456" }),
+    }).catch(() => {})
+    for (let i = 0; i < 200 && !vendorSignal; i++) await new Promise((r) => setTimeout(r, 5))
+    assert.ok(vendorSignal, "the vendor call started")
+    assert.equal(vendorSignal.aborted, false, "and is running")
+    ctl.abort()
+    await Promise.race([
+      verifyPost,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("the verify call outlived the page")), 2000).unref()),
+    ])
+    assert.equal(vendorSignal.aborted, true, "closing the page aborts the verify call it started")
   } finally {
     ctl.abort()
     await opened.callback?.().catch?.(() => {})
@@ -4619,7 +4711,7 @@ const { recordsOf, render, parseCatalog, main, sortRows, configPathOf } = await 
 const { quoteArg } = await import("../scripts/tarball.mjs")
 
 // genRun drives the generator against a stub vendor and a scratch directory.
-const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFetch, onReady, onDone, token } = {}) => {
+const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFetch, onReady, onDone, token, fetchImpl } = {}) => {
   const { mkdtempSync } = await import("node:fs")
   const { readFileSync, writeFileSync } = await import("node:fs")
   const root = mkdtempSync(join(tmpdir(), "codar-gen-"))
@@ -4638,10 +4730,10 @@ const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFet
     argv: ["node", "scripts/catalog.mjs", ...argv],
     env: { CODAR_HOME: root },
     out: outPath,
-    fetchImpl: async () => {
+    fetchImpl: fetchImpl ?? (async () => {
       if (throwOnFetch) throw throwOnFetch instanceof Error ? throwOnFetch : new TypeError("fetch failed")
       return new Response(typeof body === "string" ? body : JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
-    },
+    }),
     log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
   })
   const after = (() => {
@@ -4656,6 +4748,68 @@ const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFet
   rmSync(root, { recursive: true, force: true })
   return { exit, logs, after, outPath, siblings }
 }
+
+test("the generator drops a record carrying another provider's credential", async () => {
+  // The generator's own cut reads shapes twice: keyed (echoesIn with the
+  // current token) and, in an earlier draft, keylessly through
+  // shapeOnly(…, "") — which is false whatever the string is, because that
+  // helper only reads shapes for a caller that knows its key. The keyed read
+  // is what drops the record below; this pins that an sk- key in a display
+  // name never reaches the committed file while the readable record stays.
+  const body = {
+    code: 200,
+    data: [
+      { id: "synthetic-model", display_name: "sk-live-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", context_window: 1000 },
+      { id: "safe-model", display_name: "Safe Model", context_window: 1000 },
+    ],
+  }
+  const { exit, after } = await genRun({ body })
+  assert.equal(exit, 0, "a droppable record does not fail the run")
+  assert.ok(after && !after.includes("sk-live"), "another provider's key is not written")
+  assert.ok(after.includes("safe-model"), "the readable record is kept")
+})
+
+test("the generator's fallback fetch does not follow a redirect off the vendor", async () => {
+  // Without a proxy the generator fetched the catalog with plain fetch: a
+  // gateway (or anything that can redirect that GET) answered 302 to another
+  // origin and fetch followed it, so the file could be built from an answer
+  // the vendor never gave. The plugin's own guarded fetch is the rule now.
+  const calls = []
+  const followFetch = async (u, init) => {
+    calls.push({ url: String(u), redirect: init?.redirect })
+    if (init?.redirect === "manual") return new Response(null, { status: 302, headers: { Location: "https://elsewhere.example/catalog.json" } })
+    return new Response(JSON.stringify({ code: 200, data: [{ id: "m", display_name: "M", context_window: 1000 }] }), { status: 200, headers: { "Content-Type": "application/json" } })
+  }
+  const { exit, after } = await genRun({ body: { code: 200, data: [] }, fetchImpl: followFetch })
+  assert.equal(calls.length, 1, "the redirect was not followed")
+  assert.equal(calls[0].redirect, "manual", "the guarded fetch reads the redirect instead of the hop")
+  assert.notEqual(exit, 0, "a redirect is not a catalog")
+  assert.equal(after, null, "nothing was written")
+})
+
+test("the release preflight gives up on a registry that keeps redirecting", async () => {
+  // took() asks the registry in a child process, and that child followed a
+  // 301/302 with no count and no clock — a registry pointing at itself (or a
+  // connection that never answers) held the publish it stands in front of
+  // for ever. The chain is capped and each request has a clock now.
+  const { createServer } = await import("node:http")
+  const server = createServer((req, res) => res.writeHead(301, { Location: `http://127.0.0.1:${server.address().port}${req.url}` }).end())
+  await new Promise((r) => server.listen(0, "127.0.0.1", r))
+  const registry = `http://127.0.0.1:${server.address().port}`
+  try {
+    const { execFile } = await import("node:child_process")
+    const { fileURLToPath, pathToFileURL } = await import("node:url")
+    const here = fileURLToPath(new URL("..", import.meta.url))
+    const script = `import(${JSON.stringify(pathToFileURL(join(here, "scripts", "native-packages.mjs")).href)}).then((m) => { try { m.took([{ name: "x" }], "1.0.0", { registry: ${JSON.stringify(registry)} }); console.log("answered") } catch (e) { console.log("refused: " + e.message) } })`
+    // Asynchronously: the registry above is this process's server, and a
+    // synchronous child would block the loop that has to answer it.
+    const run = await new Promise((resolve) => execFile(process.execPath, ["-e", script], { encoding: "utf8", timeout: 15000 }, (error, stdout, stderr) => resolve({ error, stdout, stderr })))
+    assert.ok(!run.error, `the preflight finished on its own (${run.error?.signal ?? run.error?.message}): ${run.stdout}${run.stderr}`)
+    assert.match(run.stdout + run.stderr, /refused: .*(?:redirect|registry)/i)
+  } finally {
+    await new Promise((r) => server.close(r))
+  }
+})
 
 test("the catalog generator builds its records with the plugin's own rules", async () => {
   // The vendor spells a size as a string, plants an id a request could not
@@ -6703,7 +6857,7 @@ test("the gate fails a release run without builds, and skips the check otherwise
   // Windows is left out: the suite's Bun half counts as missing there (the
   // gate is shown a packed run), and the install check needs no builds only
   // up to that point.
-  const { cpSync, mkdtempSync, rmSync } = await import("node:fs")
+  const { cpSync, mkdirSync, mkdtempSync, rmSync } = await import("node:fs")
   const { spawnSync } = await import("node:child_process")
   const { fileURLToPath } = await import("node:url")
   const here = fileURLToPath(new URL("..", import.meta.url))
@@ -6722,16 +6876,81 @@ test("the gate fails a release run without builds, and skips the check otherwise
     const required = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs"), "--require-builds"], { env, encoding: "utf8", timeout: 280000 })
     assert.equal(required.status, 2, `no builds on a release run is "could not check": ${required.stdout}${required.stderr} tree=${tree}`)
     assert.match(required.stderr + required.stdout, /no builds in .*native[\\/]bin/)
+    // The packed-run marker says the suite is running inside a tarball; it is
+    // not a licence to skip a check the caller explicitly asked for. Both
+    // together is still "this run cannot do what it was told": 2.
+    const packed = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs"), "--require-builds"], { env: { ...env, CODAR_TARBALL_GATE: "1" }, encoding: "utf8", timeout: 280000 })
+    assert.equal(packed.status, 2, `a packed marker does not overrule --require-builds: ${packed.stdout}${packed.stderr}`)
+    assert.ok(!/install: skipped, this is a packed run/.test(packed.stdout), "and the packed-run skip did not stand")
     const loose = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs")], { env, encoding: "utf8", timeout: 280000 })
     assert.equal(loose.status, 0, `without --require-builds the install check is a skip (status ${loose.status}, signal ${loose.signal}): ${loose.stdout}${loose.stderr}`)
     assert.match(loose.stdout + loose.stderr, /install: skipped, no builds in this tree/)
+    // A bin directory that holds something and no build is a tree the check
+    // cannot run on, not a broken artifact: 2, as a missing tool is.
+    mkdirSync(join(tree, "native", "bin"), { recursive: true })
+    writeFileSync(join(tree, "native", "bin", ".DS_Store"), "")
+    const stray = spawnSync(process.execPath, [join(tree, "scripts", "tarball.mjs")], { env, encoding: "utf8", timeout: 280000 })
+    assert.equal(stray.status, 2, `a bin directory with no build is "could not check": ${stray.stdout}${stray.stderr}`)
+    assert.match(stray.stderr + stray.stdout, /no build at/)
   } finally {
     rmSync(tree, { recursive: true, force: true })
   }
 })
 
-test("the tarball gate refuses an argument it does not know", async () => {
-  // A misspelt --require-bun used to be ignored, and the Bun half of the gate
+test("every file the package ships is one the gate would notice missing", async () => {
+  // `files` decides what ships and the gate's required list decides what it
+  // refuses to run without. A shipped file the list leaves out can vanish
+  // without the gate saying anything — the packed suite then fails deep
+  // inside, or, for a file only the Go tests read, not at all. The two lists
+  // are kept the same size, LICENSE aside: nothing installs it.
+  const { fileURLToPath } = await import("node:url")
+  const { requiredFiles } = await import("../scripts/tarball.mjs")
+  const here = fileURLToPath(new URL("..", import.meta.url))
+  const shipped = JSON.parse(readFileSync(join(here, "package.json"), "utf8")).files
+  const missing = shipped.filter((f) => f !== "LICENSE" && !requiredFiles.includes(f))
+  assert.deepEqual(missing, [], "a shipped file the gate does not require")
+})
+
+test("the build script refuses an argument it does not know", async () => {
+  // A misspelt --strict (`--stirct`) used to be ignored and the release-time
+  // check silently ran without it. Unknown arguments are exit 2, the same
+  // answer the gate and the catalog generator give.
+  const { spawnSync } = await import("node:child_process")
+  const { fileURLToPath } = await import("node:url")
+  const here = fileURLToPath(new URL("..", import.meta.url))
+  const run = spawnSync(process.execPath, [join(here, "scripts", "build-native.mjs"), "--check", "--stirct"], { encoding: "utf8" })
+  assert.equal(run.status, 2, `an unknown argument to the build script is exit 2: ${run.stdout}${run.stderr}`)
+  assert.match(run.stderr + run.stdout, /unrecognized argument/)
+})
+
+test("a staged set the manifest cannot reach is reported before it is published", async () => {
+  // `--check` reported only what was staged; a package.json whose
+  // optionalDependencies no longer named a platform package still read as
+  // ready, and the first sign of it was an install without the proxy. The
+  // manifest is checked too, in the same pass that decides "ready".
+  const { cpSync, mkdirSync } = await import("node:fs")
+  const { spawnSync } = await import("node:child_process")
+  const { fileURLToPath } = await import("node:url")
+  const here = fileURLToPath(new URL("..", import.meta.url))
+  const tree = mkdtempSync(join(tmpdir(), "codar-manifest-"))
+  try {
+    mkdirSync(join(tree, "scripts"), { recursive: true })
+    mkdirSync(join(tree, "native"), { recursive: true })
+    cpSync(join(here, "scripts", "native-packages.mjs"), join(tree, "scripts", "native-packages.mjs"))
+    cpSync(join(here, "scripts", "build-native.mjs"), join(tree, "scripts", "build-native.mjs"))
+    cpSync(join(here, "native", "binary-name.mjs"), join(tree, "native", "binary-name.mjs"))
+    const manifest = JSON.parse(readFileSync(join(here, "package.json"), "utf8"))
+    delete manifest.optionalDependencies["magpie-plugin-codar-linux-x64"]
+    writeFileSync(join(tree, "package.json"), JSON.stringify(manifest, null, 2))
+    const run = spawnSync(process.execPath, [join(tree, "scripts", "native-packages.mjs"), "--check"], { encoding: "utf8" })
+    assert.equal(run.status, 1, `a manifest that cannot reach a platform package is not ready: ${run.stdout}${run.stderr}`)
+    assert.match(run.stdout + run.stderr, /magpie-plugin-codar-linux-x64 is not in optionalDependencies/)
+  } finally {
+    rmSync(tree, { recursive: true, force: true })
+  }
+})
+
+test("the tarball gate refuses an argument it does not know", async () => {  // A misspelt --require-bun used to be ignored, and the Bun half of the gate
   // was silently skipped on a release run. The gate now answers unknown
   // arguments the way the catalog generator does, so a release script that
   // meant to force Bun cannot mistake the skip for a pass.
@@ -7094,6 +7313,39 @@ test("a protocol the vendor states as a bare string is read", () => {
 test("a token count past what a context window can be is not a size to plan for", () => {
   assert.equal(modelOf({ id: "m", context: 1e15 }).limit.context, 0, "1e15 is not a window")
   assert.equal(modelOf({ id: "m", context: 2_000_000 }).limit.context, 2_000_000, "a real window survives")
+})
+
+test("a short key spelled with a separator of its own alphabet is still cut", () => {
+  // A password (or an SMS code) is shorter than the spread walk's floor, so a
+  // vendor echoing it with a dot between its characters — "h.u.n.t.e.r.4.2" —
+  // reached the card and magpie's log. The projection drops the separators;
+  // a short key asks for the whole key back (a partial match at eight
+  // characters is what the floor was there to avoid), so the cut is exact.
+  assert.equal(cutKey("bad password h.u.n.t.e.r.4.2", "hunter42"), "bad password …")
+  assert.equal(cutKey("bad password h_u_n_t_e_r_4_2", "hunter42"), "bad password …")
+  assert.equal(cutKey("code 1-2-3-4-5-6", "123456"), "code …")
+  // the same separators in prose that does not spell the key stay readable
+  assert.equal(cutKey("version v1.2.3.4 released", "hunter42"), "version v1.2.3.4 released")
+})
+
+test("a token spelled in two-character groups around dots is cut where no key is known", () => {
+  // The keyless shape rule knew one character between dots. Two characters a
+  // group — "ey.Jh.bG.ci…" — read as ordinary prose, and a hostile status
+  // message could put the account's token on the page in that spelling. The
+  // chain is built per segment so the token's own dots stay separators, the
+  // way an obfuscating server writes it.
+  const visible = (s) => String(s).replace(/[^A-Za-z0-9_-]/g, "")
+  const prefix = visible(TOKEN).slice(0, 40)
+  const spelled = (dot) => TOKEN.split(".").map((seg) => seg.match(/[\s\S]{1,2}/g).join(dot)).join(".")
+  for (const [label, dotted] of [["one dot", spelled(".")], ["two dots", spelled("..")]]) {
+    const cut = scrubShapes(dotted, "")
+    assert.ok(!visible(cut).includes(prefix), `${label}: no run of the token survives: ${cut}`)
+    assert.equal(scrubShapes(`失败 ${dotted}`, "").startsWith("失败"), true, `${label}: the sentence keeps its words`)
+    assert.ok(!visible(scrubShapes(`失败 ${dotted}`, "")).includes(prefix), `${label}: and none of the token`)
+  }
+  // an ordinary sentence and an abbreviation do not turn into ellipses
+  assert.equal(scrubShapes("released v1.2.3 with no dots between words", ""), "released v1.2.3 with no dots between words")
+  assert.equal(scrubShapes("See U.S.A. and U.K. for details", ""), "See U.S.A. and U.K. for details")
 })
 
 test("a credential folded with a mark the fold walk did not know is still cut", () => {
@@ -7873,6 +8125,33 @@ test("model ids split across the activity name do not carry the token onto the c
   )
   const name = u.windows.find((w) => w.name.startsWith("免费模型"))?.name ?? ""
   assert.equal(name.replace(/^免费模型 · /, "").replace("、", ""), "……", `a fragment is not a model name: ${name}`)
+})
+
+test("a token split across several activities stops before the card", async () => {
+  // The per-activity read only sees what one activity's ids spell. Spread
+  // over enough activities, each holding a couple of characters, no single
+  // join is long enough to match — and the card, read in activity order,
+  // spelled the whole token. The ids of every activity the card can show are
+  // read as one list, and a hit names no model at all.
+  const p = await CodarPlugin()
+  const until = Math.floor(Date.now() / 1000) + 3600
+  // Two characters a piece: no piece carries the `eyJ` head the shape rules
+  // cut, and 20 activities hold the whole 80-character token in order.
+  const pieces = TOKEN.match(/[\s\S]{1,2}/g)
+  const acts = []
+  for (let i = 0; i < pieces.length; i += 2) acts.push({ free_until: until, remaining_quota: null, model_ids: pieces.slice(i, i + 2) })
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 300, agent_token: 0 } },
+      "/api/codar/activities/mine": { body: { code: 200, data: acts } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const names = u.windows.filter((w) => w.name.startsWith("免费模型")).map((w) => w.name)
+  assert.ok(names.length > 1, "the activities are still reported")
+  const spelled = names.map((n) => n.replace(/^免费模型 · /, "").replace(/ 等 \d+ 个$/, "")).join("").replace(/、/g, "")
+  assert.notEqual(spelled, TOKEN, "the names in activity order are not the token")
+  assert.ok(!spelled.includes(TOKEN.slice(0, 16)), `no run of the token survives: ${spelled.slice(0, 40)}`)
 })
 
 test("the generator's leak gate catches eight-character pieces wherever they sit", async () => {
