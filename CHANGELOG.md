@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-19
+
 ### Fixed
 
 - The provider's `baseURL` ended at the gateway, without `/v1`: an OpenAI-compatible client joins `/chat/completions` onto the base and asked `https://api.claw.speedai.com/chat/completions`, which the gateway answers with a 405 page (issue #3). The loader now answers the base with `/v1`, as the vendor's own documents it, and the config hook passes a user's own base through unchanged.
