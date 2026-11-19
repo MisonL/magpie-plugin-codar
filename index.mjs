@@ -29,7 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusedCode, refreshToken, request, restricted, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
@@ -675,6 +675,16 @@ export async function CodarPlugin(input) {
         }
 
 
+        // dayStatement is the sentence the day's checks read when the answer
+        // carries two: the outer envelope's and the wrapped body's. An outer
+        // generic word ("success") beside an inner "Already signed today"
+        // was read off the outer one, and the day's own statement — and its
+        // wait — never reached the checks. The day's sentence wins when it
+        // names the day; otherwise the outer words stand.
+        const dayStatement = (outer, inner) => {
+          if (!inner || !claimedWord(inner)) return outer || inner
+          return inner
+        }
         // how long until the next attempt.
         const claimedWord = (words) => {
           const m = ALREADY_CLAIMED.exec(words)
@@ -873,7 +883,7 @@ export async function CodarPlugin(input) {
             // 30-minute trust floor.
             const deepBody = unwrapped(body)
             const secs = checkinWaitSecs(body.data?.retry_after) || checkinWaitSecs(deepBody?.retry_after) || checkinWaitSecs(body.retry_after) || checkinWaitSecs(e.retryAfter)
-            const words = saidBy(body) || saidBy(deepBody)
+            const words = dayStatement(saidBy(body), saidBy(deepBody))
             const bc = codeOf(body.code)
             // The same success-first rule as the 2xx path below: an error body
             // whose success word comes first is this attempt's claim with the
@@ -975,7 +985,7 @@ export async function CodarPlugin(input) {
         // that carries the day's sentence two `data` levels in said it just
         // the same, and reading only the outer envelope read it as a claim.
         const deepWords = saidBy(unwrapped(r))
-        const words = saidBy(r) || deepWords
+        const words = dayStatement(saidBy(r), deepWords)
         const said = scrub(words, token)
         // The vendor wraps a refusal in `data` on every other reader (points,
         // the status row, activities, the catalog): {code:200, data:{code:500}}
@@ -1296,14 +1306,10 @@ export async function CodarPlugin(input) {
         // a signed row. A {data:{data:{code:500, isSigned:true}}} passed a
         // first-level gate and was drawn as a signed day, so the walk goes as
         // deep as the check-in's.
-        const refusedInChain = (node) => {
-          for (let i = 0; node && typeof node === "object" && !Array.isArray(node) && i < 4; i++) {
-            if (saidNo(node.success) || refusedCode(codeOf(node.code)) || Boolean(errorCodeOf(node))) return true
-            node = node.data
-          }
-          return false
-        }
-        const statusRefused = refusedInChain(status)
+        // refusalWithin, not a local walk: errorCodeOf reads `data.code`, so
+        // the day's own `already_claimed` word under data read as a refusal
+        // here and the check-in row vanished.
+        const statusRefused = Boolean(status) && Boolean(refusalWithin(status))
         // The state may sit one or more `data` wrappers down; the deepest
         // object that still is one is the state's own body (a boolean data
         // is the state itself and is not descended into).

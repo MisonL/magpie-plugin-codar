@@ -218,6 +218,103 @@ test("an oauth sign-in is the key the loader sends", async () => {
 // so the plugin serves a page on 127.0.0.1 and makes every vendor call
 // itself. These tests drive that page the way a browser would — the same
 // URLs, the same bodies — with the vendor stubbed.
+test("an expiry deeper than a plain refusal is the answer that reaches the card", async () => {
+  // The first refusing node used to end the read: `{code:200, success:false,
+  // data:{code:401,…}}` returned the outer flag, so the card said the points
+  // read failed instead of marking the account expired — and the sign-in,
+  // renewal and IP check lost the same fact. A deeper node that names a dead
+  // sign-in (or a restriction) is the one whose words and fix the caller
+  // needs.
+  const { pointsOf, refusalWithin } = testables
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, success: false, data: { code: 401, message: "Invalid token", token: 0, agent_token: 0 } } },
+      "/v1/agent/balance": { body: { data: { agent_balance: 7 } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.equal(u.signIn, "expired", `a deep expiry is the sign-in's: ${JSON.stringify(u)}`)
+  assert.deepEqual(refusalWithin({ success: false, data: { code: 401 } }), { code: 401 })
+  await withFetch({ "/v1/gettoken": { body: { code: 200, success: false, data: { code: 401 } } } }, async () => {
+    await assert.rejects(pointsOf(TOKEN, "user_1", {}), (e) => e.status === 401, "the read throws the expiry with its status")
+  })
+})
+
+test("a refusal in the fourth wrapper is read, not walked past", async () => {
+  // refusalWithin and unwrapped stopped at the same three hops, so a body
+  // whose refusal sat one hop past the fields they read was accepted with its
+  // token. Real bodies nest once; the loop bound is a loop guard, not a
+  // promise about where the refusal may be.
+  const { login, unwrapped } = testables
+  const deep = { code: 200, data: { code: 200, data: { code: 200, data: { code: 200, token: TOKEN, username: "user_1", data: { code: 401, message: "Invalid token" } } } } }
+  await withFetch({ "POST /v1/login": { body: deep } }, async () => {
+    await assert.rejects(login("user_1", "pw"), (e) => e.code === "401", "the fourth-wrapper refusal is the refusal")
+  })
+  assert.equal(unwrapped(deep).code, 401, "and unwrapped reaches the same node")
+})
+
+test("a status answer's own already_claimed word still draws the row", async () => {
+  // The status row's refusal walk read errorCodeOf, which reads `data.code`:
+  // the day's own `already_claimed` under data was a refusal to that walk,
+  // and the one row the person watches disappeared.
+  const p = await CodarPlugin()
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 10, agent_token: 0 } },
+      "/v1/agent/balance": { body: { data: { agent_balance: 0 } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { code: "already_claimed", isSigned: true, retry_after: 3600 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  const row = u.windows.find((w) => w.name === "每日签到")
+  assert.ok(row, "the check-in row is drawn")
+  assert.match(row.display, /今天已领/)
+  assert.ok(row.resetsAt > Date.now(), "with the wait the answer stated")
+})
+
+test("a deep no-code already-claimed sentence is not overridden by an outer success word", async () => {
+  // {code:200, message:"success", data:{data:{message:"Already signed
+  // today", retry_after}}} was read off the outer generic word and recorded
+  // as this attempt's claim: credit 0, and magpie's day settled on a claim
+  // that never landed.
+  const p = await CodarPlugin()
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 10, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: 200, message: "success", data: { data: { message: "Already signed today", retry_after: 3600 } } } },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(u.outcome, "done", `the day's own statement wins: ${JSON.stringify(u)}`)
+  assert.match(u.message, /已领过/)
+  assert.ok(u.until > until - 60_000, "the deep wait is what the card shows")
+})
+
+test("the verify page's send button retries a captcha that never loaded", async () => {
+  // The verify page has no tab switch to ask again, and the send handler
+  // returned on a missing captcha without asking for one: one failed ct4.js
+  // left the security-check step with a button that did nothing.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const sms = await startSignIn({
+    sendCode: async () => {},
+    verifyCode: async () => ({ token: TOKEN, username: "user_1" }),
+    verify: { hint: "h", phone: "" },
+  })
+  try {
+    const html = await (await fetch(sms.url)).text()
+    assert.match(html, /if \(!cap\) \{ ensureCaptcha\(\); return \}/, "a click without a widget asks for it again")
+  } finally {
+    sms.close()
+  }
+})
+
 test("a captcha that failed to load can be asked for again from the tab", async () => {
   // The page script sets capReady before the async load and never put it
   // back, so one failed ct4.js left the SMS tab with a disabled button and
