@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The embedded fallback catalog had drifted from the vendor's list: it was missing `deepseek-v4.1-flash-economy`, `gemini-4-argon`, `gemini-4-argon-official`, `gpt-6.2-astra` and `gpt-6.2-sol`, and carried older context windows, modalities and credit rates for nine more (`gpt-6.1-sol` had 128000 context where the vendor states 1050000, `gpt-5.6-sol` had 128000 with no reply ceiling where the vendor states 1050000 and 128000). Regenerated from `GET /v1/codar/models` (20 models) with `node scripts/catalog.mjs`, whose records are the plugin's own `catalogOf` rules. The file is only the fallback — a signed-in magpie refreshes the live list every start — but an offline start used to show five models the account has and understate the rest.
+
 ### Fixed
 
 - A proxy build that existed but did not come up (a spawn the OS refused, an exit before the ready file, the five-second deadline, no private temp directory) was reported as `no platform package for this machine`, and during the new retry pause as nothing at all: the sentence sent a person reinstalling a package they already had. A failed start now says which failure it was, while an absent build still says it is absent.
