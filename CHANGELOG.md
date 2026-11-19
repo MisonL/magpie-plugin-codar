@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A proxy build that existed but did not come up (a spawn the OS refused, an exit before the ready file, the five-second deadline, no private temp directory) was reported as `no platform package for this machine`, and during the new retry pause as nothing at all: the sentence sent a person reinstalling a package they already had. A failed start now says which failure it was, while an absent build still says it is absent.
+
 ## [0.3.1] - 2026-11-19
 
 ### Fixed

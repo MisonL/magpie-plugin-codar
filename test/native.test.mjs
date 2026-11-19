@@ -1221,11 +1221,45 @@ test("a dead proxy whose replacement also refuses is retried after a pause, not 
     assert.equal(first?.name, "NativeUnavailable", `two refused sockets must be NativeUnavailable, not ${first}`)
     assert.equal(/not listening/.test(first.message), true, `the refusal must name the dead proxy: ${first.message}`)
     assert.equal(starts().length, 2, "the replacement was not attempted once")
+    // inside the pause the same reason is given: it is the transport that is
+    // out, not the machine that has no build
+    const paused = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((e) => e)
+    assert.equal(/not listening/.test(paused.message), true, `the pause said: ${paused.message}`)
     await later(120)
     const second = await proxyFetch("https://api.claw.speedai.com/v1/codar/models")
     assert.equal(second.status, 200, "the request after the pause did not reach a working proxy")
     assert.equal(starts().length, 3, "the transport stayed latched off instead of trying again")
   })
+})
+
+test("a start that failed says so, rather than blaming a missing platform package", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+  // A build that exists but exits before its ready file is not "no platform
+  // package for this machine": the fix is different (a broken install, a
+  // binary the OS refuses, a transient spawn failure), and the message is
+  // what a bug report quotes.
+  await withProxyEnv("#!/usr/bin/env node\nprocess.exit(1)\n", async () => {
+    const first = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((e) => e)
+    assert.equal(first?.name, "NativeUnavailable")
+    assert.match(first.message, /did not start/, `a failed start said: ${first.message}`)
+    assert.doesNotMatch(first.message, /no platform package/, `a failed start blamed the install: ${first.message}`)
+    // and during the retry pause the reason is the same one
+    const second = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((e) => e)
+    assert.match(second.message, /did not start/, `the pause said: ${second.message}`)
+  })
+  // a machine with no package at all still says exactly that: it is the one
+  // case where installing is the fix
+  const saved = process.env.CODAR_PROXY_BIN
+  process.env.CODAR_PROXY_BIN = join(tmpdir(), "codar-native-test-no-such-binary")
+  try {
+    const e = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((x) => x)
+    assert.equal(String(e?.message).replace("codar native transport unavailable: ", ""), "no platform package for this machine", `an absent build said: ${e?.message}`)
+  } finally {
+    if (saved === undefined) delete process.env.CODAR_PROXY_BIN
+    else process.env.CODAR_PROXY_BIN = saved
+    // this phase's failure left the retry pause on: closeProxy clears it, so
+    // the next test starts from a transport that has not just failed
+    await closeProxy()
+  }
 })
 
 test("a refused streamed answer read as text ends at the caller's own bound", NO_UNIX, async () => {
