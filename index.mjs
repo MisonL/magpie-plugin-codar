@@ -1089,6 +1089,20 @@ export async function CodarPlugin(input) {
         const deep = deepRefusal(r)
         if (deep && deepAlready(deep)) return alreadyAnswer(deepSecs(deep, earlySecs))
         if (deep) return deepAnswer(deep, saidCard(waitSaid) || "签到失败")
+        // The day's own word (`already_claimed` under data) is the day's
+        // statement, as the wording is: it settles the day unless a success
+        // word names this attempt first. Without this the bare code:200
+        // below recorded a claim that never landed, with credit off a
+        // balance that never grew.
+        const alreadyWordNode = (() => {
+          let node = r
+          for (let i = 0; i < 8 && node && typeof node === "object" && !Array.isArray(node); i++) {
+            if (errorCodeOf(node) === "already_claimed") return node
+            node = node.data
+          }
+          return null
+        })()
+        if (alreadyWordNode && !claimFirst) return alreadyAnswer(earlySecs)
         // 401/403 is an expired sign-in (or an account restriction), and what
         // the user sees is the fix, not a code — also read before
         // success:false: in `{code:401, success:false}` the success:false is

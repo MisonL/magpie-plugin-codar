@@ -7242,6 +7242,44 @@ test("a vendor that sends headers and then goes quiet cannot hang the generator"
   }
 })
 
+test("a scan status that refuses is not read for a stale success inside it", () => {
+  // The status reader looked only at the innermost status word: a refusal
+  // whose data still carried yesterday's {"status":"SUCCESS", token} was a
+  // finished sign-in, saved with a token the refusal never handed over.
+  const { wechatStatusOf } = testables
+  for (const [label, body] of [
+    ["a business code", { code: 500, message: "系统繁忙", data: { status: "SUCCESS", token: TOKEN } }],
+    ["success:false", { code: 200, success: false, data: { status: "SUCCESS", token: TOKEN } }],
+    ["a word code", { code: "account_restricted", message: "restricted", data: { status: "SUCCESS", token: TOKEN } }],
+    ["a wrapped code", { code: 200, data: { code: 500, data: { status: "SUCCESS", token: TOKEN } } }],
+  ]) {
+    const said = wechatStatusOf(body)
+    assert.notEqual(said.state, "done", `${label}: a refusal is no sign-in`)
+    assert.equal(said.token, undefined, `${label}: and hands over no token`)
+  }
+  // the vendor's 404 expiry is still an expiry, not a refusal
+  assert.equal(wechatStatusOf({ code: 404, message: "二维码已过期", data: { status: "pending" } }).state, "expired")
+})
+
+test("an already_claimed word in the wrapper is the day's statement, not a claim", async () => {
+  // {code:200, data:{code:"already_claimed", retry_after}} is the vendor
+  // saying today is done. Read as this attempt's claim, magpie recorded a
+  // check-in that never landed and read credit off a balance that never grew.
+  const p = await CodarPlugin()
+  const answers = (sign) => ({
+    "/v1/gettoken": { body: { code: 200, token: 10, agent_token: 0 } },
+    "/v1/daily-sign": { body: sign },
+    "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
+    "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+  })
+  const wrapped = await withFetch(answers({ code: 200, data: { code: "already_claimed", retry_after: 3600 } }), async () => p.auth.checkin(auth))
+  assert.equal(wrapped.outcome, "done", `the word is the day's statement: ${JSON.stringify(wrapped)}`)
+  assert.match(wrapped.message, /已领过/)
+  assert.ok(wrapped.until > Date.now(), "with the wait the answer stated")
+  const deep = await withFetch(answers({ code: 200, data: { data: { code: "already_claimed", retry_after: 3600 } } }), async () => p.auth.checkin(auth))
+  assert.equal(deep.outcome, "done", "and at any depth")
+})
+
 test("a refusal that says it failed is not re-read as already claimed by its wait", async () => {
   // A 400 beside a readable retry_after is the "already claimed" pair, but the
   // vendor also answers 400 with a rate limit or a risk-control notice, and
@@ -9188,6 +9226,81 @@ test("an ordinary long account name and an ordinary long model id are not creden
   const card = scrub("签到成功，模型 claude-sonnet-4-5-20250929 可用。", mkToken({ username: "u", exp: 1 }))
   assert.equal(card, "签到成功，模型 claude-sonnet-4-5-20250929 可用。", "a model id in the card's words is not cut")
   assert.equal(scrub("token codar_access_9f3d8e2a1b7c4d5e6f70a1b2 rejected", mkToken({ username: "u", exp: 1 })), "token … rejected", "a mixed secret still is")
+})
+
+test("a long id made only of letters and digits is an id, not a secret", async () => {
+  // The shape rules cut a 24+ run carrying a digit and a letter. On a card
+  // that is the right way to fail — a message loses a word — but a vendor
+  // names models exactly like this ("a1b2c3d4e5f6a7b8c9d0e1f2",
+  // "0123456789abcdefghijklmn"), and the catalog dropped the record: the whole
+  // list, when it was the only one, read as a refused read. A vendor string is
+  // judged by what can be named a credential (an sk- key, a Bearer, hex, a
+  // JWT, this account's own key); an unlabelled run of letters and digits is
+  // what an id is, so it is served.
+  const key = mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) + 600 })
+  const ids = ["a1b2c3d4e5f6a7b8c9d0e1f2", "0123456789abcdefghijklmn", "qwen2.5-72b-instruct-awq"]
+  const rows = ids.map((id) => ({ id, context_window: 1000, protocol: "openai_chat_completions" }))
+  const list = catalogOf({ code: 200, data: rows }, key)
+  assert.deepEqual(list?.map((m) => m.id), ids, "an ordinary id survives the keyed catalog")
+  const p = await CodarPlugin()
+  const models = await withFetch({ "/v1/codar/models": { body: { code: 200, data: rows } } }, async () => p.provider.models({ models: {} }, { auth: { type: "api", key } }))
+  for (const id of ids) assert.ok(Object.hasOwn(models, id), `the hook serves ${id}`)
+  const { exit, after } = await genRun({ body: { code: 200, data: [{ id: ids[0], display_name: "First", context_window: 1000 }] }, token: key })
+  assert.equal(exit, 0, "the generator writes the list")
+  assert.ok(after?.includes(ids[0]), "and the id is in the file")
+  // what can be named a credential still is: an sk- key in an id, a JWT of an
+  // earlier sign-in, the account's own token, and the card's own prose (which
+  // fails closed on purpose — a lost word there costs nothing).
+  assert.equal(catalogOf({ code: 200, data: [{ id: "sk-live-0123456789abcdefghij", context_window: 1000 }] }, key), null, "an sk- key in an id is still dropped")
+  assert.equal(catalogOf({ code: 200, data: [{ id: "codar_access_9f3d8e2a1b7c4d5e6f70a1b2", context_window: 1000 }] }, key), null, "a secret that names itself is still dropped")
+  assert.equal(catalogOf({ code: 200, data: [{ id: "9f86d081884c7d659a2feaa0c55ad015", context_window: 1000 }] }, key), null, "a bare run of hex is still dropped")
+  assert.equal(catalogOf({ code: 200, data: [{ id: mkToken({ username: "old", exp: 1 }), context_window: 1000 }] }, key), null, "another sign-in's JWT is still dropped")
+  assert.equal(catalogOf({ code: 200, data: [{ id: `model-${key.slice(5, 25)}`, context_window: 1000 }] }, key), null, "a run of our own token is still dropped")
+  assert.equal(scrub("模型 a1b2c3d4e5f6a7b8c9d0e1f2 可用", key), "模型 … 可用", "the card still fails closed")
+})
+
+test("catalog fields still reject marked credentials and JWT fragments", async () => {
+  const key = mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) + 600 })
+  const credentials = [
+    "sk-live-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+    "Bearer abcdefghijklmnopqrstuvwxyz",
+    "api_key=abcdef1234567890",
+    "codar_access_abcdefghijklmnop12345",
+    "1234567890abcdef1234567890abcdef",
+    "0x1234567890abcdef1234567890abcdef",
+    "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789.AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp",
+    "Ab3xY9QwAb3xY9QwAb3xY9QwAb3xY9QwAb3xY9QwAb3xY9Qw",
+  ]
+  for (const text of credentials) {
+    assert.equal(catalogOf({ code: 200, data: [{ id: text, context_window: 1000 }] }, key), null, "a credential is not a request id")
+    const body = { code: 200, data: [{ id: "marked-fixture", display_name: text, context_window: 1000 }, { id: "safe-fixture", display_name: "Safe Model", context_window: 1000 }] }
+    assert.equal(catalogOf(body, key)?.[0]?.name, "marked-fixture", "a credential is not a display name")
+    const { exit, after } = await genRun({ body, token: key })
+    assert.equal(exit, 0, "a droppable record leaves a usable fallback")
+    assert.ok(after && !after.includes(text), "the credential is not persisted")
+    assert.ok(after.includes("safe-fixture"), "the ordinary record is persisted")
+  }
+})
+
+test("the catalog field echo gate still detects unmarked encoded tokens", () => {
+  const key = TOKEN
+  const A = "abcdefghijklmnopqrstuvwxyz234567"
+  let bits = 0
+  let acc = 0
+  let base32 = ""
+  for (const byte of Buffer.from(key, "latin1")) {
+    acc = (acc << 8) | byte
+    bits += 8
+    while (bits >= 5) {
+      bits -= 5
+      base32 += A[(acc >> bits) & 31]
+    }
+  }
+  if (bits) base32 += A[(acc << (5 - bits)) & 31]
+  for (const text of [Buffer.from(key).toString("hex"), Buffer.from(key).toString("base64url"), base32, base32.slice(0, 90)]) {
+    assert.equal(testables.echoesIn([text], key), true, "a token encoding is still an echo")
+  }
+  assert.equal(testables.echoesIn(["0123456789abcdefghijklmn"], key), false, "an unrelated id is not an echo")
 })
 
 test("an encoded echo of the token is cut from the card, folded or not", async () => {
