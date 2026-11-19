@@ -9735,3 +9735,63 @@ test("a native transport that answers with an error does not fall back", async (
     testables.nativeFetch = null
   }
 })
+
+// The gateway tells a Codar client from another one by the request's content
+// type, not by the transport or the account: a conversation announced as
+// "application/json" is refused with 403 "client_not_supported", while the
+// same credential and the same body answer 200 when the type is the desktop's
+// own ("codar-web-v1" — read from the desktop's sidecar binary). The loader's
+// fetch is what the host sends the conversation through, so the type is
+// replaced there and the body stays what the SDK built.
+test("the loader's fetch announces the desktop's content type", async () => {
+  const p = await CodarPlugin()
+  await p.config({ provider: { codar: {} } })
+  const { fetch: send } = await p.auth.loader(async () => auth())
+  assert.equal(typeof send, "function", "the loader answers a fetch the host can use")
+
+  // The plugin's guarded fetch hands the runtime's fetch a Request, so what
+  // went out is read off that — a fetch that read an init would read none.
+  const real = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (url) => {
+    const given = url instanceof Request ? url : null
+    seen.push(given)
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } })
+  }
+  try {
+    // The host hands its SDK's init over: a JSON body with the type an OpenAI
+    // client writes. The gateway reads that type and refuses the conversation,
+    // so the type that goes out has to be the desktop's.
+    await send("https://api.claw.speedai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ model: "gpt-6.2-sol", messages: [{ role: "user", content: "hi" }] }),
+    })
+    assert.equal(seen.length, 1, "the conversation went out once")
+    assert.equal(new Headers(seen[0].headers).get("Content-Type"), "codar-web-v1", "the type the gateway reads is the desktop's")
+    // The credential the SDK wrote is still there — the refusal was never
+    // about it.
+    assert.equal(new Headers(seen[0].headers).get("Authorization"), `Bearer ${TOKEN}`)
+
+    // An Anthropic conversation writes its own type; the gateway reads that
+    // one too, so it is replaced the same way.
+    await send("https://api.claw.speedai.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-5-5", messages: [{ role: "user", content: "hi" }] }),
+    })
+    assert.equal(new Headers(seen[1].headers).get("Content-Type"), "codar-web-v1", "the Anthropic path gets the same type")
+    assert.equal(new Headers(seen[1].headers).get("anthropic-version"), "2023-06-01", "the protocol's own header is left alone")
+
+    // A type that is not JSON is a caller's own choice and stays: the rule is
+    // about the type the SDK writes, not about every type.
+    await send("https://api.claw.speedai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "text/event-stream" },
+      body: "{}",
+    })
+    assert.equal(new Headers(seen[2].headers).get("Content-Type"), "text/event-stream", "another type is the caller's own")
+  } finally {
+    globalThis.fetch = real
+  }
+})

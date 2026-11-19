@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A conversation was refused by the vendor with `403 {"detail":{"code":"client_not_supported","message":"This login credential is restricted to Codar. Use an API key for other clients."}}`. The gateway tells a Codar client from another one by the request's content type, not by the transport or the account: the same credential, body and path answer 200 when the type is the desktop's own (`codar-web-v1`, read from the desktop's sidecar binary) and 403 when it is `application/json`, which is what the OpenAI and Anthropic clients write. The account's other endpoints answer 200 with the same credential, and a freshly registered account is refused the same way, so the refusal reads the client identification rather than the account. The loader's fetch — the one the host runs its conversations through — now announces the desktop's type on the way out, for both the OpenAI and the Anthropic path; the body stays the JSON the SDK built, and a type that is not JSON is left as the caller wrote it. (issue #6, measured 2026-11-19.)
+
 ## [0.3.1] - 2026-11-19
 
 ### Fixed

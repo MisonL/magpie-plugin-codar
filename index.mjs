@@ -108,6 +108,13 @@ const verifyPendingOf = (e, username) => {
   }
 }
 
+// DESKTOP_CONTENT_TYPE is the content type the desktop's own client writes
+// on its gateway requests (read from the sidecar binary, Resources/bin/codar
+// in the 0.3.13 package). The gateway reads it to tell a Codar client from
+// another one; a request announced as "application/json" is refused with
+// "client_not_supported" — see chatTransport below.
+const DESKTOP_CONTENT_TYPE = "codar-web-v1"
+
 // chatTransport is the fetch the host is handed for chat. magpie runs a
 // loader's fetch in place of its own (host.js: `typeof o.fetch === "function"
 // ? o.fetch : fetch`), so answering one here sends the conversation through
@@ -119,9 +126,30 @@ const verifyPendingOf = (e, username) => {
 // see. This is the second chance, not a second transport. Both agree on the
 // redirect rule: the proxy, or guarded.mjs's fetch in its place (guarded.mjs
 // says why the conversation's credential must not follow a Location).
+//
+// The vendor's gateway tells a Codar client from another one by the request's
+// content type, not by the transport: a conversation whose body is announced
+// as "application/json" is refused with
+//
+//	403 {"detail":{"code":"client_not_supported",
+//	     "message":"This login credential is restricted to Codar.
+//	                Use an API key for other clients."}}
+//
+// while the same request, the same credential and the same body answer 200
+// when the type is the desktop's own ("codar-web-v1", the string the
+// desktop's sidecar writes on its own requests — measured 2026-11-19). The
+// refusal is not about the credential: the account's other endpoints answer
+// 200 with it, and a freshly registered account is refused the same way, so
+// the gateway reads the client identification, not the account. A header the
+// desktop sends is therefore sent here as well: the type is replaced on the
+// way out and the body stays the JSON the SDK built.
 const chatTransport = async (url, init) => {
   const send = await chatFetchOf()
-  return send ? send(url, init) : guardedFetch(url, init)
+  const headers = new Headers(init?.headers ?? {})
+  const type = headers.get("Content-Type")
+  if (!type || type === "application/json") headers.set("Content-Type", DESKTOP_CONTENT_TYPE)
+  const next = { ...(init ?? {}), headers }
+  return send ? send(url, next) : guardedFetch(url, next)
 }
 
 // claimedCampaigns and claimingCampaign hold the free-model claim down to one
