@@ -9259,6 +9259,28 @@ test("a long id made only of letters and digits is an id, not a secret", async (
   assert.equal(scrub("模型 a1b2c3d4e5f6a7b8c9d0e1f2 可用", key), "模型 … 可用", "the card still fails closed")
 })
 
+test("a random mixed-case run is not a model id, and an opaque lower-case one still is", async () => {
+  // Judging a catalog field by credentialish rather than by the shape pass
+  // left one shape served that the old gate dropped: a 24–39 character run
+  // with mixed case and a digit, which is how a credential's body is written
+  // ("Ab3xY9Qw…" — no vendor names a model that way). A run that reads as an
+  // id (all lower case, or words) stays served.
+  const key = mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) + 600 })
+  const row = (id, name = id) => ({ id, display_name: name, context_window: 1000, protocol: "openai_chat_completions" })
+  for (const text of ["Ab3xY9QwAb3xY9QwAb3xY9Qw", "aB3xY9QwAb3xY9QwAb3xY9QwAb3xY9Qw"]) {
+    assert.equal(catalogOf({ code: 200, data: [row(text)] }, key), null, `${text.length}: a credential-shaped run is not an id`)
+    assert.equal(catalogOf({ code: 200, data: [row("safe-model", text)] }, key)?.[0]?.name, "safe-model", "a credential-shaped run is not a display name")
+    const { exit, after } = await genRun({ body: { code: 200, data: [row(text, "Marked"), row("safe-fixture", "Safe Model")] }, token: key })
+    assert.equal(exit, 0, "a droppable record leaves a usable fallback")
+    assert.ok(after && !after.includes(text), "the credential-shaped id is not persisted")
+    assert.ok(after.includes("safe-fixture"), "the ordinary record is persisted")
+  }
+  // the shapes an id is actually written in are served: lower-case opaque
+  // ids, and camelCase words with digits between them
+  const ids = ["a1b2c3d4e5f6a7b8c9d0e1f2", "0123456789abcdefghijklmn", "DeepSeekR1DistillQwen32BInstruct", "LongCamelCaseModelIdentifierV2"]
+  assert.deepEqual(catalogOf({ code: 200, data: ids.map((id) => row(id)) }, key)?.map((m) => m.id), ids, "an id's own shapes are served")
+})
+
 test("catalog fields still reject marked credentials and JWT fragments", async () => {
   const key = mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) + 600 })
   const credentials = [

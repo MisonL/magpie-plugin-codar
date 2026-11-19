@@ -1092,6 +1092,164 @@ test("a proxy that dies is replaced, not mourned", { skip: process.platform === 
   }
 })
 
+// fakeProxyFailsOnce exits before publishing a ready file the first time it
+// is started, and answers like fakeProxy after that: one transient start
+// failure, then a working proxy.
+const fakeProxyFailsOnce = `#!/usr/bin/env node
+import { createServer } from "node:net"
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+const argv = process.argv.slice(2)
+const arg = (n) => argv[argv.indexOf(n) + 1]
+const log = process.env.FAKE_PROXY_LOG
+const started = () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\\n").filter(Boolean).length : 0)
+const first = started() === 0
+appendFileSync(log, process.pid + "\\n")
+if (first) process.exit(1)
+const transport = arg("-listen")
+const address = arg("-address")
+const ready = arg("-ready")
+if (transport === "unix") rmSync(address, { force: true })
+const server = createServer((socket) => {
+  let buf = ""
+  socket.on("error", () => {})
+  socket.on("data", (d) => {
+    buf += d.toString("latin1")
+    if (!buf.includes("\\r\\n\\r\\n")) return
+    const body = JSON.stringify({ code: 200, from: "fake" })
+    socket.end("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body)
+  })
+})
+server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+`
+
+// fakeProxyDeafTwice publishes a ready file naming a socket nobody listens on
+// for its first two starts, and answers like fakeProxy from the third: a proxy
+// that died and a replacement that did not come up, then one that would.
+const fakeProxyDeafTwice = `#!/usr/bin/env node
+import { createServer } from "node:net"
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
+const argv = process.argv.slice(2)
+const arg = (n) => argv[argv.indexOf(n) + 1]
+const log = process.env.FAKE_PROXY_LOG
+const started = () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\\n").filter(Boolean).length : 0)
+const n = started()
+appendFileSync(log, process.pid + "\\n")
+const transport = arg("-listen")
+const address = arg("-address")
+const ready = arg("-ready")
+if (n < 2) {
+  writeFileSync(ready, JSON.stringify({ transport, address: join(dirname(ready), "deaf-" + n + ".sock") }))
+  setTimeout(() => {}, 60000)
+} else {
+  if (transport === "unix") rmSync(address, { force: true })
+  const server = createServer((socket) => {
+    let buf = ""
+    socket.on("error", () => {})
+    socket.on("data", (d) => {
+      buf += d.toString("latin1")
+      if (!buf.includes("\\r\\n\\r\\n")) return
+      const body = JSON.stringify({ code: 200, from: "fake" })
+      socket.end("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body)
+    })
+  })
+  server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+}
+`
+
+// withProxyEnv runs body with this test's fake proxy named, and puts every
+// environment variable back whatever happens.
+async function withProxyEnv(files, body) {
+  const dir = mkdtempSync(join(tmpdir(), "codar-native-fake-"))
+  const saved = { bin: process.env.CODAR_PROXY_BIN, log: process.env.FAKE_PROXY_LOG, retry: process.env.CODAR_PROXY_RETRY_MS }
+  const bin = join(dir, "fake-proxy.mjs")
+  const log = join(dir, "starts.log")
+  writeFileSync(bin, files)
+  chmodSync(bin, 0o755)
+  process.env.CODAR_PROXY_BIN = bin
+  process.env.FAKE_PROXY_LOG = log
+  // the pause after a failed start, short enough for a test
+  process.env.CODAR_PROXY_RETRY_MS = "50"
+  const starts = () =>
+    existsSync(log)
+      ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => Number(line.split(" ")[0]))
+      : []
+  try {
+    await body({ starts })
+  } finally {
+    if (saved.bin === undefined) delete process.env.CODAR_PROXY_BIN
+    else process.env.CODAR_PROXY_BIN = saved.bin
+    if (saved.log === undefined) delete process.env.FAKE_PROXY_LOG
+    else process.env.FAKE_PROXY_LOG = saved.log
+    if (saved.retry === undefined) delete process.env.CODAR_PROXY_RETRY_MS
+    else process.env.CODAR_PROXY_RETRY_MS = saved.retry
+    await closeProxy()
+    for (const pid of starts()) {
+      try {
+        process.kill(pid, "SIGKILL")
+      } catch {}
+    }
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const later = (ms) => new Promise((r) => setTimeout(r, ms))
+
+test("a start that failed is tried again after a pause, not remembered for the process's life", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+  // One transient failure (a spawn error, the five-second ready deadline, a
+  // machine resuming from sleep) used to be cached as "there is no proxy" for
+  // as long as the process lived: the desktop transport never came back, and
+  // every request and chat left through Bun's TLS without saying so.
+  await withProxyEnv(fakeProxyFailsOnce, async ({ starts }) => {
+    const first = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((e) => e)
+    assert.equal(first?.name, "NativeUnavailable", `a failed start must be NativeUnavailable, not ${first}`)
+    assert.equal(starts().length, 1, "the fake proxy's failing start did not run")
+    await later(120)
+    const second = await proxyFetch("https://api.claw.speedai.com/v1/codar/models")
+    assert.equal(second.status, 200, "the request after the pause did not reach a working proxy")
+    assert.equal(starts().length, 2, "the failed start was not tried again")
+  })
+})
+
+test("a dead proxy whose replacement also refuses is retried after a pause, not latched off", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+  // After a refused socket and one refused replacement, proxyFetch set
+  // `closing = true`, and proxy() then answered null until an explicit
+  // closeProxy the host never makes: one outage kept the whole session on the
+  // plain fetch. The failure is remembered for a pause instead.
+  await withProxyEnv(fakeProxyDeafTwice, async ({ starts }) => {
+    const first = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((e) => e)
+    assert.equal(first?.name, "NativeUnavailable", `two refused sockets must be NativeUnavailable, not ${first}`)
+    assert.equal(/not listening/.test(first.message), true, `the refusal must name the dead proxy: ${first.message}`)
+    assert.equal(starts().length, 2, "the replacement was not attempted once")
+    await later(120)
+    const second = await proxyFetch("https://api.claw.speedai.com/v1/codar/models")
+    assert.equal(second.status, 200, "the request after the pause did not reach a working proxy")
+    assert.equal(starts().length, 3, "the transport stayed latched off instead of trying again")
+  })
+})
+
+test("a refused streamed answer read as text ends at the caller's own bound", NO_UNIX, async () => {
+  // A chat request streams, and a refusal's body is read with text(). The
+  // socket's deadline after a head is the stream's idle bound (five minutes),
+  // so a refusal that named a body and never sent it kept text() — and the
+  // card that quotes the vendor's sentence — pending long past the caller's
+  // own timeout.
+  const s = await listen((r, socket) => {
+    socket.on("error", () => {})
+    socket.write("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n")
+  })
+  try {
+    const ans = await request(s.path, { stream: true, timeoutMs: 300 })
+    assert.equal(ans.status, 403)
+    const out = await Promise.race([ans.text().catch((e) => e), later(2000).then(() => "still pending")])
+    assert.equal(out?.code, "no_answer", `text() outlived the caller's bound: ${out}`)
+    for (let i = 0; i < 200 && s.open > 0; i++) await later(10)
+    assert.equal(s.open, 0, "the abandoned refusal kept its socket")
+  } finally {
+    await s.close()
+  }
+})
+
 test("the proxy's files live in a directory of this process's own", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
   // The ready file tells this plugin where to send the account's credential.
   // In the shared temp directory its name was a pid (public) plus eight
