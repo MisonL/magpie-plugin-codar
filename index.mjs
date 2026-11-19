@@ -724,6 +724,19 @@ export async function CodarPlugin(input) {
         }
         // The refusal inside says what the outer layer could not: an expired
         // sign-in or an account restriction is the fix the user needs.
+        // deepAlready is the day's own statement at that depth, read the way
+        // the flat path reads it: a 400 (or 200, or no code) beside the
+        // rolling-window sentence is "already claimed", not a failure — the
+        // deep walk returned the object before its words were read.
+        const deepAlready = (inner) => {
+          const deepWords = saidBy(inner)
+          const deepCode = codeOf(inner?.code)
+          const deepWord = errorCodeOf(inner)
+          return claimedWord(deepWords) && alreadyFirst(deepWords) && !claimDenied(deepWords) && !saidNo(inner?.success) && (deepCode === 400 || deepCode === 200 || Number.isNaN(deepCode)) && (!deepWord || deepWord === "already_claimed")
+        }
+        // the wait a deep answer states, read where the daily-sign body carries
+        // it (the inner object, or the wrapper's own retry_after)
+        const deepSecs = (inner, fallbackSecs) => checkinWaitSecs(inner?.retry_after) || checkinWaitSecs(unwrapped(inner)?.retry_after) || fallbackSecs
         const deepAnswer = (inner, fallback) => {
           const innerCode = codeOf(inner?.code)
           if (innerCode === 401 || innerCode === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(errorCodeOf(inner) ?? "")) return { outcome: "failed", message: "登录已过期，请重新登录" }
@@ -883,6 +896,7 @@ export async function CodarPlugin(input) {
             const deniedFlat = saidNo(body.success) || wRefused || Boolean(wordCode && wordCode !== "already_claimed")
             const successSaid = successSaidIn(words)
             const deep = deepRefusal(body)
+            if (deep && deepAlready(deep)) return alreadyAnswer(deepSecs(deep, secs))
             if (deep) return deepAnswer(deep, (secs ? waitIn(scrub(whyOf(e), token), secs) : scrub(whyOf(e), token)) || "签到失败")
             // On the error branch a success word is this attempt's claim only
             // when the body also states a business code that can carry one:
@@ -1063,6 +1077,7 @@ export async function CodarPlugin(input) {
         // success:false}}}): the envelope says 200 and the refusal is two
         // levels in; read as a claim it settled the day at 0 points.
         const deep = deepRefusal(r)
+        if (deep && deepAlready(deep)) return alreadyAnswer(deepSecs(deep, earlySecs))
         if (deep) return deepAnswer(deep, saidCard(waitSaid) || "签到失败")
         // 401/403 is an expired sign-in (or an account restriction), and what
         // the user sees is the fix, not a code — also read before

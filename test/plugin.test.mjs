@@ -218,6 +218,24 @@ test("an oauth sign-in is the key the loader sends", async () => {
 // so the plugin serves a page on 127.0.0.1 and makes every vendor call
 // itself. These tests drive that page the way a browser would — the same
 // URLs, the same bodies — with the vendor stubbed.
+test("a captcha that failed to load can be asked for again from the tab", async () => {
+  // The page script sets capReady before the async load and never put it
+  // back, so one failed ct4.js left the SMS tab with a disabled button and
+  // no way to retry but closing the page. The code now resets the flag and
+  // re-enables the button; this pins that the script does (the browser
+  // behaviour is read off the page's own source, not run).
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const sms = await startSignIn({ sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }) })
+  try {
+    const html = await (await fetch(sms.url)).text()
+    assert.match(html, /catch \(e\) \{[\s\S]{0,300}?capReady = false/, "a failed captcha load puts the flag back")
+    assert.match(html, /请重试/, "and says the person can retry")
+    assert.match(html, /catch \(e\) \{[\s\S]{0,400}?el\("send"\)\.disabled = false/, "the button is not left disabled")
+  } finally {
+    sms.close()
+  }
+})
+
 test("the SMS page sends a code only with a solved captcha, then trades the code for a token", async () => {
   const { startSignIn } = await import("../lib/signinpage.mjs")
   const sent = []
@@ -566,6 +584,59 @@ test("an IP-check handover is used once, expires, and is cleared by another sign
   const signed = await tokenMethod.authorize({ token: other })
   assert.equal(signed.type, "success", "the pasted token signed in")
   assert.match(await titleOf(), /登录科搭 Codar/, "a token sign-in cleared the handover")
+})
+
+test("a refusal is the deepest wrapper's answer, and a balance it hides is no balance", async () => {
+  // The wrapper can carry a refusal with live-looking fields beside it: an
+  // inner 401 whose data still holds a token, an inner success:false whose
+  // data still holds yesterday's numbers. unwrapped() walks past both to the
+  // innermost object, so the gates saw only a token and a balance — the login
+  // was saved and the card drew stale points from a refused read.
+  const { login, pointsOf, agentPointsOf, claimFreeModel, unwrapped } = testables
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const good = `${b64({ alg: "HS256" })}.${b64({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 3600 })}.sig`
+  await withFetch({ "POST /v1/login": { body: { code: 200, data: { code: 401, message: "Invalid token", data: { token: good, username: "user_1" } } } } }, async () => {
+    await assert.rejects(login("user_1", "pw"), (e) => e.code === "401", "a 401 between the envelope and the fields is the refusal")
+  })
+  await withFetch({ "POST /v1/gettoken": { body: { code: 200, data: { success: false, data: { token: 999, agent_token: 2 } } } } }, async () => {
+    await assert.rejects(pointsOf(good, "user_1", {}), "a wrapped success:false hides no balance")
+  })
+  await withFetch({ "POST /v1/agent/balance": { body: { code: 200, data: { success: false, data: { balance: 77 } } } } }, async () => {
+    await assert.rejects(agentPointsOf(good, "user_1", {}), "the agent balance too")
+  })
+  await withFetch(
+    {
+      "/api/codar/activities/free-model": { body: { code: 200, data: { status: "available", activity_id: "a1", free_until: Math.floor(Date.now() / 1000) + 3600 } } },
+      "/api/codar/activities/free-model/claim": { body: { code: 200, data: { success: false, data: { message: "busy" } } } },
+    },
+    async () => {
+      assert.equal(await claimFreeModel(good, {}), null, "a claim refused between wrapper and fields is no claim")
+    },
+  )
+  // unwrapped still answers the innermost object (it is a reader, not a gate)
+  assert.deepEqual(unwrapped({ data: { code: 401, data: { token: "x" } } }), { token: "x" })
+})
+
+test("a daily-sign answer wrapped twice reads the day's own statement, as the flat one does", async () => {
+  // `{code:400, retry_after}` beside "24小时内仅可领取一次" is the day already
+  // claimed, and the flat shape answers `done`. Two `data` levels in, the
+  // deep-refusal walk returned the inner object before the wording was read,
+  // so the same sentence was reported as a failed check-in.
+  const p = await CodarPlugin()
+  const until = Math.floor(Date.now() / 1000) + 3600
+  const sign = { code: 200, data: { data: { code: 400, message: "24小时内仅可领取一次", retry_after: 3600 } } }
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 100, agent_token: 0 } },
+      "/v1/daily-sign": { body: sign },
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(u.outcome, "done", `the wrapped day's statement is the same statement: ${JSON.stringify(u)}`)
+  assert.match(u.message, /已领过/)
+  assert.ok(u.until > until - 60_000, "with the wait the vendor stated")
 })
 
 test("a wrapped refusal is a refusal, and a token the plugin cannot keep is not saved", async () => {
