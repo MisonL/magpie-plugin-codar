@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-20
+
 ### Changed
 
-- The embedded fallback catalog had drifted from the vendor's list: it was missing `deepseek-v4.1-flash-economy`, `gemini-4-argon`, `gemini-4-argon-official`, `gpt-6.2-astra` and `gpt-6.2-sol`, and carried older context windows, modalities and credit rates for nine more (`gpt-6.1-sol` had 128000 context where the vendor states 1050000, `gpt-5.6-sol` had 128000 with no reply ceiling where the vendor states 1050000 and 128000). Regenerated from `GET /v1/codar/models` (20 models) with `node scripts/catalog.mjs`, whose records are the plugin's own `catalogOf` rules. The file is only the fallback — a signed-in magpie refreshes the live list every start — but an offline start used to show five models the account has and understate the rest.
+- The embedded fallback catalog had drifted from the vendor's list: it was missing `deepseek-v4.1-flash-economy`, `gemini-4-argon`, `gemini-4-argon-official`, `gpt-6.2-astra` and `gpt-6.2-sol`, and carried older context windows, modalities and credit rates for twelve more (`gpt-6.1-sol` had 128000 context where the vendor states 1050000, `gpt-5.6-sol` had 128000 with no reply ceiling where the vendor states 1050000 and 128000). Regenerated from `GET /v1/codar/models` (20 models) with `node scripts/catalog.mjs`, whose records are the plugin's own `catalogOf` rules. The file is only the fallback — a signed-in magpie refreshes the live list every start — but an offline start used to show five models the account has and understate the rest.
 
 ### Fixed
 
+- The Go proxy sent `Host: <vendor host>:443` on every request to the vendor. Its target URL was built with the port spelled out, and net/http writes a Host header from the URL as it is. The desktop sidecar joins a path onto a bare `https://<host>` base, so its Host carries the name alone, and no official request has `:443` there; the proxy now builds the same shape. Captured on both sides of the wire (the 0.3.17 sidecar and this proxy against the same server): everything else — the TLS ClientHello, HTTP version, User-Agent, Authorization and Content-Type — already matched.
 - A proxy build that existed but did not come up (a spawn the OS refused, an exit before the ready file, the five-second deadline, no private temp directory) was reported as `no platform package for this machine`, and during the new retry pause as nothing at all: the sentence sent a person reinstalling a package they already had. A failed start now says which failure it was, while an absent build still says it is absent.
+- A refusal nested five `data` wrappers deep was read as a claim: the check-in's deep walk stopped one node short of where `unwrapped` reads, so `{code:200, message:"签到成功", data:{data:{data:{data:{data:{code:500}}}}}}` settled the day at 0 points, and a free-model answer with a refusal that deep was read as `available` and claimed. Both walks now go as deep as the other readers do (eight nodes), so a wrapped refusal is reported as one and no claim is written against it; the failed card line is the refusal's own words or `签到失败`, never the outer success wording it was wrapped in.
+- A `403 {"detail":{"code":"client_not_supported"}}` — the vendor refusing a login credential that is meant for its own client — reached the usage card as `登录已过期，请重新登录` and would mark the account signed out, so magpie asked for a sign-in that cannot fix it. The card, the check-in line and both balance reads now name the refusal (`client_not_supported`) and say to use a vendor-supported API key or contact Codar support, without marking the account expired; the plugin does not impersonate the vendor's client. The refusal is read anywhere in the wrapper chain, not only on the envelope: a success word outside with the gate under `data` settled the day as a claim, and a numeric 403 beside the gate sentence was reported as an expiry — re-login cannot fix a client gate. A word code spelled in upper case (`CLIENT_NOT_SUPPORTED`) is the same word.
+- A vendor field of several megabytes stalled or crashed a hook: the key-shape scans (`echoesKey`, `credentialish`, the split walk) ran global regexes over the whole string, and an 8 MB field threw `RangeError: Maximum call stack size exceeded` out of the activities read, while a 4–8 MB field of newlines took two to four seconds in the host every plugin shares. They now read the prefix a card could show, as the cleaners already do; a contiguous copy is still cut from the whole string, and the split walk, which was capped already, no longer pays its regexes over bytes it never read. A string longer than that cap also stopped reading as credential-shaped: `shapeOnly` compared a truncated scrub against the whole field, so any 8 KB+ name of plain letters looked like a secret.
+- The desktop transport's byte body was written from the caller's buffer a turn after the call: a caller that reused its `Uint8Array` right after calling changed the bytes on the wire, where fetch snapshots a body at call time. The bytes are copied when the request is made — and, through the proxy entry points, before the first `await`, since starting the proxy could take seconds and the copy used to happen only after it came up.
+- The folded-key cut (`strippedHas`) ran two global replacements over the whole vendor string before answering: with a JWT-shaped key and a body of letter/newline pairs, a 4 MB field took over a second inside a hook, like the other shape scans that were already capped. It now reads the same card-sized prefix with the folded-key margin, a hundred milliseconds instead of a second.
+- An answer that states both `account_restricted` and the client-gate sentence answered `client_not_supported` on the check-in, while the balance reads answered `account_restricted`: one hook's order, not two. The restriction's word now speaks first everywhere — its fix is the vendor's support.
 
 ## [0.3.1] - 2026-11-19
 
@@ -1137,7 +1146,9 @@ Initial release.
 - A test suite (187 tests) on Node 18–24 and Bun across Linux, macOS and
   Windows, including a formatting test that pins `.editorconfig`.
 
-[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.2
+[0.3.1]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.1
 [0.3.0]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.2.4
 [0.2.3]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.2.3

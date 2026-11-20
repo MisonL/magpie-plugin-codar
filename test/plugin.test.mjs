@@ -8,13 +8,14 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { homedir, tmpdir } from "node:os"
 import { join, sep } from "node:path"
 import { request as httpRequest } from "node:http"
+import net from "node:net"
 
 import { CodarPlugin } from "../index.mjs"
 import { testables } from "../lib/internal.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../lib/catalog.mjs"
 
-const { codeOf, tokenOf, usernameOf, expiresAt, expired, modelOf, modelsOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, errorCodeOf, restricted, retryAfterOf, signStateOf, signedIn, runningActivities, freeModelOf, scrubLine, scrubShapes, cutKey, echoesKey, windowsOf, WINDOWS_OF, decodedCarriesKey, cutProjected, flatten, encodedRun, splitAcross, signMessage, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, baseURL, ALREADY_CLAIMED, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, unusableKey, login, refreshToken, LOGIN_PATH, REFRESH_PATH } = testables
+const { codeOf, tokenOf, usernameOf, expiresAt, expired, modelOf, modelsOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, errorCodeOf, restricted, retryAfterOf, signStateOf, signedIn, runningActivities, freeModelOf, scrubLine, scrubShapes, cutKey, echoesKey, echoesIn, windowsOf, WINDOWS_OF, decodedCarriesKey, cutProjected, flatten, encodedRun, splitAcross, signMessage, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, baseURL, ALREADY_CLAIMED, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, unusableKey, login, refreshToken, LOGIN_PATH, REFRESH_PATH } = testables
 // Nothing in this file may reach the Go proxy: several tests stub
 // globalThis.fetch directly rather than through withFetch, and on a machine
 // with a built native/bin the proxy would answer them instead — the stubs
@@ -163,6 +164,19 @@ test("a password sign-in that wants an SMS check names the way that works", asyn
   )
   assert.equal(wrong.type, "failed")
   assert.equal(wrong.error, "用户名或密码错误")
+
+  // A refusal that is not the IP check can still hand over a token and quote
+  // it in the vendor's sentence; the card is the host's to draw, so the token
+  // never reaches it — the shape rules cut an opaque run, a JWT and a
+  // named-credential spelling alike.
+  for (const temp of ["q7z9x2v5b8n1m4k3j6h0g9f8d7s6a7b8c9d0", mkToken({ username: "user_2", exp: 1 }).slice(0, 40)]) {
+    const quoted = await withFetch(
+      { "POST /v1/login": { status: 403, body: { code: 403, message: `凭证 token=${temp} 不可用`, token: temp } } },
+      async () => p.auth.methods.find((x) => x.label === "科搭账号密码登录").authorize({ username: "user_2", password: "s3cret-pass" }),
+    )
+    assert.equal(quoted.type, "failed")
+    assert.ok(!quoted.error.includes(temp), "the temp token is not in what the card shows")
+  }
 })
 
 test("a renewal keeps the sign-in ahead of its exp, and a refused one marks it expired", async () => {
@@ -559,6 +573,141 @@ test("the page module is lib/signinpage.mjs and the plugin imports it from there
   const p = await CodarPlugin()
   const page = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
   assert.equal(typeof page.authorize, "function", "the method the page serves is loaded from lib/signinpage.mjs")
+})
+
+test("a malformed request target answers 400 instead of taking the process down", async () => {
+  // The listener parsed req.url with the URL constructor outside any try: a
+  // request line whose target the parser refuses (an absolute URL with a
+  // broken authority) threw out of the async listener, and nothing handled
+  // that rejection — Node and Bun both ended the whole process on it, which
+  // any local process could trigger while the page was open.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const sms = await startSignIn({ sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }) })
+  try {
+    const port = new URL(sms.url).port
+    const answer = await new Promise((resolve, reject) => {
+      const socket = net.connect(Number(port), "127.0.0.1", () => {
+        socket.write(`GET http://[ HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+      })
+      let text = ""
+      socket.on("data", (d) => (text += d))
+      socket.on("end", () => resolve(text))
+      socket.on("error", reject)
+      // A listener that throws instead of answering leaves the socket open;
+      // the test must end anyway and say what it got.
+      socket.setTimeout(2000, () => {
+        socket.destroy()
+        resolve(text)
+      })
+    })
+    assert.match(answer, /^HTTP\/1\.1 400/, "the malformed target is answered, not thrown")
+    // The listener is still serving: the page itself loads afterwards.
+    assert.match(await (await fetch(sms.url)).text(), /科搭/, "the page survives a malformed request")
+  } finally {
+    sms.close()
+  }
+})
+
+test("the client gate is read from the vendor's own sentence, not only from the code word", async () => {
+  // The gateway's answers are not required to carry `client_not_supported` in
+  // a field the plugin reads: a rewritten body can say it only in the
+  // sentence. Read as a claim that is a false check-in; read as an expiry it
+  // is a sign-in prompt that cannot help.
+  const p = await CodarPlugin()
+  const sentence = "This login credential is restricted to Codar. Use an API key for other clients."
+  const shapes = [
+    { code: 200, message: sentence },
+    { success: true, message: sentence },
+    { code: 403, message: sentence },
+  ]
+  for (const [i, body] of shapes.entries()) {
+    const r = await withFetch(
+      { "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } }, "/v1/daily-sign": { body, status: i === 2 ? 403 : 200 } },
+      async () => p.auth.checkin(auth),
+    )
+    assert.equal(r.outcome, "failed", `shape ${i}: the sentence is a refusal`)
+    assert.match(r.message, /client_not_supported/, `shape ${i}: and says which refusal it was`)
+    assert.doesNotMatch(r.message, /登录已过期/, `shape ${i}: not an expiry`)
+  }
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: { detail: { message: sentence } }, status: 403 },
+      "/v1/agent/balance": { body: { detail: { message: sentence } }, status: 403 },
+      "/v1/daily-sign/status": { body: { code: 200, data: {} } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.error ?? "", /client_not_supported/)
+  assert.equal(u.signIn, "", "the sentence alone still must not mark the account signed out")
+})
+
+test("a gate under `data`, or spelled in another case, is still the gate", async () => {
+  // The gateway's rewrite is not required to put the refusal on the envelope:
+  // a success word outside and the gate inside is still a gate (read as a
+  // claim it settled a day that never landed), a numeric 403 beside the gate
+  // sentence is the gate and not an expiry (re-login cannot fix it), and a
+  // word code spelled in upper case is the same word.
+  const p = await CodarPlugin()
+  const sentence = "This login credential is restricted to Codar. Use an API key for other clients."
+  const shapes = [
+    { body: { code: 200, message: "签到成功", data: { code: 200, message: "client_not_supported" } }, status: 200 },
+    { body: { code: 200, message: "签到成功", data: { code: 403, message: sentence } }, status: 200 },
+    { body: { code: "CLIENT_NOT_SUPPORTED", message: "nope" }, status: 200 },
+  ]
+  for (const [i, { body, status }] of shapes.entries()) {
+    const r = await withFetch(
+      { "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } }, "/v1/daily-sign": { body, status } },
+      async (calls) => {
+        const out = await p.auth.checkin(auth)
+        assert.ok(!calls.some((c) => String(c.url).includes("/api/codar/activities/free-model")), `shape ${i}: a gate claims no free model`)
+        return out
+      },
+    )
+    assert.equal(r.outcome, "failed", `shape ${i}: the gate is not a claim`)
+    assert.match(r.message, /client_not_supported/, `shape ${i}: and says which refusal it was`)
+    assert.doesNotMatch(r.message, /登录已过期|签到成功/, `shape ${i}: not an expiry, and not a claim`)
+  }
+  // Both refusals stated at once: the account restriction's word code keeps
+  // its meaning (the fix is the vendor's support), on every hook — the two
+  // balance readers already read it first.
+  const both = { code: "account_restricted", message: sentence }
+  for (const [i, status] of [200, 403].entries()) {
+    const r = await withFetch(
+      { "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } }, "/v1/daily-sign": { body: both, status } },
+      async () => p.auth.checkin(auth),
+    )
+    assert.match(r.message, /account_restricted/, `shape ${i}: the restriction's own word`)
+    assert.doesNotMatch(r.message, /client_not_supported/, `shape ${i}: not the client gate`)
+  }
+  const u2 = await withFetch(
+    {
+      "/v1/gettoken": { body: both, status: 403 },
+      "/v1/daily-sign/status": { body: { code: 200, data: {} } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u2.error ?? "", /account_restricted/, "the balance read keeps the same order")
+  // The usage card reads the same answers: a gate one wrapper deeper than
+  // `data`, on an HTTP 403 and on a 200 beside it, is the whole card's answer.
+  const usageShapes = [
+    { "/v1/agent/balance": { body: { code: 200, data: { code: 200, message: "ok", data: { message: sentence } } }, status: 403 } },
+    { "/v1/agent/balance": { body: { code: 200, data: { code: 200, message: "ok", data: { message: sentence } } }, status: 200 } },
+  ]
+  for (const balance of usageShapes) {
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } },
+        "/v1/daily-sign/status": { body: { code: 200, data: {} } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+        ...balance,
+      },
+      async () => p.auth.usage(auth),
+    )
+    assert.match(u.error ?? "", /client_not_supported/, `${balance["/v1/agent/balance"].status}: the nested sentence is the gate`)
+    assert.equal(u.signIn, "", "the gate is not marked as an expired sign-in")
+  }
 })
 
 test("a password sign-in the IP check stopped is finished through verify_ip, not a second password", async () => {
@@ -1669,6 +1818,13 @@ test("a campaign read a level in refused is not claimed", async () => {
   const refusals = [
     { code: 200, data: { success: false, data: { status: "available", activity_id: 11 } } },
     { code: 200, data: { data: { code: "already_claimed" }, status: "available", activity_id: 11 } },
+    // One hop past the four the loop used to read: the refusal node still
+    // carries the campaign's fields, so a short walk handed them back as an
+    // available campaign and the claim write went out anyway.
+    { code: 200, data: { code: 200, data: { code: 200, data: { code: 200, data: { code: 500, status: "available", activity_id: 11 } } } } },
+    // The deepest node unwrapped() hands back: eight `data` wrappers. Every
+    // reader stops at the same node, so a refusal there is a refusal too.
+    { code: 200, data: { data: { data: { data: { data: { data: { data: { data: { code: 500, status: "available", activity_id: 11 } } } } } } } } },
   ]
   for (const [i, got] of refusals.entries()) {
     const token = mkToken({ username: `user_campaign_${i}`, exp: Math.floor(Date.now() / 1000) + 86400 })
@@ -4918,22 +5074,23 @@ const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFet
 }
 
 test("the generator drops a record carrying another provider's credential", async () => {
-  // The generator's own cut reads shapes twice: keyed (echoesIn with the
-  // current token) and, in an earlier draft, keylessly through
-  // shapeOnly(…, "") — which is false whatever the string is, because that
-  // helper only reads shapes for a caller that knows its key. The keyed read
-  // is what drops the record below; this pins that an sk- key in a display
-  // name never reaches the committed file while the readable record stays.
+  // The generator's own cut asks echoesIn with the current token over the
+  // file's reading of a string and the string as read: another provider's key
+  // in a display name never reaches the committed catalog, while an ordinary
+  // record beside it is kept — and an unlabelled run of letters and digits is
+  // an id (catalogOf's own rule), not a secret, so the generator keeps it too.
   const body = {
     code: 200,
     data: [
       { id: "synthetic-model", display_name: "sk-live-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", context_window: 1000 },
+      { id: "q7z9x2v5b8n1m4k3j6h0g9f8d7s6a7b8c9d0", display_name: "Marked", context_window: 1000 },
       { id: "safe-model", display_name: "Safe Model", context_window: 1000 },
     ],
   }
   const { exit, after } = await genRun({ body })
   assert.equal(exit, 0, "a droppable record does not fail the run")
   assert.ok(after && !after.includes("sk-live"), "another provider's key is not written")
+  assert.ok(after.includes("q7z9x2v5"), "an unlabelled run of letters and digits is an id, not a secret")
   assert.ok(after.includes("safe-model"), "the readable record is kept")
 })
 
@@ -6257,6 +6414,31 @@ test("a multi-megabyte vendor sentence does not throw or stall the cleaners", ()
     assert.ok(clean.length <= 120, `${label}: cleanText is still a card line`)
     assert.ok(ms < 500, `${label}: ${MAX_ANSWER_BYTES} bytes took ${ms.toFixed(0)} ms`)
   }
+  // The key's shape scans run the same global regexes (stripLog's class
+  // replace, credentialish's run match): a multi-megabyte vendor id that
+  // reaches an activity or a model name stalled a hook for seconds. They read
+  // a card-sized prefix too; a contiguous copy is still cut from the whole
+  // string by cutKey.
+  const huge = { "one long word": "a".repeat(MAX_ANSWER_BYTES), "newlines": "a\n".repeat(MAX_ANSWER_BYTES / 2) }
+  for (const [label, text] of Object.entries(huge)) {
+    const t = process.hrtime.bigint()
+    const echoed = echoesKey(text, TOKEN)
+    const listed = echoesIn([text], TOKEN)
+    const ms = Number(process.hrtime.bigint() - t) / 1e6
+    assert.equal(echoed, false, `${label}: a field without the key's runs is not a hit`)
+    assert.equal(listed, false, `${label}: and neither is the list's answer`)
+    assert.ok(ms < 500, `${label}: the key scan took ${ms.toFixed(0)} ms`)
+  }
+  // The fold cut asks the same question of the whole string (strippedHas):
+  // with a JWT-shaped key and a body of letter/newline pairs, the two global
+  // replacements over 4 MB took over a second inside a hook.
+  const foldedKey = "eyJ" + "a".repeat(140)
+  const foldText = "e" + "a\n".repeat(MAX_ANSWER_BYTES / 2)
+  const ft = process.hrtime.bigint()
+  const folded = scrubLine(foldText, foldedKey)
+  const fms = Number(process.hrtime.bigint() - ft) / 1e6
+  assert.ok(folded.length <= MAX_SCRUB_CHARS, "the fold cut still answers a card line")
+  assert.ok(fms < 500, `the folded-key cut took ${fms.toFixed(0)} ms`)
 })
 
 test("the generator refuses a vendor answer past the plugin's own cap", async () => {
@@ -6996,7 +7178,7 @@ test("the gate quotes every character cmd.exe acts on", async () => {
   assert.equal(quoteArg("C:\\Temp&x", false), "C:\\Temp&x", "POSIX passes arguments untouched")
 })
 
-test("a missing Bun is a skip, and --require-bun makes it exit 2", { skip: process.platform === "win32" || Boolean(process.env.CODAR_TARBALL_GATE), timeout: 120000 }, async () => {
+test("a missing Bun is a skip, and --require-bun makes it exit 2", { skip: process.platform === "win32" || Boolean(process.env.CODAR_TARBALL_GATE), timeout: 240000 }, async () => {
   // Two different answers: a machine without Bun simply skips that half, and a
   // release run that requires Bun has not run the check at all — 2 ("could not
   // run here"), not 1 ("the packed suite failed"). The old code answered 1 for
@@ -8970,6 +9152,10 @@ test("a refusal one wrapper deeper, or spelled as a code word, is not a claim", 
   const p = await CodarPlugin()
   const cases = [
     [{ code: 200, data: { data: { code: 500, success: false, message: "签到失败" } } }, "a refusal two levels in"],
+    // The refusal sits one hop past the four `data` wrappers deepRefusal reads:
+    // the outer layers repeat the success wording, so a walk that stops early
+    // settles the day at 0 points.
+    [{ code: 200, message: "签到成功", data: { data: { data: { data: { data: { code: 500 } } } } } }, "a refusal five levels in"],
     [{ code: "invalid_token", message: "Success" }, "a business code in words"],
     [{ code: 400, message: "Already signed successfully today? No, not yet", data: { retry_after: 3600 } }, "a success word denied by the next sentence"],
   ]
@@ -8977,6 +9163,62 @@ test("a refusal one wrapper deeper, or spelled as a code word, is not a claim", 
     const r = await withFetch({ "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } }, "/v1/daily-sign": { body } }, async () => p.auth.checkin(auth))
     assert.equal(r.outcome, "failed", label)
   }
+  // The deep node carries no sentence of its own; the card's fallback must
+  // not be the outer layer's success wording — a failure line that reads
+  // "签到成功" says the opposite of what happened.
+  const r = await withFetch(
+    { "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } }, "/v1/daily-sign": { body: { code: 200, message: "签到成功", data: { data: { data: { data: { data: { code: 500 } } } } } } } },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.message, "签到失败")
+})
+
+test("a login credential the vendor restricts to its own client is not a sign-in problem", async () => {
+  const p = await CodarPlugin()
+  const gated = { detail: { code: "client_not_supported", message: "This login credential is restricted to Codar. Use an API key for other clients." } }
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { body: gated, status: 403 },
+      "/v1/agent/balance": { body: gated, status: 403 },
+      "/v1/daily-sign/status": { body: gated, status: 403 },
+      "/api/codar/activities/mine": { body: gated, status: 403 },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.error ?? "", /client_not_supported/)
+  // Re-login is not the fix, so the account must not be marked signed out.
+  assert.equal(u.signIn, "")
+})
+
+test("a check-in the vendor restricts to its client says which refusal it was", async () => {
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } },
+      "/v1/daily-sign": { body: { code: "client_not_supported", message: "This login credential is restricted to Codar. Use an API key for other clients." } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "failed")
+  assert.match(r.message, /client_not_supported/)
+  assert.doesNotMatch(r.message, /登录已过期/)
+})
+
+test("a check-in refused by the client gate at the HTTP layer is not read as an expiry", async () => {
+  // The gateway's 403 gates arrive as non-2xx answers, so request() throws
+  // before any body gate runs; the code it carries is the only sign the
+  // refusal is the client gate rather than a dead token.
+  const p = await CodarPlugin()
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { body: { code: 200, token: 9, agent_token: 0 } },
+      "/v1/daily-sign": { status: 403, body: { detail: { code: "client_not_supported", message: "This login credential is restricted to Codar. Use an API key for other clients." } } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(r.outcome, "failed")
+  assert.match(r.message, /client_not_supported/)
+  assert.doesNotMatch(r.message, /登录已过期/)
 })
 
 test("the status row reads the first wait that can be stated", async () => {

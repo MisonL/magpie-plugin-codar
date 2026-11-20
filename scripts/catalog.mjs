@@ -384,7 +384,7 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
   const nameCut = (r) => r.name !== "…" && cutOf(r.name)
   function cutOf(said) {
     const text = String(said ?? "")
-    return rules.echoesIn([asRead(text), text], sent) || rules.shapeOnly(asRead(text), "")
+    return rules.echoesIn([asRead(text), text], sent)
   }
   const kept = made.filter((r) => !idCut(r) && !nameCut(r))
   // the pieces read both in file order and in the order the vendor wrote

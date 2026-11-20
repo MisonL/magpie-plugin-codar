@@ -139,6 +139,89 @@ test("a byte view leaves as its own bytes, whatever kind of view it is", NO_UNIX
   }
 })
 
+// fakeProxyEcho writes the body it received to FAKE_PROXY_LOG, one hex line
+// per request, so a test can see the bytes that reached the wire.
+const fakeProxyEcho = `#!/usr/bin/env node
+import { createServer } from "node:net"
+import { appendFileSync, rmSync, writeFileSync } from "node:fs"
+const argv = process.argv.slice(2)
+const arg = (n) => argv[argv.indexOf(n) + 1]
+const transport = arg("-listen")
+const address = arg("-address")
+const ready = arg("-ready")
+if (transport === "unix") rmSync(address, { force: true })
+const server = createServer((socket) => {
+  let buf = Buffer.alloc(0)
+  socket.on("error", () => {})
+  socket.on("data", (d) => {
+    buf = Buffer.concat([buf, d])
+    const end = buf.indexOf("\\r\\n\\r\\n")
+    if (end < 0) return
+    const head = buf.subarray(0, end).toString("latin1")
+    const length = Number(/content-length: *(\\d+)/i.exec(head)?.[1] ?? 0)
+    const rest = buf.subarray(end + 4)
+    if (rest.length < length) return
+    appendFileSync(process.env.FAKE_PROXY_LOG, rest.subarray(0, length).toString("hex") + "\\n")
+    socket.end("HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\n{}")
+  })
+})
+server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+`
+
+test("a byte body is snapshotted at the call, though the proxy starts first", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+  // fetch takes a body's bytes when it is called. The proxy transport copies
+  // them — but only once the proxy is up, and starting it is an await. A
+  // caller that reuses its buffer right after the call changed the request
+  // while the proxy was starting; the copy has to happen at the call itself.
+  const dir = mkdtempSync(join(tmpdir(), "codar-native-snap-"))
+  const bin = join(dir, "fake-proxy.mjs")
+  const log = join(dir, "body.log")
+  writeFileSync(bin, fakeProxyEcho)
+  chmodSync(bin, 0o755)
+  const saved = { bin: process.env.CODAR_PROXY_BIN, log: process.env.FAKE_PROXY_LOG }
+  process.env.CODAR_PROXY_BIN = bin
+  process.env.FAKE_PROXY_LOG = log
+  try {
+    // a fresh start, so this run's proxy is the one that logs
+    await closeProxy()
+    const bytes = new Uint8Array([0x01, 0x02, 0x03])
+    const pending = proxyFetch("https://api.claw.speedai.com/v1/codar/models", { method: "POST", body: bytes })
+    bytes.fill(0xff)
+    const ans = await pending
+    assert.equal(ans.status, 200)
+    assert.equal(readFileSync(log, "utf8").trim(), "010203", "the bytes at the call are the bytes sent")
+  } finally {
+    if (saved.bin === undefined) delete process.env.CODAR_PROXY_BIN
+    else process.env.CODAR_PROXY_BIN = saved.bin
+    if (saved.log === undefined) delete process.env.FAKE_PROXY_LOG
+    else process.env.FAKE_PROXY_LOG = saved.log
+    await closeProxy()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a byte body is snapshotted when the request is made, as fetch takes one", NO_UNIX, async () => {
+  // The socket writes the body when it connects, one turn later. A body that
+  // is a view of the caller's buffer was read at that write, so a caller
+  // reusing its buffer right after the call changed the bytes on the wire.
+  // fetch takes the byte-sequence snapshot at call time; so does this.
+  let body
+  const s = await listen((r, socket) => {
+    body = Buffer.from(r.body)
+    socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+  })
+  try {
+    const bytes = new Uint8Array([0x01, 0x02, 0x03])
+    const pending = request(s.path, { method: "POST", body: bytes })
+    bytes.fill(0xff)
+    const ans = await pending
+    assert.equal(ans.status, 200)
+    assert.equal(body.toString("hex"), "010203", "the bytes at the call are the bytes sent")
+  } finally {
+    await s.close()
+  }
+})
+
 test("a TCP-mode request carries the token and nothing the vendor would see", async () => {
   let head = ""
   const server = createServer((socket) => {

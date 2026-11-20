@@ -29,7 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
@@ -57,6 +57,12 @@ const signInFailure = (e) => {
   if (said) return said
   return whyOf(e) || "登录失败"
 }
+
+// gatedError reads a thrown refusal as the client gate: the word code or the
+// sentence the error carries, or — where request() kept only the envelope's
+// words — the body's own wrapper chain, which may hold the gate one level
+// deeper than saidBy reads.
+const gatedError = (e) => clientGated(e?.code, e?.message) || gateWithin(e?.body)
 
 // verifyPending remembers a sign-in the vendor's IP check stopped, so the
 // sign-in page can finish that check instead of starting a fresh login: the temp
@@ -715,11 +721,13 @@ export async function CodarPlugin(input) {
         // {code:200, data:{data:{success:false}}}. A gateway wraps the
         // vendor's refusal and the outer layer repeats the success wording;
         // read off the outer words and code alone, the day settled at 0
-        // points. The wrappers are read three levels deep, as the 2xx path
-        // reads them, on every path.
+        // points. It walks the same `data` wrappers refusalWithin and
+        // unwrapped read — the root itself is judged by the envelope checks
+        // before this walk — and stops at the deepest node unwrapped() would
+        // hand back.
         const deepRefusal = (body) => {
           let deep = body && typeof body === "object" && !Array.isArray(body) ? body : null
-          for (let i = 0; i < 4 && deep; i++) {
+          for (let i = 0; i < 8 && deep; i++) {
             const inner = deep.data && typeof deep.data === "object" && !Array.isArray(deep.data) ? deep.data : null
             if (!inner) return null
             const innerCode = codeOf(inner.code)
@@ -751,9 +759,14 @@ export async function CodarPlugin(input) {
           const innerCode = codeOf(inner?.code)
           if (innerCode === 401 || innerCode === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(errorCodeOf(inner) ?? "")) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (errorCodeOf(inner) === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
-          // the refusal's own words, not the outer layer's success sentence
+          if (clientGated(errorCodeOf(inner), inner?.message)) return { outcome: "failed", message: CLIENT_GATED }
+          // the refusal's own words, not the outer layer's success sentence —
+          // and when the deep node has none, a fallback that itself reads as
+          // this attempt's success is no fallback: a failure line that says
+          // "签到成功" tells the user the day landed
           const saidInner = typeof inner?.message === "string" ? scrub(inner.message, token) : ""
-          return { outcome: "failed", message: saidInner || fallback }
+          const sane = typeof fallback === "string" && !successSaidIn(fallback) ? fallback : ""
+          return { outcome: "failed", message: saidInner || sane || "签到失败" }
         }
         // A success word the sentence then denies ("…successful? No, not
         // yet") is no claim: the bare code:200 beside it used to settle the
@@ -858,6 +871,10 @@ export async function CodarPlugin(input) {
           // vendor, only the latter means signing in again. Recognize the
           // vendor's account_restricted first, then the re-login case.
           if (restricted(e)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          // a word in the body, even beside the client gate's sentence: the
+          // restriction is the account's answer, as the balance reads have it
+          if (restrictedWithin(e?.body)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          if (gatedError(e)) return { outcome: "failed", message: CLIENT_GATED }
           if (signedOut(e)) return { outcome: "failed", message: "登录已过期，请重新登录" }
           // HTTP 400 can also mean "already claimed today": request() throws
           // on non-2xx first, and without handling this step a 400 with an
@@ -884,6 +901,11 @@ export async function CodarPlugin(input) {
             const deepBody = unwrapped(body)
             const secs = checkinWaitSecs(body.data?.retry_after) || checkinWaitSecs(deepBody?.retry_after) || checkinWaitSecs(body.retry_after) || checkinWaitSecs(e.retryAfter)
             const words = dayStatement(saidBy(body), saidBy(deepBody))
+            // The vendor's sentence can be the whole refusal: a rewritten
+            // body that keeps a 200 beside it is still the client gate, and
+            // read as an ordinary failure it hid the fix (an API key or
+            // support, not a re-login).
+            if (gateWithin(body)) return { outcome: "failed", message: CLIENT_GATED }
             const bc = codeOf(body.code)
             // The same success-first rule as the 2xx path below: an error body
             // whose success word comes first is this attempt's claim with the
@@ -919,6 +941,7 @@ export async function CodarPlugin(input) {
             const claimFirst = successSaid && !alreadyFirst(words) && (bc === 200 || bc === 400)
             if (bc === 401 || bc === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(wordCode)) return { outcome: "failed", message: "登录已过期，请重新登录" }
             if (wordCode === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+            if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
             // The 400-beside-a-wait pair: the vendor's "already claimed" in its
             // usual shape. A failure word still vetoes it (risk control and
             // rate limits answer 400 with seconds too), and so does a success
@@ -987,6 +1010,13 @@ export async function CodarPlugin(input) {
         const deepWords = saidBy(unwrapped(r))
         const words = dayStatement(saidBy(r), deepWords)
         const said = scrub(words, token)
+        // The sentence alone can be the entire refusal (a rewritten body with
+        // a 200 still beside it): the success word it must not override is a
+        // claim, this is the vendor saying the credential is not for this
+        // client at all. The restriction's own word outranks it, as in the
+        // balance reads.
+        if (restrictedWithin(r)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+        if (gateWithin(r)) return { outcome: "failed", message: CLIENT_GATED }
         // The vendor wraps a refusal in `data` on every other reader (points,
         // the status row, activities, the catalog): {code:200, data:{code:500}}
         // or {code:200, data:{success:false}} is HTTP yes, business no. The
@@ -1081,6 +1111,7 @@ export async function CodarPlugin(input) {
         if (wordCode && wordCode !== "already_claimed") {
           if (/^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(wordCode) || code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (wordCode === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
           return { outcome: "failed", message: saidCard(waitSaid) || "签到失败" }
         }
         // A refusal one wrapper deeper than `data` ({data:{data:{code:500,
@@ -1096,7 +1127,9 @@ export async function CodarPlugin(input) {
         // balance that never grew.
         const alreadyWordNode = (() => {
           let node = r
-          for (let i = 0; i < 8 && node && typeof node === "object" && !Array.isArray(node); i++) {
+          // the root and the eight `data` wrappers unwrapped() walks: the same
+          // nodes refusalWithin reads, so the two cannot disagree on a body
+          for (let i = 0; i < 9 && node && typeof node === "object" && !Array.isArray(node); i++) {
             if (errorCodeOf(node) === "already_claimed") return node
             node = node.data
           }
@@ -1119,6 +1152,7 @@ export async function CodarPlugin(input) {
         if (wrappedRefused) {
           if (wrappedCode === 401 || wrappedCode === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (errorCodeOf(wrapped) === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          if (clientGated(errorCodeOf(wrapped), saidBy(wrapped))) return { outcome: "failed", message: CLIENT_GATED }
           return { outcome: "failed", message: saidCard(waitSaid) || (Number.isFinite(wrappedCode) ? `签到失败（code ${wrappedCode}）` : "签到失败") }
         }
         // One place does not follow the client: when the answer itself says
@@ -1261,6 +1295,8 @@ export async function CodarPlugin(input) {
           // accepted), so the agent figure is simply left unspecified.
           if (agentR.status === "rejected" && restricted(agentR.reason))
             return { error: "账号 API 访问受限（account_restricted），请联系科搭支持", signIn: "" }
+          if (agentR.status === "rejected" && gatedError(agentR.reason))
+            return { error: CLIENT_GATED, signIn: "" }
         } else {
           const e = pointsR.reason
           // An expired sign-in is the whole card's answer: the other two reads
@@ -1270,6 +1306,7 @@ export async function CodarPlugin(input) {
           // account_restricted) is not expiry and re-login does not fix it;
           // say it the way the vendor does.
           if (restricted(e)) return { error: "账号 API 访问受限（account_restricted），请联系科搭支持", signIn: "" }
+          if (gatedError(e)) return { error: CLIENT_GATED, signIn: "" }
           if (signedOut(e)) return { error: "登录已过期，请重新登录", signIn: "expired" }
           // The general-points read failed: if the other balance endpoint
           // answered an Agent number, still draw the check-in row, activities
@@ -1283,6 +1320,8 @@ export async function CodarPlugin(input) {
           // the account was actually restricted or signed out.
           if (agentR.status === "rejected" && restricted(agentR.reason))
             return { error: "账号 API 访问受限（account_restricted），请联系科搭支持", signIn: "" }
+          if (agentR.status === "rejected" && gatedError(agentR.reason))
+            return { error: CLIENT_GATED, signIn: "" }
           if (agentR.status === "rejected" && signedOut(agentR.reason))
             return { error: "登录已过期，请重新登录", signIn: "expired" }
           const agent = agentR.status === "fulfilled" ? agentR.value : null
@@ -1552,9 +1591,13 @@ export async function CodarPlugin(input) {
         const token = tokenOf(options && typeof options === "object" ? options.auth : undefined)
         if (!token || expired(token)) return given
         try {
-          // The app's Electron main process reads the catalog (main.cjs's
-          // auth-request allowlist includes /v1/codar/models), using Node's
-          // default UA; the Go UA is only used for chat (sent by the sidecar).
+          // The app's main process reads the catalog too (its auth-request
+          // allowlist includes /v1/codar/models), but in 0.3.17 that read
+          // leaves through cloudNetwork.fetchAuth, which posts the request to
+          // the sidecar's /api/desktop/cloud-auth-request — api.claw.speedai.com
+          // is one of OFFICIAL_HOSTS. The outbound request is the sidecar's Go
+          // client with its own UA, not a Node fetch, so this request goes the
+          // same way (request() prefers the native transport).
           const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl })
           // The key goes to catalogOf so the token is cut out of the raw
           // strings, before their 120-character clean: a record whose id

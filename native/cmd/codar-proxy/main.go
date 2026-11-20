@@ -48,11 +48,18 @@
 // transport and relays the answer. Only hosts in officialHosts are forwarded.
 // In TCP mode every request must carry X-Codar-Proxy-Token with the token.
 //
-// What leaves is what the desktop's own requests carry: Host, User-Agent
-// "Go-http-client/1.1" (the gateway negotiates TLS 1.3 with no ALPN, so
-// net/http writes HTTP/1.1), Accept-Encoding from the transport, and from the
-// plugin only the headers in `forwarded`. Every other header the plugin or
-// the host adds is dropped.
+// What leaves is what the desktop's own requests carry: Host (the name alone:
+// the sidecar's provider client is given https://<host> as its base, so no
+// :443 is ever in its Host header), User-Agent, Accept-Encoding from the
+// transport, and from the plugin only the headers in `forwarded`. Every other
+// header the plugin or the host adds is dropped.
+//
+// The version the request travels over is whatever the server selects, as on
+// the sidecar, and the UA follows it: Go's own transport offers ALPN
+// [h2 http/1.1] and reads back the choice — against api.claw.speedai.com
+// today that is HTTP/1.1 with User-Agent "Go-http-client/1.1"; against
+// api.kuaipaper.com it is h2 with "Go-http-client/2.0". Both were captured on
+// the wire from this binary and from the 0.3.17 sidecars, and match.
 //
 // The socket's mode is 0600 and it is removed on exit. When ready-file is
 // given, the listener's JSON {"transport", "address", "token"} is written
@@ -485,7 +492,12 @@ func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	idle := time.AfterFunc(headTimeout, cancel)
 	defer idle.Stop()
 
-	target := "https://" + net.JoinHostPort(host, "443") + r.URL.EscapedPath()
+	// The URL is the sidecar's own shape: its provider client joins a request
+	// path onto the base it was configured with (https://<host>), so net/http
+	// writes Host as the name alone. Spelling the default port out here — as
+	// https://<host>:443 — put `:443` in the Host header on every request,
+	// which no official request carries. https already means 443.
+	target := "https://" + host + r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}

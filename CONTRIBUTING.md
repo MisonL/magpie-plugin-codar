@@ -157,13 +157,20 @@ one cannot be filled in faithfully after the fact. Then:
 ```bash
 npm run native:all                                  # the five platform builds
 npm version <patch|minor|major> -m "release: v%s"   # bumps package.json, commits, tags
-node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
+node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
+node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
 node scripts/native-packages.mjs --publish          # the five platform packages, first
 git push --follow-tags
 npm publish                                         # prepublishOnly re-runs the same gates: --strict builds, the packed suite and install check (--require-bun --require-builds), the staged set (--check)
 gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
 ```
+
+The staging step comes before its check: `--check` reads the staged set, and a
+tree still holding the previous version's staging fails it for that reason
+alone. The no-argument run stages from the current `native/bin` and main
+`package.json`; `--publish` stages the same set again before it uploads, so a
+stale staging directory is never what reaches the registry.
 
 **The gates run before the first publish, not after it.** A platform package
 published at a version cannot be replaced or withdrawn (npm refuses to

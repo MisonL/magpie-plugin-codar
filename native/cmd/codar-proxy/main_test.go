@@ -108,14 +108,14 @@ func TestProviderTransportDialsTheLastKnownAddress(t *testing.T) {
 // Authorization and Content-Type, and nothing else the plugin or host added.
 func TestForwardedRequestCarriesOnlyTheDesktopsHeaders(t *testing.T) {
 	type seen struct {
-		method, path, query string
-		header              http.Header
-		body                string
+		method, path, query, host string
+		header                    http.Header
+		body                      string
 	}
 	got := make(chan seen, 1)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		got <- seen{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Clone(), string(body)}
+		got <- seen{r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.Header.Clone(), string(body)}
 		w.Header().Set("Content-Type", "application/json")
 		// a Connection header names one more field of this hop only
 		w.Header().Set("Connection", "X-Leak")
@@ -168,6 +168,12 @@ func TestForwardedRequestCarriesOnlyTheDesktopsHeaders(t *testing.T) {
 	}
 	if ua := s.header.Get("User-Agent"); ua != "Go-http-client/1.1" {
 		t.Errorf("User-Agent %q, want Go-http-client/1.1", ua)
+	}
+	// The sidecar's provider client builds its URL from the base it was
+	// given (https://api.claw.speedai.com) plus the request path, so Host
+	// carries the name alone; a :443 there is a port no official request has.
+	if s.host != "api.claw.speedai.com" {
+		t.Errorf("Host %q, want the vendor's name without its default port", s.host)
 	}
 	if auth := s.header.Get("Authorization"); auth != "Bearer test" {
 		t.Errorf("Authorization %q, want the plugin's", auth)
@@ -526,7 +532,7 @@ func TestForwarderKeepsTheCredentialOnItsOwnHost(t *testing.T) {
 		t.Fatalf("a refused cross-host redirect answered %d, want 502", rec.Code)
 	}
 	for _, line := range got {
-		if strings.Contains(line, "synthetic-key") && !strings.HasPrefix(line, "api.claw.speedai.com:") {
+		if strings.Contains(line, "synthetic-key") && !strings.HasPrefix(line, "api.claw.speedai.com ") {
 			t.Fatalf("a credential reached another host: %v", got)
 		}
 	}
