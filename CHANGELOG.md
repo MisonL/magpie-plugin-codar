@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-21
+
 ### Fixed
 
-- The suite's "only the vendor's official hosts and only the proxy's binary are used" test asserted the checkout's `native/bin` path for every platform, so a normal npm install — where the lookup correctly opens the platform package it landed — failed that one assertion on Windows (issue #8). It now checks the file name the lookup answers and still requires the exact checkout path when that is what the install resolves, so both documented layouts are covered.
+- The suite's "only the vendor's official hosts and only the proxy's binary are used" test asserted the checkout's `native/bin` path for every platform, so a normal npm install — where the lookup correctly opens the platform package it landed — failed that one assertion on Windows (issue #8). It now checks the file name the lookup answers and still requires the exact checkout path when that is what the install resolves, so both documented layouts are covered. No runtime code changed.
 
 ## [0.3.2] - 2026-11-20
 
@@ -1150,7 +1152,8 @@ Initial release.
 - A test suite (187 tests) on Node 18–24 and Bun across Linux, macOS and
   Windows, including a formatting test that pins `.editorconfig`.
 
-[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.3
 [0.3.2]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.2
 [0.3.1]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.1
 [0.3.0]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.2.4...v0.3.0
