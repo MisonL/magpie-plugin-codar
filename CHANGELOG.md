@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The sign-in page's last screen is one centred block now: a 46px round mark with a soft halo and a check that draws itself in (a red cross for a sign-in the vendor will not finish), the 20px/600 heading, the sentence in ink, a muted hint and a small “凭证只保存在本机” pill, all centred on the card's scale; with reduced motion the finished frame is shown instead.
+
 ## [0.3.4] - 2026-11-21
 
 ### Fixed
