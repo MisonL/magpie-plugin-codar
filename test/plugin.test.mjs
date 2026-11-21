@@ -1263,7 +1263,14 @@ test("the scan status reads the vendor's words as the page's own states", () => 
   const { qrImageURL } = testables
   assert.equal(qrImageURL("https://codar-web.speedai.com/a.png"), true)
   assert.equal(qrImageURL("https://api.kuaipaper.com/a.png"), true)
-  for (const bad of ["http://codar-web.speedai.com/a.png", "https://127.0.0.1:8080/x", "https://codar-web.speedai.com:8443/a.png", "https://user:pw@codar-web.speedai.com/a.png", "javascript:alert(1)", "data:image/png;base64,AA", "file:///etc/passwd", "https://evil.example/a.png", "https://api.claw.speedai.com/a.png"]) {
+  // The vendor answers the code with WeChat's own image endpoint now
+  // (measured 2026-11-21: https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=…),
+  // not an image on its own hosts. That endpoint is the one path allowed
+  // there; anything else on the host is not this code.
+  const wechatQr = "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=abc"
+  assert.equal(qrImageURL(wechatQr), true, "the WeChat-hosted code is the code")
+  assert.deepEqual(wechatQrOf({ data: { scene: "s1", qr_url: wechatQr } }), { scene: "s1", qrUrl: wechatQr })
+  for (const bad of ["http://codar-web.speedai.com/a.png", "https://127.0.0.1:8080/x", "https://codar-web.speedai.com:8443/a.png", "https://user:pw@codar-web.speedai.com/a.png", "javascript:alert(1)", "data:image/png;base64,AA", "file:///etc/passwd", "https://evil.example/a.png", "https://api.claw.speedai.com/a.png", "https://mp.weixin.qq.com/cgi-bin/other?ticket=a", "https://mp.weixin.qq.com/", "http://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=a", "https://mp.weixin.qq.com:8443/cgi-bin/showqrcode?ticket=a", "https://user@mp.weixin.qq.com/cgi-bin/showqrcode?ticket=a"]) {
     assert.equal(qrImageURL(bad), false, bad)
     assert.equal(wechatQrOf({ data: { scene: "s1", qr_url: bad } }), null, bad)
   }
@@ -1466,7 +1473,7 @@ test("the QR sign-in is one method the host can open, and closes with the page",
     const u = String(url)
     if (u.startsWith("http://127.0.0.1:")) return realFetch(u, init)
     calls.push({ url: u, method: String(init?.method ?? "GET").toUpperCase(), body: init?.body ? JSON.parse(init.body) : null })
-    if (u.endsWith("/v1/wechat/login/qrcode")) return new Response(JSON.stringify({ code: 200, data: { scene: "s-9", qr_url: "https://codar-web.speedai.com/q.png" } }), { status: 200 })
+    if (u.endsWith("/v1/wechat/login/qrcode")) return new Response(JSON.stringify({ code: 200, data: { scene: "s-9", qr_url: "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=t-9" } }), { status: 200 })
     return new Response(JSON.stringify({ code: 200, data: { status: "scanned" } }), { status: 200 })
   }
   const ctl = new AbortController()
@@ -1486,6 +1493,7 @@ test("the QR sign-in is one method the host can open, and closes with the page",
     assert.match(html, /手机号登录/, "the other way in is a tab on the same page")
     const qr = await (await realFetch(`${opened.url}qr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).json()
     assert.equal(qr.scene, "s-9")
+    assert.equal(qr.qr_url, "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=t-9", "the WeChat-hosted code reaches the page")
     const seen = await (await realFetch(`${opened.url}status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene: "s-9" }) })).json()
     assert.equal(seen.state, "scanned")
     // the vendor calls are the plugin's, on the vendor's hosts, never the page's

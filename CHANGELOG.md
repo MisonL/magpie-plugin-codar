@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-21
+
+### Fixed
+
+- The QR sign-in showed "二维码获取失败：二维码数据不完整" instead of a code: the vendor now answers `POST /v1/wechat/login/qrcode` with WeChat's own image endpoint (`https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=…`, measured 2026-11-21), and the page's image allowlist held only the vendor's own hosts, so the answer was dropped. That one path on that host is allowed now — still https, no port or userinfo — and every other URL is still refused.
+
 ## [0.3.3] - 2026-11-21
 
 ### Fixed
@@ -1152,7 +1158,8 @@ Initial release.
 - A test suite (187 tests) on Node 18–24 and Bun across Linux, macOS and
   Windows, including a formatting test that pins `.editorconfig`.
 
-[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.4
 [0.3.3]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.3
 [0.3.2]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.2
 [0.3.1]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.1
