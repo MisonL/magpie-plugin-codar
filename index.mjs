@@ -29,7 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, publishedConcurrency, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
@@ -212,15 +212,6 @@ export async function CodarPlugin(input) {
   // globalThis.fetch, and there is no second path.
   const fetchImpl = (...args) => globalThis.fetch(...args)
 
-  // Concurrency: the vendor states it on no endpoint today (measured on
-  // 2026-10-27: not in the catalog, pricing, or the 429 response), and the
-  // default of 3 is measured — fire 4 at once and the 4th gets 429
-  // concurrent_limit_exceeded. Once the catalog carries max_concurrency, the
-  // catalog refresh below records it, and auth's getter uses it the next
-  // time it is read. The host reads this value once when building provider
-  // info (host.js's concurrencyOf), and the models hook runs before that, so
-  // the first request after a refresh already queues under the new number.
-  let vendorConcurrency = 0
   // The loader's baseURL: the provider's address as it is written down, "/v1"
   // included (the config hook sets it, the loader's comment says why). Until
   // then it is the vendor's gateway; a provider served through config always
@@ -231,14 +222,14 @@ export async function CodarPlugin(input) {
     auth: {
       provider: ID,
 
-      // Codar limits to 3 concurrent requests per model (measured: fire 4 at
-      // once and the 4th gets 429 concurrent_limit_exceeded). Limit to 3 per
-      // account so magpie queues instead of hitting the rate limit; users
-      // can raise it in the provider settings. Getter: use the catalog's
-      // number when it states one (see above), otherwise the measured 3.
-      get maxConcurrency() {
-        return vendorConcurrency || 3
-      },
+      // No maxConcurrency. A number declared here is magpie's queue per
+      // account or key (internal/provider/concurrency.go: nothing declared,
+      // 0, is no limit at all), and the vendor's concurrent_limit_exceeded
+      // is per model: one account-wide 3 throttled every other model beside
+      // the busy one. The community plugins declare none; the vendor's own
+      // 429 goes to magpie's rate-limit handling, and a person who knows
+      // their account can set a number in the provider's settings. The
+      // catalog is not read for one either, for the same reason.
 
       // Three sign-in methods: a token (the Codar desktop's own login on this
       // machine, or one pasted from anywhere), one 「科搭OAuth登录」 page carrying
@@ -552,11 +543,17 @@ export async function CodarPlugin(input) {
         return signInResult(next)
       },
 
-      // refreshLead is how long before exp the host renews: 12 hours. A
-      // desktop sign-in lives 7 days, so a magpie left running renews it
-      // well before the day it would have run out; the vendor's own client
-      // renews on a similar schedule.
-      refreshLead: 12 * 60 * 60 * 1000,
+      // No refreshLead: the host renews at its own lead (five minutes,
+      // host.js's leadOf) when the plugin names none. Twelve hours was a
+      // schedule nothing here measured, and a vendor renewal that did not
+      // carry the token's exp forward would then have renewed on every
+      // request for those twelve hours.
+      //
+      // No rotating either: the host reads it as "the vendor spends a
+      // refresh token once", and this vendor has no separate refresh token —
+      // /v1/token/refresh takes the same bearer token a request carries.
+      // Whether a renewed sign-in refuses the old token has not been
+      // measured; if it does, the flag is the one to add.
 
       // What a request for this account carries: the stored key. magpie falls
       // back to it without a loader, but the contract for a provider served
@@ -1605,16 +1602,6 @@ export async function CodarPlugin(input) {
           // is not an id a request can ask for), and a name is cut and kept.
           const list = catalogOf(body, token)
           if (!list) throw new Error("the vendor's catalog was not a list")
-          // If the vendor one day states a concurrency in the catalog, queue
-          // by it (see vendorConcurrency above). Only change it when the
-          // catalog really states a number: publishedConcurrency answers 0
-          // for a catalog that says nothing, and assigning unconditionally
-          // would wipe it back to the default 3 — so a vendor that once gave
-          // 7 and later omits the field once (a proxy-built catalog, a vendor
-          // canary) would quietly drop the limit back to 3. A missing field
-          // does not say "1" or "3".
-          const statedConcurrency = publishedConcurrency(body)
-          if (statedConcurrency) vendorConcurrency = statedConcurrency
           // The vendor's catalog has the final say on its own models; entries
           // the user added to this provider themselves (ids not in the
           // embedded catalog) survive the refresh, and the config hook merges
@@ -1631,9 +1618,6 @@ export async function CodarPlugin(input) {
           // but the host's next step with this list is bracket assignment
           // `out.models[key] = …` — and that writes the prototype. No model is
           // named that, so dropping it costs nothing (see noMagicKeys).
-          // The host reads maxConcurrency once, when it starts; a catalog
-          // that comes back this run asks for fewer than what is in use. It
-          // is recorded, for the next start (the README says so).
           // What a live record states beyond the catalog file's fields (the
           // vendor's rate) reaches the host here: modelOf carries it, and
           // only this hook's answer is read for it (host.js's config-model

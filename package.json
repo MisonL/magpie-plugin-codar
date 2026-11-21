@@ -50,8 +50,7 @@
     "node": ">=20"
   },
   "magpie": {
-    "icon": "https://codar.speedai.com/assets/codar-icon.png",
-    "maxConcurrency": 3
+    "icon": "https://codar.speedai.com/assets/codar-icon.png"
   },
   "scripts": {
     "test": "node --test",

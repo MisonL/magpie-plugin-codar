@@ -15,7 +15,7 @@ import { testables } from "../lib/internal.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../lib/catalog.mjs"
 
-const { codeOf, tokenOf, usernameOf, expiresAt, expired, modelOf, modelsOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, errorCodeOf, restricted, retryAfterOf, signStateOf, signedIn, runningActivities, freeModelOf, scrubLine, scrubShapes, cutKey, echoesKey, echoesIn, windowsOf, WINDOWS_OF, decodedCarriesKey, cutProjected, flatten, encodedRun, splitAcross, signMessage, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, baseURL, ALREADY_CLAIMED, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, unusableKey, login, refreshToken, LOGIN_PATH, REFRESH_PATH } = testables
+const { codeOf, tokenOf, usernameOf, expiresAt, expired, modelOf, modelsOf, catalogOf, protocolOf, mergeModel, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, errorCodeOf, restricted, retryAfterOf, signStateOf, signedIn, runningActivities, freeModelOf, scrubLine, scrubShapes, cutKey, echoesKey, echoesIn, windowsOf, WINDOWS_OF, decodedCarriesKey, cutProjected, flatten, encodedRun, splitAcross, signMessage, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, baseURL, ALREADY_CLAIMED, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, unusableKey, login, refreshToken, LOGIN_PATH, REFRESH_PATH } = testables
 // Nothing in this file may reach the Go proxy: several tests stub
 // globalThis.fetch directly rather than through withFetch, and on a machine
 // with a built native/bin the proxy would answer them instead — the stubs
@@ -2775,42 +2775,27 @@ test("a config whose provider is not an object does not take the provider down",
   assert.equal(missing.provider.codar.api, "https://api.claw.speedai.com/v1", "a config with no provider at all still gets ours")
 })
 
-test("the auth hook asks magpie for the vendor's three concurrent requests", async () => {
-  // Codar turns away the 4th concurrent request of one model with 429
-  // concurrent_limit_exceeded (measured 2026-10-27: 2 and 3 in flight pass,
-  // 4 and 5 get 429 for all but three). magpie queues past maxConcurrency
-  // and lets the user raise it on the provider.
+test("the plugin declares no concurrency, as the other community plugins mostly do", async () => {
+  // magpie treats an undeclared number as no limit (internal/provider/
+  // concurrency.go: 0 is none), and the vendor's concurrent_limit_exceeded
+  // is per model, so an account-wide 3 throttled every other model beside
+  // the busy one. The 429 is left to magpie's rate-limit handling, and to a
+  // person who sets a number in the provider settings.
   const p = await CodarPlugin()
-  assert.equal(p.auth.maxConcurrency, 3)
+  assert.equal("maxConcurrency" in p.auth, false, "no number on the auth hook")
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url)))
+  assert.equal("maxConcurrency" in (pkg.magpie ?? {}), false, "nor in package.json's magpie")
 })
 
-test("a concurrency the vendor's catalog states is used, without a reload", async () => {
-  // The number is read when magpie builds the provider's info (host.js
-  // concurrencyOf), and the models hook runs before that in the same pass.
-  // So a catalog that starts saying max_concurrency reaches the queue on
-  // the next listing: no plugin update, no restart.
+  test("the plugin leaves a sign-in's renewal timing to magpie, and declares no rotation", async () => {
+  // host.js's leadOf renews at its own five minutes when the plugin states
+  // none; a twelve-hour lead was a schedule nothing measured. rotating is
+  // "the vendor spends a refresh token once": this vendor has no separate
+  // refresh token — the token renews with itself — and whether a renewal
+  // kills the old one has not been measured.
   const p = await CodarPlugin()
-  const given = { id: "codar", models: {} }
-  await withFetch(
-    {
-      "/v1/codar/models": {
-        body: { catalog: { data: [{ id: "x", display_name: "X", protocol: { type: "openai_chat_completions" }, max_concurrency: 5 }] } },
-      },
-    },
-    async () => p.provider.models(given, { auth: await auth() }),
-  )
-  assert.equal(p.auth.maxConcurrency, 5, "the vendor's own number replaces the measured default")
-
-  const q = await CodarPlugin()
-  await withFetch(
-    {
-      "/v1/codar/models": {
-        body: { catalog: { data: [{ id: "x", display_name: "X", protocol: { type: "openai_chat_completions" } }] } },
-      },
-    },
-    async () => q.provider.models({ id: "codar", models: {} }, { auth: await auth() }),
-  )
-  assert.equal(q.auth.maxConcurrency, 3, "a catalog with no number keeps the measured one")
+  assert.equal("refreshLead" in p.auth, false, "magpie renews at its own lead")
+  assert.equal("rotating" in p.auth, false, "no single-use refresh token to declare")
 })
 
 test("claude models go out on the anthropic SDK, the rest on openai-compatible", () => {
@@ -3405,7 +3390,7 @@ test("vendor strings are cleaned, and an id that needs cleaning is left out", ()
       { id: "bad\u0001id", display_name: "Bad", protocol: { type: "openai_chat_completions" } },
       { id: "  ", display_name: "Blank" },
     ],
-  })
+})
   assert.deepEqual(list.map((m) => m.id), ["ok"], "the two unusable ids are left out")
   assert.equal(list[0].name, "Fine Name", "the control character in the name is a space")
 })
@@ -3438,13 +3423,13 @@ test("a token quoted back in an error is cut by its shape, even with no token in
   const p = await CodarPlugin()
   const r = await p.auth.checkin(async () => {
     throw boom
-  })
+})
   assert.doesNotMatch(r.message, new RegExp(jwt.slice(10, 30)))
   assert.match(r.message, /…/)
 
   const u = await p.auth.usage(async () => {
     throw boom
-  })
+})
   assert.doesNotMatch(u.error, new RegExp(jwt.slice(10, 30)))
 })
 
@@ -3548,20 +3533,20 @@ test("a getAuth that throws fails the hook; the usage read marks a 401 as expire
   const p = await CodarPlugin()
   const plain = await p.auth.checkin(async () => {
     throw new Error("no account")
-  })
+})
   assert.equal(plain.outcome, "failed")
   assert.equal(plain.message, "no account")
 
   const denied = Object.assign(new Error("denied"), { status: 401 })
   const r = await p.auth.checkin(async () => {
     throw denied
-  })
+})
   assert.equal(r.outcome, "failed")
   assert.equal(r.signIn, undefined, "the check-in's own answer has no signIn to be read")
 
   const u = await p.auth.usage(async () => {
     throw denied
-  })
+})
   assert.equal(u.signIn, "expired")
   assert.ok(u.error)
 })
@@ -3716,7 +3701,7 @@ test("each endpoint is asked with its own method, host, body and credential", as
       type: c.init.headers["Content-Type"],
       body: c.init.body,
     }
-  })
+})
   const one = (path, method) => {
     const hit = seen.filter((s) => s.path === path && s.method === method)
     assert.ok(hit.length > 0, `${method} ${path} was made`)
@@ -3779,7 +3764,7 @@ test("a usage read with a locally expired token never reaches the vendor", async
     assert.equal(u.signIn, "expired", "the account is marked for magpie")
     assert.match(u.error, /登录已过期/)
     assert.equal(calls.length, 0, "and nothing was sent")
-  })
+})
 })
 
 test("the vendor's catalog shape, as it answers today, is read field for field", () => {
@@ -3939,7 +3924,7 @@ test("a vendor string with a bidi override or a zero-width space is cleaned", ()
       { id: "ok", display_name: "Fine\u202eName\u200b", protocol: { type: "openai_chat_completions" } },
       { id: "bad\u202eid", display_name: "Bad", protocol: { type: "openai_chat_completions" } },
     ],
-  })
+})
   assert.deepEqual(list.map((m) => m.id), ["ok"], "an id with a bidi override in it is not an id a request can ask for")
   assert.equal(list[0].name, "Fine Name", "the name is one clean line")
 })
@@ -4099,56 +4084,6 @@ test("an activity whose end no calendar can state carries no resetsAt, not 1970"
   assert.equal(last.resetsAt, 253402300799000, "the last instant both ends accept is a time, and is said")
 })
 
-test("a max_concurrency of the wrong type does not pin the account to one at a time", async () => {
-  const p = await CodarPlugin()
-  await withFetch(
-    { "/v1/codar/models": { body: { object: "list", data: [{ id: "x", max_concurrency: true }] } } },
-    async () => p.provider.models({ models: {} }, { auth: await auth() }),
-  )
-  assert.equal(p.auth.maxConcurrency, 3, "a boolean is not a number of requests")
-  const q = await CodarPlugin()
-  await withFetch(
-    { "/v1/codar/models": { body: { object: "list", data: [{ id: "x", max_concurrency: 7 }] } } },
-    async () => q.provider.models({ models: {} }, { auth: await auth() }),
-  )
-  assert.equal(q.auth.maxConcurrency, 7, "a real number still is")
-  // The vendor can state one per model; the account queues at the smallest,
-  // and only a count a host can keep is a count at all. The 700k-entry test
-  // below puts the smallest value last, so a fold that kept the last one
-  // would pass it — these put it first.
-  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 2 }, { max_concurrency: 9 }] }), 2, "the smallest wins, wherever it sits")
-  assert.equal(publishedConcurrency({ max_concurrency: 5, data: [{ max_concurrency: 9 }] }), 5, "a provider-level count counts")
-  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 2.5 }] }), 0, "a fraction is not a count of requests")
-  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 5000 }] }), 0, "nor is a number no account could honour")
-  assert.equal(publishedConcurrency({ data: [{ max_concurrency: 1000 }] }), 1000, "the cap itself is a count")
-  assert.equal(publishedConcurrency({ data: [{ max_concurrency: "4" }] }), 4, "a numeric string is a number, as the vendor client reads them")
-})
-
-test("a catalog big enough to overflow a spread argument still yields its concurrency", async () => {
-  // publishedConcurrency walks the vendor's whole list (the 2000-entry cap is
-  // on the answer given the host, not on this reading) and used to fold it
-  // with Math.min(...nums). A spread passes one argument per entry, and past
-  // ~125k entries on Node (~640k on Bun) that throws "Maximum call stack size
-  // exceeded" — inside the models hook, where the catch turns it into a
-  // fallback, so a catalog that is merely enormous would cost the live list
-  // and the vendor's concurrency. The fold is now a running minimum.
-  const shared = { max_concurrency: 9 }
-  const many = new Array(700000).fill(shared)
-  many[699999] = { max_concurrency: 2 }
-  assert.equal(publishedConcurrency({ data: many }), 2, "the smallest the catalog names, however long the list is")
-
-  // the same shape through the models hook: no fallback, the number applied
-  const entries = []
-  for (let i = 0; i < 130000; i++) entries.push(i === 129999 ? { id: "m-last", max_concurrency: 2 } : { id: `m${i}`, max_concurrency: 9 })
-  const p = await CodarPlugin()
-  const out = await withFetch(
-    { "/v1/codar/models": { body: { object: "list", data: entries } } },
-    async () => p.provider.models({ models: {} }, { auth: await auth() }),
-  )
-  assert.equal(out[Symbol.for("magpie.fellBack")], undefined, "no fallback: the size alone is not a failure")
-  assert.equal(p.auth.maxConcurrency, 2, "and the catalog's number reaches the account")
-})
-
 test("a context window that is not a positive number is read as not stated", () => {
   const list = catalogOf({
     data: [
@@ -4156,7 +4091,7 @@ test("a context window that is not a positive number is read as not stated", () 
       { id: "inf", context_window: 1e999, protocol: { type: "openai_chat_completions" } },
       { id: "ok", context_window: 200000, protocol: { type: "openai_chat_completions" } },
     ],
-  })
+})
   const by = (id) => list.find((m) => m.id === id)
   assert.equal(by("neg").context, 0, "a negative window is not a size")
   assert.equal(by("inf").context, 0, "nor is an infinite one")
@@ -4388,7 +4323,7 @@ test("the reply ceiling the vendor states is on the model", () => {
       { id: "unstated", protocol: { type: "openai_chat_completions" } },
       { id: "odd", request_schema: { properties: { max_tokens: { maximum: true } } }, protocol: { type: "openai_chat_completions" } },
     ],
-  })
+})
   const by = (id) => list.find((m) => m.id === id)
   assert.equal(by("stated").maxOutput, 131072, "the stated ceiling is read")
   assert.equal(by("unstated").maxOutput, 0, "none stated is not a ceiling")
@@ -5067,7 +5002,7 @@ const genRun = async ({ body, argv = [], seeded, out = "catalog.mjs", throwOnFet
       return new Response(typeof body === "string" ? body : JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
     }),
     log: { log: (m) => logs.push(String(m)), error: (m) => logs.push(String(m)) },
-  })
+})
   const after = (() => {
     try {
       return readFileSync(outPath, "utf8")
@@ -5541,7 +5476,7 @@ test("a token in a record's object key is cut before it is written", async () =>
         { id: "auto", display_name: "Auto", context_window: 128000 },
       ],
     },
-  })
+})
   assert.equal(exit, 0, "the answer still writes")
   assert.equal(String(after).includes(token), false, "the token echoed as an object key is not written")
   assert.equal(logs.join("\n").includes(token), false, "nor printed")
@@ -5552,7 +5487,7 @@ test("a token in a record's object key is cut before it is written", async () =>
   const named = await genRun({
     token,
     body: { code: 200, data: [{ id: "model-named", display_name: `early access ${foldedName}`, context_window: 1000, output_modalities: ["text"] }] },
-  })
+})
   assert.equal(named.exit, 0)
   assert.equal(String(named.after).includes(token), false, "a token folded at U+180E is not written")
   assert.match(String(named.after), /early access …/, "and the place it was is marked")
@@ -5565,7 +5500,7 @@ test("a token in a record's object key is cut before it is written", async () =>
   const far = await genRun({
     token,
     body: { code: 200, data: [{ id: "model-deep", display_name: "Deep", context_window: 1000, input_modalities: [deep], output_modalities: ["text"] }] },
-  })
+})
   assert.equal(far.exit, 0)
   assert.equal(String(far.after).includes(token), false, "a token past the depth cap is not written either")
 })
@@ -5753,14 +5688,6 @@ test("a status or activity read that never answers does not sink the card", asyn
   }
 })
 
-test("a concurrency on the catalog envelope itself is read too", () => {
-  // publishedConcurrency reads three places for the number: the body, the
-  // catalog wrapper, and each model. Only the first and the last had a test,
-  // so the wrapped spelling could have been dropped in silence.
-  assert.equal(publishedConcurrency({ catalog: { max_concurrency: 4, data: [{ id: "a" }] } }), 4, "a count on the catalog wrapper is a count")
-  assert.equal(publishedConcurrency({ catalog: { max_concurrency: 6, data: [{ max_concurrency: 9 }] } }), 6, "and the smallest of all of them still wins")
-})
-
 test("a word where a number belongs is not a wait, on any of the four fields", () => {
   // numOf accepts numbers and numeric strings; a boolean, an array and an
   // object are none of them. Every field read with it had its own guard, but
@@ -5774,7 +5701,7 @@ test("a word where a number belongs is not a wait, on any of the four fields", (
       { free_until: { at: now + 3600 }, remaining_quota: null, model_ids: ["c"] },
       { free_until: now + 3600, remaining_quota: 5, user_quota_limit: 10, model_ids: ["d"] },
     ],
-  })
+})
   assert.deepEqual(running.map((a) => a.model_ids[0]), ["d"], "a boolean, an array and an object are not times; an unreadable quota is not drawn")
   assert.equal(secsOf(true), 0, "and it is the reading that refuses them, not a comparison that happens to")
 })
@@ -5792,7 +5719,7 @@ test("an activity whose remaining quota cannot be read is not drawn as unlimited
       { free_until: now + 3600, remaining_quota: null, model_ids: ["y"] },
       { free_until: now + 3600, remaining_quota: "12", model_ids: ["z"] },
     ],
-  })
+})
   assert.deepEqual(data.map((a) => a.model_ids[0]), ["y", "z"], "an unreadable quota is hidden, a null and a number are not")
 })
 
@@ -6309,17 +6236,6 @@ test("a business code is read the way the vendor's client reads one", async () =
   assert.equal(r.outcome, "failed", "a code the client reads as 0 is not the day's 400, whatever the words")
 })
 
-test("a catalog that says nothing about concurrency does not undo the last number", async () => {
-  const p = await CodarPlugin()
-  const route = (extra) => ({
-    "/v1/codar/models": { body: { data: [{ id: "x", protocol: { type: "openai_chat_completions" }, ...extra }] } },
-  })
-  await withFetch(route({ max_concurrency: 7 }), async () => p.provider.models({ models: {} }, { auth: await auth() }))
-  assert.equal(p.auth.maxConcurrency, 7)
-  await withFetch(route({}), async () => p.provider.models({ models: {} }, { auth: await auth() }))
-  assert.equal(p.auth.maxConcurrency, 7, "a catalog with no number is not a statement to go back to 3")
-})
-
 test("a credential echoed without its eyJ head, or as its signature alone, is cut", () => {
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
   const header = b64({ alg: "HS256", typ: "JWT" })
@@ -6394,7 +6310,7 @@ test("an answer split into chunks is decoded whole, even inside a character", as
       c.enqueue(bytes.slice(2))
       c.close()
     },
-  })
+})
   const { text } = await readAnswer(new Response(split))
   assert.equal(text, "点数 ok")
 })
@@ -6605,7 +6521,7 @@ test("the auth hook carries a loader, and it hands the request the account's key
     assert.equal(calls.length, 1, "the host's fetch did not carry it")
     assert.equal(calls[0].url, "https://api.claw.speedai.com/v1/chat/completions")
     return res.json()
-  })
+})
   assert.deepEqual(answered, { via: "fetch" })
 })
 
@@ -7371,7 +7287,7 @@ test("a temporary file another process pre-created is not written through", asyn
       victimText = readFileSync(victim, "utf8")
       outWasLink = lstatSync(p).isSymbolicLink()
     },
-  })
+})
   if (run.exit === 2 && /cannot write/.test(run.logs.join("\n"))) {
     t.skip("this platform would not create the symlink the case needs")
     return
@@ -7461,7 +7377,7 @@ test("an already_claimed word in the wrapper is the day's statement, not a claim
     "/v1/daily-sign": { body: sign },
     "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true, retry_after: 3600 } } },
     "/api/codar/activities/mine": { body: { code: 200, data: [] } },
-  })
+})
   const wrapped = await withFetch(answers({ code: 200, data: { code: "already_claimed", retry_after: 3600 } }), async () => p.auth.checkin(auth))
   assert.equal(wrapped.outcome, "done", `the word is the day's statement: ${JSON.stringify(wrapped)}`)
   assert.match(wrapped.message, /已领过/)
@@ -7782,7 +7698,7 @@ test("--check never prints the token, even out of the old catalog file", async (
     seeded,
     argv: ["--check"],
     token: key,
-  })
+})
   assert.equal(exit, 1, "the record moved")
   assert.ok(logs.some((l) => l.startsWith("changed:")), "the moved record is named")
   assert.ok(!logs.join("\n").includes(key), "the token is cut out of the old value")
@@ -7803,7 +7719,7 @@ test("a token split across two fields stops the generator instead of reaching th
       ],
     },
     token: key,
-  })
+})
   assert.equal(exit, 2, "a leak we cannot cut is a failed run, not a written file")
   assert.equal(after, null, "nothing is written")
   assert.match(logs.join("\n"), /part of the account token/)
@@ -7882,7 +7798,7 @@ test("a restriction or expiry on the second balance read is the account's answer
     "/v1/agent/balance": agent,
     "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
     "/api/codar/activities/mine": { body: { code: 200, data: [] } },
-  })
+})
   const restricted = () => new Response(JSON.stringify({ detail: { code: "account_restricted", message: "API access is restricted" } }), { status: 403 })
   const failedFirst = await withFetch(routes(restricted, { detail: "boom" }), async () => p.auth.usage(auth))
   assert.match(failedFirst.error ?? "", /account_restricted/, "the restriction is said, not the first read's error")
@@ -7955,7 +7871,7 @@ test("a token split into short pieces still stops the generator", async () => {
   const { exit, after, logs } = await genRun({
     body: { code: 200, data: pieces.map((p, i) => ({ id: `m${i}`, display_name: p, context_window: 1000 })) },
     token: key,
-  })
+})
   assert.equal(exit, 2, "a leak we cannot cut is a failed run")
   assert.equal(after, null, "nothing is written")
   assert.match(logs.join("\n"), /part of the account token/)
@@ -8075,7 +7991,7 @@ test("a token split into pieces shorter than the window still stops the generato
   const { exit, after, logs } = await genRun({
     body: { code: 200, data: pieces.map((p, i) => ({ id: `m${i}`, display_name: p, context_window: 1000 })) },
     token: key,
-  })
+})
   assert.equal(exit, 2, "the reassembled token is a leak we cannot cut")
   assert.equal(after, null, "nothing is written")
   assert.match(logs.join("\n"), /part of the account token/)
@@ -8095,7 +8011,7 @@ test("a refused answer is reported by its status, not as a failed fetch", async 
     out: join(root, "catalog.mjs"),
     log: { log: (m) => bodies.push(String(m)), error: (m) => bodies.push(String(m)) },
     fetchImpl: async () => new Response(new ReadableStream({ start(c) { c.error(new Error("stream refused")) } }), { status: 500 }),
-  })
+})
   rmSync(root, { recursive: true, force: true })
   assert.equal(exit, 2)
   assert.match(bodies.join("\n"), /HTTP 500/, `the status is said: ${bodies.join(" | ")}`)
@@ -9471,7 +9387,7 @@ test("an ordinary long account name and an ordinary long model id are not creden
       { id: "claude-sonnet-4-5-20250929", context_window: 200000, protocol: { type: "openai_chat_completions" } },
       { id: "DeepSeekR1DistillQwen32BInstruct", context_window: 8000, protocol: { type: "openai_chat_completions" } },
     ],
-  })
+})
   assert.deepEqual(list.map((m) => m.id), ["claude-sonnet-4-5-20250929", "DeepSeekR1DistillQwen32BInstruct"])
   const card = scrub("签到成功，模型 claude-sonnet-4-5-20250929 可用。", mkToken({ username: "u", exp: 1 }))
   assert.equal(card, "签到成功，模型 claude-sonnet-4-5-20250929 可用。", "a model id in the card's words is not cut")
@@ -9799,7 +9715,7 @@ test("the generator writes, checks and prints no split of the token", { timeout:
     seeded: render(sortRows(numberedRows)),
     argv: ["--check"],
     token: key,
-  })
+})
   assert.equal(numberedCheck.exit, 2, "the numbered order is read too")
   assert.ok(!numberedCheck.logs.join("\n").includes(numbered[1].display_name), "and no piece is printed")
 })
