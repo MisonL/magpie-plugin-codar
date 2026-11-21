@@ -11,7 +11,7 @@ import { createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { binaryPath, chatFetch, closeProxy, hosts, officialURL, proxyFetch, sendVia } from "../lib/native.mjs"
@@ -1493,10 +1493,22 @@ test("only the vendor's official hosts and only the proxy's binary are used", as
   assert.equal(hosts.has("evil.example"), false)
   // the build script and the lookup agree on every name: a build the script
   // writes for a platform is the file the lookup opens on it (they disagreed
-  // on Windows once, and a Windows build went unfound)
+  // on Windows once, and a Windows build went unfound). The directory is the
+  // install's to choose — a checkout opens `native/bin`, an npm install opens
+  // the platform package it landed (issue #8: asserting the checkout path
+  // failed in a normal npm layout on Windows) — so the name is the contract
+  // here, and the scratch-package test below proves the package layout. On a
+  // host running the other arch's runtime (Rosetta) the lookup resolves
+  // through the fallback, which is the other arch's build of the platform.
   for (const [platform, arch] of [["darwin", "arm64"], ["darwin", "x64"], ["linux", "arm64"], ["linux", "x64"], ["win32", "x64"]]) {
     const file = join(here, "..", "native", "bin", binaryFile(platform, arch))
-    assert.equal(binaryPath(platform, arch), file)
+    const other = arch === "arm64" ? "x64" : "arm64"
+    const resolved = binaryPath(platform, arch)
+    assert.ok(
+      [binaryFile(platform, arch), binaryFile(platform, other)].includes(basename(resolved)),
+      `${platform}/${arch}: the lookup opens a build of that platform, not ${resolved}`,
+    )
+    if (dirname(resolved) === join(here, "..", "native", "bin")) assert.equal(resolved, file, `${platform}/${arch}: a checkout's own build is the file opened`)
     // what the build script writes is that same name
     assert.equal(builtName({ os: platform, arch: arch === "x64" ? "amd64" : arch }), binaryFile(platform, arch))
   }
