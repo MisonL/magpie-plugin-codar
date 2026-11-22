@@ -982,6 +982,52 @@ test("a password attempt superseded by a newer sign-in does not leave its handov
   }
 })
 
+test("of two refused password attempts the later refusal owns the handover", async () => {
+  // A is started first and its IP-check refusal comes back last. The guard
+  // counts COMPLETED sign-ins only, so both refusals pass it and the older
+  // one wrote over the newer: the next 「科搭OAuth登录」 opened A's security
+  // check while the person had just been refused for B. A handover is now
+  // stamped with its attempt's order: a refusal rewrites one only when it
+  // belongs to an attempt that started no earlier than the write did.
+  const tempA = mkToken({ username: "user_pA", exp: Math.floor(Date.now() / 1000) + 600 })
+  const tempB = mkToken({ username: "user_pB", exp: Math.floor(Date.now() / 1000) + 600 })
+  let releaseA
+  const aHeld = new Promise((r) => (releaseA = r))
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  const refusal = (who, temp) => ({ code: 201, status: "ip_verify_required", username: who, phone: "13800138000", token: temp })
+  await withFetch(
+    {
+      "POST /v1/login": (url, init) => {
+        const who = JSON.parse(init.body).username
+        if (who === "user_pA") {
+          // A is held until B's refusal has been written
+          return aHeld.then(() => new Response(JSON.stringify(refusal(who, tempA)), { status: 200, headers: { "Content-Type": "application/json" } }))
+        }
+        return Promise.resolve(new Response(JSON.stringify(refusal(who, tempB)), { status: 200, headers: { "Content-Type": "application/json" } }))
+      },
+    },
+    async () => {
+      const a = password.authorize({ username: "user_pA", password: "pwA" })
+      await new Promise((r) => setTimeout(r, 20))
+      const b = password.authorize({ username: "user_pB", password: "pwB" })
+      await b
+      releaseA()
+      await a
+    },
+  )
+  const ctl = new AbortController()
+  const page = await sms.authorize({}, { signal: ctl.signal })
+  try {
+    const html = await (await fetch(page.url)).text()
+    assert.match(html, /user_pB/, "the page continues the newer attempt's account")
+    assert.ok(!/user_pA/.test(html), "the older refusal did not rewrite the newer handover")
+  } finally {
+    ctl.abort()
+  }
+})
+
 test("a handover that lands while a newer password attempt is in flight dies with it", async () => {
   // Attempt A (account user_m1) is refused with the IP check; the refusal
   // arrives while attempt B (user_m2) is still open. B started after A, so
@@ -6666,6 +6712,36 @@ test("a refusal that words itself in an object detail is still read", () => {
   assert.equal(saidBy({ detail: "Not authenticated" }), "Not authenticated", "a string detail is unchanged")
   assert.equal(errorCodeOf({ code: "quota_exceeded" }), "quota_exceeded", "a word code is kept as it is")
   assert.equal(errorCodeOf({ code: 500 }), "", "a numeric code is not a business word")
+})
+
+test("a restriction wrapped beside an inner 401 stays a restriction on the card", async () => {
+  // The balance endpoints may answer the outer layer's success word with the
+  // account restriction on the envelope and the token's own 401 under `data`
+  // (measured on the gateway's rewrites: the two refusals can sit at either
+  // depth). The refusal walk takes the first refusal node it meets — the
+  // 401 — and the readers then said 「登录已过期」 and marked the account
+  // signed out: re-logging cannot fix a restricted account, and the fix they
+  // were sent to do was the wrong one. The chain's restriction now speaks
+  // first, as the check-in path already reads it.
+  const p = await CodarPlugin()
+  for (const outer of [
+    { code: "account_restricted", message: "API access is restricted. Please contact support." },
+    { code: 200, message: "This login credential is restricted to Codar. Use an API key for other clients. (client_not_supported)" },
+  ]) {
+    const body = { ...outer, data: { code: 401, message: "Token has expired" } }
+    const u = await withFetch(
+      {
+        "/v1/gettoken": { body },
+        "/v1/agent/balance": { body },
+        "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+        "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+      },
+      async () => p.auth.usage(auth),
+    )
+    assert.equal(u.signIn ?? "", "", "the account is not marked expired")
+    assert.match(u.error ?? "", /受限|客户端使用|API key|support/, `the card names the refusal: ${JSON.stringify(outer).slice(0, 60)}`)
+    assert.ok(!/登录已过期/.test(u.error ?? ""), "no re-login sentence for a refusal re-login cannot fix")
+  }
 })
 
 test("account_restricted is not read as a sign-in that lapsed", async () => {

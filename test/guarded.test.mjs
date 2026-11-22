@@ -323,12 +323,26 @@ test("the rule keeps the origin it was given, port included", () => {
   assert.equal(hopOf(vendor, at, null), null)
 })
 
-test("an address that is not https is left to the caller's own fetch", async () => {
-  // The plugin's addresses are https; an address a caller wrote down as plain
-  // http is handed to fetch with the init exactly as given, redirect mode and
-  // all, and the rule takes no hop for it.
-  const { transport, asked } = planned(() => "/elsewhere")
-  const res = await guardedFetch("http://example.invalid/start", { method: "POST", body: "{}", redirect: "follow" }, { transport })
-  assert.equal(res.status, 302)
-  assert.deepEqual(asked, [{ url: "http://example.invalid/start", redirected: "follow" }], "the caller's init reached the transport unchanged")
+test("a plain-http address is held to the same rule as https", async () => {
+  // A user's chat base can be plain http (a local gateway on a loopback port
+  // is a normal chain), and the request carries their key. An address that
+  // is not https used to be handed to the transport with the caller's
+  // redirect mode intact, so a redirect off that origin could take
+  // Authorization to another host with it. The rule keeps http too: a hop
+  // only on the origin the request started on, port included, and a
+  // cross-origin redirect returned as the answer it is.
+  const away = planned(() => "http://elsewhere.invalid/collect")
+  const refused = await guardedFetch("http://example.invalid/start", { method: "POST", headers: { authorization: "Bearer SYNTH" }, body: "{}", redirect: "follow" }, { transport: away.transport })
+  assert.equal(refused.status, 302, "the redirect off the http origin is returned, not followed")
+  assert.deepEqual(away.asked, [{ url: "http://example.invalid/start", redirected: "manual" }], "the caller's follow mode was replaced by the rule")
+
+  const seen = []
+  const hopTransport = (url, init) => {
+    seen.push(String(url))
+    const target = String(url).endsWith("/start") ? "http://127.0.0.1:3000/v1/models" : null
+    return Promise.resolve(target === null ? new Response(null, { status: 200 }) : new Response(null, { status: 302, headers: { location: target } }))
+  }
+  const second = await guardedFetch("http://127.0.0.1:3000/start", {}, { transport: hopTransport })
+  assert.equal(second.status, 200, "a same-origin http hop is taken, as fetch takes it")
+  assert.deepEqual(seen, ["http://127.0.0.1:3000/start", "http://127.0.0.1:3000/v1/models"])
 })

@@ -154,10 +154,16 @@ nobody catches later — the file records why a version exists, and a missing
 one cannot be filled in faithfully after the fact. Then:
 
 ```bash
-npm run native:all                                  # the five platform builds
-npm version <patch|minor|major> -m "release: v%s"   # bumps package.json, commits, tags
-# npm version does NOT touch optionalDependencies: bump those five pins to the same version by hand,
-# or native-packages.mjs --check will refuse the staged set (this bit 0.3.1 — see its release entry).
+npm run native:all # the five platform builds, freshly
+# `npm version` alone commits package.json's own version and leaves the five
+# optionalDependencies pins behind (the 0.3.1 release learned this the hard
+# way): bump the version and edit the five pins together, commit that one
+# change as the release commit, and tag it, so the commit the tag names
+# carries pins that match its own version.
+npm version <patch|minor|major> --no-git-tag-version # package.json's version only
+# then edit package.json's five optionalDependencies to the same version
+git add package.json CHANGELOG.md && git commit -m "release: v<version>"
+git tag v<version>
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
