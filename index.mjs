@@ -36,10 +36,20 @@ import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_B
 // (host.js's save), with expires from the token's own exp. A token that
 // states no exp keeps 0, which the host reads as "no renewal due". Without
 // this the sign-in is kept as a bare api key and nothing renews it.
+//
+// A finished sign-in bumps signIns so an older attempt, still in flight, sees
+// it was superseded and drops its handover. A renewal must NOT bump it: the
+// host renews the stored sign-in on its own (leadOf), and a renewal that
+// lands while a password POST is in flight is not a newer sign-in — counting
+// it made that attempt throw away a handover it had a right to write, so the
+// next OAuth page opened on the tabs instead of the security check. renewResult
+// is the same shape without the bump.
+const signedInToken = (token) => ({ type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 })
 const signInResult = (token) => {
   signIns += 1
-  return { type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 }
+  return signedInToken(token)
 }
+const renewResult = signedInToken
 
 // signInFailure says why a password sign-in did not finish, in the user's
 // words. The two vendor answers worth telling apart: a 4xx whose body code is
@@ -223,13 +233,16 @@ export async function CodarPlugin(input) {
       provider: ID,
 
       // No maxConcurrency. A number declared here is magpie's queue per
-      // account or key (internal/provider/concurrency.go: nothing declared,
-      // 0, is no limit at all), and the vendor's concurrent_limit_exceeded
-      // is per model: one account-wide 3 throttled every other model beside
-      // the busy one. The community plugins declare none; the vendor's own
-      // 429 goes to magpie's rate-limit handling, and a person who knows
-      // their account can set a number in the provider's settings. The
-      // catalog is not read for one either, for the same reason.
+      // account or key (host.js's declared, internal/provider/concurrency.go:
+      // nothing stated is no limit at all). The vendor's one measured answer
+      // (2026-10-27: a fourth request at once, 429 concurrent_limit_exceeded)
+      // cannot tell whether the vendor counts per model or per account; an
+      // account-wide 3 risked queueing idle models behind the busy one, and
+      // most community plugins declare none (measured 2026-11-21: only zcode
+      // among the installed set states a number). The vendor's 429 then
+      // reaches magpie as the vendor's own refusal; a person who knows their
+      // account can still set a queue in the provider's settings. The catalog
+      // is not read for a number either, for the same reason.
 
       // Three sign-in methods: a token (the Codar desktop's own login on this
       // machine, or one pasted from anywhere), one 「科搭OAuth登录」 page carrying
@@ -533,14 +546,14 @@ export async function CodarPlugin(input) {
         try {
           next = await refreshToken(token)
         } catch (e) {
-          // The host may keep this sentence (it writes failed renewals to its
-          // own file), and the request it came from carried the token: cut it
-          // here as every card line is cut, so nothing that echoes it back is
-          // ever stored.
+          // The host keeps a failed renewal's sentence in memory and shows or
+          // logs it (host.js's unrenewed, renewed:false), and the request it
+          // came from carried the token: cut it here as every card line is
+          // cut, so nothing that echoes it back is ever stored.
           if (typeof e?.message === "string") e.message = scrub(e.message, token) || "续期失败"
           throw e
         }
-        return signInResult(next)
+        return renewResult(next)
       },
 
       // No refreshLead: the host renews at its own lead (five minutes,

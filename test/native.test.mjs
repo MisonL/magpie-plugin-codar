@@ -871,7 +871,7 @@ test("the toolchain override variables are named for the release line", () => {
   }
 })
 
-test("a release refuses a package without every platform's build", async () => {
+test("a release refuses a package without every platform's build", { timeout: 60_000 }, async () => {
   const empty = mkdtempSync(join(tmpdir(), "codar-native-empty-"))
   const full = mkdtempSync(join(tmpdir(), "codar-native-full-"))
   const stub = mkdtempSync(join(tmpdir(), "codar-native-stub-"))
@@ -961,7 +961,7 @@ test("the gate names the platform package from either separator", async () => {
 })
 
 // the packed gate refuses a package that repeats the builds
-test("the tarball gate refuses a main package that carries the builds", async () => {
+test("the tarball gate refuses a main package that carries the builds", { timeout: 60_000 }, async () => {
   const { requireNativeBin } = await import("../scripts/tarball.mjs")
   const bare = mkdtempSync(join(tmpdir(), "codar-gate-bare-"))
   const empty = mkdtempSync(join(tmpdir(), "codar-gate-empty-"))
@@ -1345,7 +1345,7 @@ test("a start that failed says so, rather than blaming a missing platform packag
   }
 })
 
-test("a refused streamed answer read as text ends at the caller's own bound", NO_UNIX, async () => {
+test("a refused streamed answer read as text ends at the caller's own bound", { ...NO_UNIX, timeout: 60_000 }, async () => {
   // A chat request streams, and a refusal's body is read with text(). The
   // socket's deadline after a head is the stream's idle bound (five minutes),
   // so a refusal that named a body and never sent it kept text() — and the
