@@ -47,6 +47,12 @@ import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_B
 const signedInToken = (token) => ({ type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 })
 const signInResult = (token) => {
   signIns += 1
+  // A COMPLETED sign-in is the newest word on who the person is. An older
+  // attempt whose IP-check refusal landed while this one was in flight (the
+  // guard above could not see a completion that had not happened yet) may
+  // have just written its handover — it dies here, or the next page would
+  // open the other account's security check.
+  pendingVerify = null
   return signedInToken(token)
 }
 const renewResult = signedInToken

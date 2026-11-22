@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A background token renewal that finished while a password sign-in's login POST was in flight was counted as a newer sign-in (signInResult bumped the sign-in guard on every success, renewals included), so the attempt threw away its IP-check handover and the next 「科搭OAuth登录」 opened on the tabs instead of the security check. A renewal is not a sign-in: the kept-token result it returns no longer bumps the guard, and a test pins the interleaving.
+- A completed sign-in left an older attempt's IP-check handover standing when that attempt's refusal landed mid-flight (the guard could not see a completion that had not happened yet): for up to its ten minutes, the next 「科搭OAuth登录」 opened the OTHER account's security check, and passing it signed the wrong account in. A completed sign-in now clears the handover where it clears nothing else can. (Found by the pre-release review of 95ec2ac; a test pins the interleaving.)
 - Three wall-clock-sensitive tests (the two packed-tarball gate cases in test/native.test.mjs and the streamed-refusal read) ran under bun's five-second default and failed when the packed suite kept bun busy; each now names a sixty-second cap, as the streaming-cap test already did.
 
 ## [0.3.4] - 2026-11-21

@@ -959,6 +959,58 @@ test("a password attempt superseded by a newer sign-in does not leave its handov
   }
 })
 
+test("a handover that lands while a newer password attempt is in flight dies with it", async () => {
+  // Attempt A (account user_m1) is refused with the IP check; the refusal
+  // arrives while attempt B (user_m2) is still open. B started after A, so
+  // A's guard (signIns unchanged until someone COMPLETES) lets the handover
+  // be written — and then B completes. A completed sign-in is the newest
+  // word on who the person is: the handover must not survive it, or the
+  // next 「科搭OAuth登录」 opens as user_m1's security check.
+  const tempA = mkToken({ username: "user_m1", exp: Math.floor(Date.now() / 1000) + 600 })
+  const okB = mkToken({ username: "user_m2", exp: Math.floor(Date.now() / 1000) + 86400 })
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  // the macrotask hop guarantees A's refusal has run through authorize's
+  // catch (all microtasks) before B's login answer is delivered
+  let settle
+  const afterA = new Promise((r) => (settle = r))
+  let first = true
+  await withFetch(
+    {
+      "POST /v1/login": (url, init) => {
+        const who = JSON.parse(init.body).username
+        if (who === "user_m1") {
+          setTimeout(settle, 0)
+          return new Response(JSON.stringify({ code: 201, status: "ip_verify_required", username: "user_m1", phone: "13800138000", token: tempA }), { status: 200, headers: { "Content-Type": "application/json" } })
+        }
+        return afterA.then(() => {
+          if (first) {
+            first = false
+            return new Response(JSON.stringify({ code: 200, token: okB, username: "user_m2" }), { status: 200, headers: { "Content-Type": "application/json" } })
+          }
+          return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 })
+        })
+      },
+    },
+    async () => {
+      const a = password.authorize({ username: "user_m1", password: "pw1" })
+      const b = password.authorize({ username: "user_m2", password: "pw2" })
+      const outA = await a
+      const outB = await b
+      assert.equal(outA.type, "failed")
+      assert.equal(outB.type, "success", "B completed the sign-in")
+    },
+  )
+  const ctl = new AbortController()
+  const page = await sms.authorize({}, { signal: ctl.signal })
+  try {
+    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "B's completion took A's handover with it")
+  } finally {
+    ctl.abort()
+  }
+})
+
 test("a renewal landing while a password POST is in flight keeps its handover", async () => {
   // The host renews a stored sign-in on its own lead; when that renewal
   // finishes between the password attempt's start and its login answer, it
