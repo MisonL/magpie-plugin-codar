@@ -11,9 +11,10 @@
 // sidecar's own defaults.
 //
 // The binaries are not committed (`native/bin` is ignored). A release runs
-// `npm run native:all` before packing, so the tarball carries every platform;
-// a checkout that never ran it has no binary, and the plugin falls back to its
-// own fetch there — the suite and the tarball gate pass either way.
+// `npm run native:all` before staging, so each platform package carries its own
+// build (since 0.3.0 the main tarball carries none); a checkout that never ran
+// it has no binary, and the plugin falls back to its own fetch there — the suite
+// and the tarball gate pass either way.
 //
 // Usage: node scripts/build-native.mjs [--all] [--check [--strict]]
 //   (no flags)  build the targets this machine can build: its own platform,

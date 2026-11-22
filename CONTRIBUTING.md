@@ -97,10 +97,9 @@ node scripts/catalog.mjs --check   # is lib/catalog.mjs still what the vendor sa
 The tests stub `fetch`; nothing here talks to speedai. Fixtures follow the
 clock, so they don't expire on a given day. `test/style.test.mjs` pins the
 formatting rules in `.editorconfig` (LF, one final newline, no trailing
-whitespace, two-space indent) for `.mjs` and `.md` files, discovered from the
-tree (`.github` included; dot-directories such as `.git` are skipped), so a new one of those is
-covered the moment it lands. JSON and YAML indentation is `.editorconfig`'s
-convention only, not checked by the suite.
+whitespace, two-space indent) for `.mjs`, `.md`, `.json`, `.yml` and `.yaml` files,
+discovered from the tree (`.github` included; dot-directories such as `.git` are skipped),
+so a new one of those is covered the moment it lands.
 
 CI runs the suite on Node 20–24, on Bun across Linux / macOS / Windows, and on
 Node on Windows and macOS. A `tarball` job packs the artifact and runs the
@@ -157,6 +156,8 @@ one cannot be filled in faithfully after the fact. Then:
 ```bash
 npm run native:all                                  # the five platform builds
 npm version <patch|minor|major> -m "release: v%s"   # bumps package.json, commits, tags
+# npm version does NOT touch optionalDependencies: bump those five pins to the same version by hand,
+# or native-packages.mjs --check will refuse the staged set (this bit 0.3.1 — see its release entry).
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
