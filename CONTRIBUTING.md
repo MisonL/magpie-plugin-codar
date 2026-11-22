@@ -162,14 +162,14 @@ npm run native:all # the five platform builds, freshly
 # carries pins that match its own version.
 npm version <patch|minor|major> --no-git-tag-version # package.json's version only
 # then edit package.json's five optionalDependencies to the same version
-git add package.json CHANGELOG.md && git commit -m "release: v<version>"
+git add -u && git commit -m "release: v<version>" # or name every file the release touched
 git tag v<version>
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
 node scripts/native-packages.mjs --publish          # the five platform packages, first
-git push --follow-tags
 npm publish                                         # prepublishOnly re-runs the same gates: --strict builds, the packed suite and install check (--require-bun --require-builds), the staged set (--check)
+git push --follow-tags                              # after the packages are up: a tag pushed before a failed publish would be public alone
 gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
 ```
 
