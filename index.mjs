@@ -98,6 +98,16 @@ let pendingVerify = null
 // older attempt, and the SMS page must not be pointed at the older account.
 let signIns = 0
 
+// signFlows numbers sign-in ATTEMPTS as they start (a password try, an
+// OAuth page). A handover carries the number of the attempt that made it,
+// and a refusal may replace a standing one only when its own attempt
+// started no earlier: two attempts refused by the IP check can come back
+// in the opposite order from the one they started in, and the later
+// refusal — the flow the person is actually in — has to own the handover.
+// signIns above counts COMPLETED sign-ins; neither alone covers both
+// orders, the completion clear and the write order.
+let signFlows = 0
+
 // takePendingVerify answers the handover once, if it is still good. An entry
 // past its window is dropped rather than used — the vendor would refuse its
 // token anyway, and the page would be verifying an account the person no
@@ -341,6 +351,7 @@ export async function CodarPlugin(input) {
           async authorize(_inputs, { signal } = {}) {
             if (signal?.aborted) return { type: "failed", error: "登录已取消" }
             const startedAt = signIns
+            const myFlow = ++signFlows
             const pending = takePendingVerify()
             // Both vendor calls of a side are wrapped here: a refusal that
             // quotes what was sent must not print it on the page. The SMS code
@@ -433,7 +444,7 @@ export async function CodarPlugin(input) {
               // still expires on its original schedule) — unless a newer
               // sign-in finished while this one was setting up, in which case
               // the handover belongs to a flow the person has left.
-              if (pending && signIns === startedAt) pendingVerify = pending
+              if (pending && signIns === startedAt && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
               return { type: "failed", error: `无法打开登录页：${whyOf(e)}` }
             }
             // A sign-in cancelled while the page was being set up must not
@@ -444,7 +455,7 @@ export async function CodarPlugin(input) {
             // fails to open at all.
             if (signal?.aborted) {
               page.close()
-              if (pending && signIns === startedAt) pendingVerify = pending
+              if (pending && signIns === startedAt && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
               return { type: "failed", error: "登录已取消" }
             }
             const onAbort = () => page.close()
@@ -506,6 +517,7 @@ export async function CodarPlugin(input) {
             // SMS page as if it were.
             pendingVerify = null
             const startedAt = signIns
+            const myFlow = ++signFlows
             try {
               const got = await login(username, password)
               return signInResult(got.token)
@@ -522,7 +534,10 @@ export async function CodarPlugin(input) {
               // newer flow: its account, not this one, is who the person is
               // signing in as, and this refusal's handover is already stale.
               const pending = signIns === startedAt ? verifyPendingOf(e, username) : null
-              if (pending) pendingVerify = pending
+              // A handover a later-started attempt wrote is not this one's to
+              // replace: that refusal belongs to the flow the person started
+              // after this one, and it may well have returned first.
+              if (pending && (pendingVerify === null || (pendingVerify.flow ?? 0) <= myFlow)) pendingVerify = { ...pending, flow: myFlow }
               return { type: "failed", error: scrubLine(scrubLine(signInFailure(e), username), password) }
             }
           },
