@@ -1080,6 +1080,59 @@ test("a handover that lands while a newer password attempt is in flight dies wit
   }
 })
 
+test("a refusal that lands after its rival's handover was taken does not resurrect", async () => {
+  // A (started first) hangs; B (started second) is refused and writes; the
+  // OAuth page TAKES B's handover — the slot is empty now — and only then A's
+  // refusal returns. The flow comparison guards a STANDING handover; an
+  // empty slot let A write, and the next page opened A's security check
+  // after the person had already been shown B's. The slot remembers the
+  // newest attempt whose handover was taken, and a refusal below that line
+  // writes nothing.
+  const tempA = mkToken({ username: "user_tA", exp: Math.floor(Date.now() / 1000) + 600 })
+  const tempB = mkToken({ username: "user_tB", exp: Math.floor(Date.now() / 1000) + 600 })
+  let releaseA
+  const aHeld = new Promise((r) => (releaseA = r))
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  const refusal = (who, temp) => new Response(JSON.stringify({ code: 201, status: "ip_verify_required", username: who, phone: "13800138000", token: temp }), { status: 200, headers: { "Content-Type": "application/json" } })
+  let ctl1
+  let first
+  await withFetch(
+    {
+      "POST /v1/login": (url, init) => {
+        const who = JSON.parse(init.body).username
+        if (who === "user_tA") return aHeld.then(() => refusal(who, tempA))
+        return Promise.resolve(refusal(who, tempB))
+      },
+    },
+    async () => {
+      const a = password.authorize({ username: "user_tA", password: "pwA" })
+      await new Promise((r) => setTimeout(r, 20))
+      await password.authorize({ username: "user_tB", password: "pwB" })
+      // the page TAKES B's handover; it stays open until fetched below,
+      // after the stub leaves the global fetch
+      ctl1 = new AbortController()
+      first = await sms.authorize({}, { signal: ctl1.signal })
+      releaseA()
+      await a
+    },
+  )
+  try {
+    assert.match(await (await fetch(first.url)).text(), /user_tB/, "B's handover reached the page")
+  } finally {
+    ctl1.abort()
+  }
+  // only now does A's slow refusal land, into the emptied slot
+  const ctl = new AbortController()
+  const page = await sms.authorize({}, { signal: ctl.signal })
+  try {
+    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "an older refusal does not refill a taken slot")
+  } finally {
+    ctl.abort()
+  }
+})
+
 test("a renewal landing while a password POST is in flight keeps its handover", async () => {
   // The host renews a stored sign-in on its own lead; when that renewal
   // finishes between the password attempt's start and its login answer, it

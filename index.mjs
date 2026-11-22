@@ -107,6 +107,11 @@ let signIns = 0
 // signIns above counts COMPLETED sign-ins; neither alone covers both
 // orders, the completion clear and the write order.
 let signFlows = 0
+// takenFlow is the newest attempt whose handover the page TOOK. A slot
+// emptied by a take is not open again to every writer: an older attempt's
+// refusal returning late found the slot empty, passed the standing-handover
+// comparison, and refilled it with the account the person had left behind.
+let takenFlow = 0
 
 // takePendingVerify answers the handover once, if it is still good. An entry
 // past its window is dropped rather than used — the vendor would refuse its
@@ -115,6 +120,7 @@ let signFlows = 0
 const takePendingVerify = () => {
   const got = pendingVerify
   pendingVerify = null
+  if (got) takenFlow = Math.max(takenFlow, got.flow ?? 0)
   if (!got || !(Date.now() - got.at <= PENDING_VERIFY_MS)) return null
   return got
 }
@@ -444,7 +450,7 @@ export async function CodarPlugin(input) {
               // still expires on its original schedule) — unless a newer
               // sign-in finished while this one was setting up, in which case
               // the handover belongs to a flow the person has left.
-              if (pending && signIns === startedAt && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
+              if (pending && signIns === startedAt && (pending.flow ?? 0) >= takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
               return { type: "failed", error: `无法打开登录页：${whyOf(e)}` }
             }
             // A sign-in cancelled while the page was being set up must not
@@ -455,7 +461,7 @@ export async function CodarPlugin(input) {
             // fails to open at all.
             if (signal?.aborted) {
               page.close()
-              if (pending && signIns === startedAt && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
+              if (pending && signIns === startedAt && (pending.flow ?? 0) >= takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
               return { type: "failed", error: "登录已取消" }
             }
             const onAbort = () => page.close()
@@ -537,7 +543,7 @@ export async function CodarPlugin(input) {
               // A handover a later-started attempt wrote is not this one's to
               // replace: that refusal belongs to the flow the person started
               // after this one, and it may well have returned first.
-              if (pending && (pendingVerify === null || (pendingVerify.flow ?? 0) <= myFlow)) pendingVerify = { ...pending, flow: myFlow }
+              if (pending && myFlow > takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= myFlow)) pendingVerify = { ...pending, flow: myFlow }
               return { type: "failed", error: scrubLine(scrubLine(signInFailure(e), username), password) }
             }
           },

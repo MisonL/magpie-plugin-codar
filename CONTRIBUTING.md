@@ -164,6 +164,7 @@ npm version <patch|minor|major> --no-git-tag-version # package.json's version on
 # then edit package.json's five optionalDependencies to the same version
 git add -u && git commit -m "release: v<version>" # or name every file the release touched
 git tag v<version>
+node scripts/build-native.mjs --check --strict      # the five builds are real — headers, bits, no stub — before any of them is staged, published, or shipped
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
