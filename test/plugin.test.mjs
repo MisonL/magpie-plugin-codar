@@ -347,6 +347,29 @@ test("a captcha that failed to load can be asked for again from the tab", async 
   }
 })
 
+test("the end screen's halo glows behind the mark, and its still frame is its end state", async () => {
+  // The halo is an ::after over the mark: positioned pseudo-elements paint
+  // above in-flow content, so it sat over the white tick, and with
+  // animations off it rested at opacity 1 / scale 1 — heavier than the
+  // animation's own end frame. It is pushed behind the mark (z-index -1
+  // inside the block's own stacking context) and its base carries the end
+  // state, so reduced motion shows the finished glow, not a stronger one.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const page = await startSignIn({ sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }) })
+  try {
+    const html = await (await fetch(page.url)).text()
+    const after = /\.end \.mark::after \{([^}]*)\}/.exec(html)?.[1] ?? ""
+    assert.match(after, /z-index: -1/, "the halo paints behind the mark, not over the tick")
+    assert.match(after, /opacity: \.7/, "its still frame is the end opacity")
+    assert.match(after, /transform: scale\(1\.05\)/, "and the end scale")
+    assert.match(html, /\.end \{[^}]*isolation: isolate/, "the centred block owns its stacking context, or the -1 layer falls behind the card")
+    const halo = /@keyframes halo \{(.*)\}/.exec(html)?.[1] ?? ""
+    assert.match(halo, /to \{ transform: scale\(1\.05\); opacity: \.7 \}/, "the keyframe ends where the base sits")
+  } finally {
+    page.close()
+  }
+})
+
 test("the SMS page sends a code only with a solved captcha, then trades the code for a token", async () => {
   const { startSignIn } = await import("../lib/signinpage.mjs")
   const sent = []
