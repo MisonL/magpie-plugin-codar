@@ -9,7 +9,7 @@ import { execFile, execFileSync, spawn } from "node:child_process"
 import { test } from "node:test"
 import { createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -1728,6 +1728,77 @@ test("a release ships each build as its own package, and the main package names 
   }
   } finally {
     for (const dir of [bin, out]) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a sweep drops only dead, aged directories under our prefix", async () => {
+  // The rule sweepStaleDirs follows, pinned against a root of its own so no
+  // real proxy can be caught in it: under the prefix, past the grace, and
+  // answering nothing. Every shape a real machine grew — ready.json naming a
+  // vanished socket (a transient CLI host's death), a plain file wearing the
+  // socket's name (the double kill that ran no exit handler), nothing at all,
+  // and the shapes that must survive: one live socket, a fresh start, a name
+  // outside the prefix, a directory that cannot be read.
+  const { sweepStaleDirs } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-sweep-test-"))
+  const past = new Date(Date.now() - 60000)
+  const mk = (name) => {
+    const dir = join(root, name)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    return dir
+  }
+  // a directory's mtime follows its last content write, so the age is set
+  // after the shapes are filled, the way a dead proxy's directory sits
+  // untouched from its death onward
+  const age = (dir) => utimesSync(dir, past, past)
+  try {
+    const readyGone = mk("codar-plugin-gone001")
+    writeFileSync(join(readyGone, "ready.json"), JSON.stringify({ transport: "unix", address: join(readyGone, "proxy.sock"), token: "aa" }))
+    age(readyGone)
+    const staleSock = mk("codar-plugin-oldc002")
+    writeFileSync(join(staleSock, "proxy.sock"), "a plain file where a socket was")
+    age(staleSock)
+    const empty = mk("codar-plugin-nada003")
+    age(empty)
+    const live = mk("codar-plugin-live004")
+    const fresh = mk("codar-plugin-fresh5")
+    writeFileSync(join(fresh, "ready.json"), "{}")
+    const unrelated = mk("codar-plugins-other6")
+    writeFileSync(join(unrelated, "ready.json"), "{}")
+    age(unrelated)
+    const unreadable = mk("codar-plugin-hush007")
+    writeFileSync(join(unreadable, "ready.json"), "{}")
+    age(unreadable)
+
+    // one real server answers inside `live`, at the address its ready names
+    const sock = join(live, "proxy.sock")
+    const server = createServer()
+    await new Promise((r, rej) => {
+      server.once("error", rej)
+      server.listen(sock, r)
+    })
+    writeFileSync(join(live, "ready.json"), JSON.stringify({ transport: "unix", address: sock }))
+    age(live)
+    chmodSync(unreadable, 0o000)
+    try {
+      const removed = await sweepStaleDirs({ root, minAgeMs: 30000 })
+      assert.ok(removed.includes(readyGone), "ready.json over a vanished socket is a dead proxy")
+      assert.ok(removed.includes(staleSock), "a plain file wearing the socket's name is dead too")
+      assert.ok(removed.includes(empty), "an empty aged directory under our prefix is ours to drop")
+      assert.ok(!existsSync(readyGone) && !existsSync(staleSock) && !existsSync(empty), "and gone for real")
+      assert.ok(!removed.includes(live), "a socket that answers is a running proxy — kept however old")
+      assert.ok(!removed.includes(fresh), "inside the grace: not judged yet")
+      assert.ok(!removed.includes(unrelated), "outside the prefix: never ours")
+      assert.ok(!removed.includes(unreadable), "unreadable: skipped, not crashed on")
+      assert.ok(existsSync(live) && existsSync(fresh) && existsSync(unrelated) && existsSync(unreadable))
+      assert.equal((await sweepStaleDirs({ root, minAgeMs: 30000 })).length, 0, "a second sweep finds nothing new")
+    } finally {
+      server.close()
+      try { unlinkSync(sock) } catch {}
+      chmodSync(unreadable, 0o700)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 

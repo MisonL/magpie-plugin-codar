@@ -1500,6 +1500,86 @@ test("the scan status reads the vendor's words as the page's own states", () => 
   }
 })
 
+test("a leaked page link cannot stack vendor long-polls or churn the QR code", async () => {
+  // The SMS side keeps its own server-side cooldown and submit budget, so a
+  // script that found the page's URL stops at the listener. The QR side had
+  // nothing: every /qr asked the vendor for a fresh code and every /status
+  // held one of the vendor's long-polls open, and a hundred in parallel is a
+  // hundred open requests behind the page's random path. The listener now
+  // takes one live call per route at a time — the page itself always waits
+  // for the answer before asking again, so a person never meets the rule —
+  // and each route carries a generous total for the listener's whole life.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  let qrAsked = 0
+  let statusAsked = 0
+  let holdRelease
+  const hold = new Promise((r) => (holdRelease = r))
+  const page = await startSignIn({
+    qrcode: async () => {
+      qrAsked += 1
+      return { scene: "scene-1", qrUrl: "https://codar-web.speedai.com/qr.png" }
+    },
+    status: async () => {
+      statusAsked += 1
+      await hold
+      return { state: "waiting" }
+    },
+    maxQrCalls: 2,
+    maxStatusCalls: 2,
+  })
+  const post = async (route, body = {}) => {
+    const res = await fetch(`${page.url}${route}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    return { status: res.status, json: await res.json().catch(() => null) }
+  }
+  try {
+    // one live poll: the second, while the first is still open, is refused
+    // here and the vendor is never held twice
+    const first = post("status", { scene: "scene-1" })
+    await new Promise((r) => setTimeout(r, 10))
+    let stacked
+    try {
+      stacked = await post("status", { scene: "scene-1" })
+    } finally {
+      holdRelease()
+    }
+    assert.equal(stacked.status, 429, "a stacked poll is refused")
+    assert.equal(statusAsked, 1, "and the vendor saw only the first")
+    assert.equal((await first).status, 200, "the live poll answered normally")
+
+    // sequential polls keep working until the route's own total
+    const again = await post("status", { scene: "scene-1" })
+    assert.equal(again.status, 200, "a page polling at its own pace is not punished")
+    const spent = await post("status", { scene: "scene-1" })
+    assert.equal(spent.status, 429, "past the budget the listener answers, not the vendor")
+    assert.equal(statusAsked, 2, "the refused call never left the page")
+
+    // the QR route: same shape, its own total
+    assert.equal((await post("qr")).status, 200)
+    assert.equal((await post("qr")).status, 200)
+    const churn = await post("qr")
+    assert.equal(churn.status, 429, "the third code is refused here")
+    assert.equal(qrAsked, 2, "the vendor issued only the two")
+    assert.match(churn.json.error ?? "", /过多/, "a refusal words the limit")
+
+    // the budget is the listener's own: a fresh page starts fresh
+    const page2 = await startSignIn({
+      qrcode: async () => ({ scene: "s", qrUrl: "https://codar-web.speedai.com/x.png" }),
+      status: async () => ({ state: "waiting" }),
+      maxQrCalls: 2,
+      maxStatusCalls: 2,
+    })
+    try {
+      assert.equal(await post2(page2, "qr"), 200, "a new page gets its own budget")
+    } finally {
+      page2.close()
+    }
+  } finally {
+    page.close()
+  }
+})
+
+const post2 = async (page, route, body = {}) => (await fetch(`${page.url}${route}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).status
+
 test("the QR page shows the vendor's image, polls to a token, and never sees the token", async () => {
   const { startSignIn } = await import("../lib/signinpage.mjs")
   const asked = []
