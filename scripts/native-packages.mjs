@@ -25,7 +25,7 @@
 // must carry for the packages to be reached.
 
 import { spawnSync } from "node:child_process"
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -73,6 +73,10 @@ export function stagePackages({ bin, out, version, targets = buildTargets }) {
     if (!existsSync(source) || statSync(source).size < 4096) throw new Error(`${p.name}: no build at ${source}; run npm run native:all first`)
     const dir = join(out, p.name)
     const dest = join(dir, "bin", p.file)
+    // a staging directory that outlived its release would otherwise ship its
+    // stale files beside this build: npm packs what is there, not what was
+    // just copied. The whole package directory is this release's to write.
+    rmSync(dir, { recursive: true, force: true })
     mkdirSync(join(dir, "bin"), { recursive: true })
     copyFileSync(source, dest)
     chmodSync(dest, 0o755)

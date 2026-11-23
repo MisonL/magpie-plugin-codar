@@ -78,7 +78,10 @@ The account's name and password are sent in one request, `POST /v1/login {userna
 
 ```bash
 node --test                       # the whole suite (installs packages from a
-                                  # registry served on 127.0.0.1; no vendor calls)
+                                  # registry served on 127.0.0.1; no vendor calls;
+                                  # one preflight reads registry.npmjs.org for
+                                  # what is already published — CODAR_OFFLINE=1
+                                  # skips it)
 bun test                          # the runtime magpie actually loads plugins on
 node scripts/catalog.mjs --check  # is lib/catalog.mjs still what the vendor says?
 node scripts/catalog.mjs          # regenerate it from the signed-in app
@@ -89,6 +92,13 @@ node scripts/native-packages.mjs  # stage the platform packages (native/packages
 ```
 
 The proxy needs a Go toolchain to build (`scripts/build-native.mjs` fetches the 1.24.3 and 1.26.7 toolchains through `GOTOOLCHAIN`), but nothing in the suite invokes that toolchain: it runs a real built proxy in two places — one test kills the host of the checkout's own build, and the install check below starts the proxy a package manager installed from the platform packages — and everywhere else `test/native.test.mjs` drives the client against a socket of its own, `native/cmd/codar-proxy/main_test.go` pins what the proxy sends and how it decides, and the tests that need a running proxy start a scripted stand-in through `CODAR_PROXY_BIN` instead (it speaks unix sockets only, and skips where that does not exist). On Windows the proxy itself listens on loopback TCP rather than a unix socket. The built binaries are not committed (`.gitignore` keeps `native/bin` out), so a checkout without a build simply uses fetch.
+
+Two environment variables exist for troubleshooting the native transport:
+`CODAR_PLUGIN_DISABLE_NATIVE=1` turns the proxy off (every request takes the
+plain fetch, and the tests that need a proxy skip), and `CODAR_PROXY_RETRY_MS`
+sets the pause before a failed proxy start is tried again (default 30 000).
+`CODAR_PROXY_BIN` names a different executable — the tests use it for their
+scripted stand-in.
 
 `lib/catalog.mjs` is generated with the plugin's own reader (`catalogOf`), so the fallback and the live list are built by the same rules. Its exit codes keep failures apart: `0` the run succeeded (`--check`: nothing moved), `1` a record moved (`--check` only), `2` the run could not finish — the vendor's answer was a refusal or its shape had moved (no list, a record with no context window), the local file could not be read or written, or an argument was not one it knows (only `--check` is). A failed run writes nothing and never empties the fallback. It needs a signed-in app, so it is a local command, not a CI step.
 
@@ -117,7 +127,7 @@ leaves nothing behind once the proxy it started sees its stdin close.
 
 A package manager installs the one whose `os`/`cpu` match the machine and skips
 the other four, so an install is one 5.8–6.6 MB build (2.4–2.8 MB of tarball,
-plus the main package's 0.33 MB) instead of all five: 32.0 MB unpacked became
+plus the main package's 0.4 MB) instead of all five: 32.0 MB unpacked became
 about 7 MB on disk and a 13.3 MB download became about 3 MB. The `cpu` field is
 npm's spelling — `x64`, never Go's `amd64`, which npm refuses outright with
 `EBADPLATFORM` — while the binary inside keeps the Go-flavoured file name

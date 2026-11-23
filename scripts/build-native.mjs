@@ -22,10 +22,12 @@
 //               linux (CGO is off, so cross-compiling within an OS is free)
 //   --all       build every target
 //   --check     report what the binary directory holds, build none
-//   --strict    with --check, exit 1 unless every target is present and looks
-//               like a build for its platform (the release gate: a published
-//               package must carry all five, and a truncated or empty file
-//               with the right name must not pass for one)
+//   --strict    with --check, exit 1 unless every target is present, looks
+//               like a build for its platform, and is newer than the proxy's
+//               own source (the release gate: a published package must carry
+//               all five, a truncated or empty file with the right name must
+//               not pass for one, and a build made before the source it
+//               names must not ship as that source's)
 //
 // Environment: GO, to name the go command (default "go"); GO_1_24 and GO_1_26
 // to name the 1.24.3 and 1.26.7 toolchains (defaults "go1.24.3" and
@@ -140,12 +142,36 @@ const archOf = (head, goos) => {
   return arches
 }
 
+// newestSourceMtime is when the proxy's own source last changed — the .go
+// files under native/cmd, the content each build carries. A build older than
+// one of them was made from something else; the release line once shipped
+// builds made before the source they named, and a header-shaped file cannot
+// tell anyone that. go.mod is left out on purpose: the build loop rewrites it
+// per target and restores it after the last build, so its mtime says nothing
+// about the binaries.
+export const newestSourceMtime = (srcDir = join(root, "cmd")) => {
+  let newest = 0
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) walk(path)
+      else if (entry.name.endsWith(".go")) newest = Math.max(newest, statSync(path).mtimeMs)
+    }
+  }
+  try {
+    walk(srcDir)
+  } catch {
+    return 0
+  }
+  return newest
+}
+
 // inspectTarget reports one target's state in a directory: "present" when the
 // file is a non-empty, executable, correctly-flavoured build; "missing" when
 // it is not there; "broken" with a reason when it is there but cannot be what
 // the plugin will exec. The name used to be the whole check, which let an
 // empty file (or a `.gitignore`d placeholder) pass for a release.
-export const inspectTarget = (dir, t) => {
+export const inspectTarget = (dir, t, sourceMtime = 0) => {
   const name = binaryName(t)
   const path = join(dir, name)
   let stat
@@ -181,12 +207,16 @@ export const inspectTarget = (dir, t) => {
   if (t.goos !== "windows" && process.platform !== "win32" && (stat.mode & 0o111) === 0) {
     return { name, state: "broken", reason: "not executable" }
   }
+  if (sourceMtime > 0 && stat.mtimeMs < sourceMtime) {
+    return { name, state: "broken", reason: "older than its source; run node scripts/build-native.mjs --all" }
+  }
   return { name, state: "present" }
 }
 
 // checkTargets is the whole directory, in the table's order: what --check
 // prints and --strict refuses.
-export const checkTargets = (dir = out) => targets.map((t) => inspectTarget(dir, t))
+export const checkTargets = (dir = out, sourceMtime = newestSourceMtime()) =>
+  targets.map((t) => inspectTarget(dir, t, sourceMtime))
 
 // missingTargets is the builds a directory does not have, by file name: what
 // --check reports, and what --strict refuses.

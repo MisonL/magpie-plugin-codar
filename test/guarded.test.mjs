@@ -323,6 +323,13 @@ test("the rule keeps the origin it was given, port included", () => {
   assert.equal(hopOf(vendor, at, "/v1/models"), vendor + "/v1/models")
   assert.equal(hopOf(vendor, at, vendor + "/v1"), vendor + "/v1")
   assert.equal(hopOf(vendor, at, "https://api.claw.speedai.com:8443/v1"), null)
+  // the Go proxy refuses any port written at all; the origin has none to
+  // repeat, so even :443 — which parses away into the same origin — is a
+  // portful name and no hop, keeping the two transports' rule one rule
+  assert.equal(hopOf(vendor, at, "https://api.claw.speedai.com:443/v1"), null)
+  // and a protocol-relative Location writes its port the same way
+  assert.equal(hopOf(vendor, at, "//api.claw.speedai.com:443/v1"), null)
+  assert.equal(hopOf(vendor, at, "//api.claw.speedai.com/v1"), vendor + "/v1")
   assert.equal(hopOf(vendor, at, "https://api.claw.speedai.com.evil.example/v1"), null)
   assert.equal(hopOf(vendor, at, "https://evil.example/api.claw.speedai.com"), null)
   assert.equal(hopOf(vendor, at, "http://api.claw.speedai.com/v1"), null)

@@ -164,7 +164,7 @@ npm version <patch|minor|major> --no-git-tag-version # package.json's version on
 # then edit package.json's five optionalDependencies to the same version
 git add -u && git commit -m "release: v<version>" # or name every file the release touched
 git tag v<version>
-node scripts/build-native.mjs --check --strict      # the five builds are real — headers, bits, no stub — before any of them is staged, published, or shipped
+node scripts/build-native.mjs --check --strict      # the five builds are real — headers, bits, no stub, newer than the proxy's source — before any of them is staged, published, or shipped
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
@@ -199,14 +199,16 @@ scripts/native-packages.mjs --publish` stages all five from `native/bin` and
 publishes them; `--check` says what is staged and refuses a version that is not
 the main package's. `prepublishOnly` starts with
 `node scripts/build-native.mjs --check --strict`, which refuses a release that
-has no build (or only a stub where one belongs) for any platform, and then runs
-the tarball gate with `--require-bun --require-builds`, which installs the
-packed main package in a scratch project with bun and with npm and requires
-each install to land this machine's platform package and start its proxy. Neither check can tell a fresh build from
-an old one: `--strict` reads presence, headers and the executable bit, and the
-staged packages are whatever `native/bin` held. Running `npm run native:all`
-first is the release step that keeps them current, and a build made before the
-release's source change looks exactly like one made after it.
+has no build (or only a stub where one belongs) for any platform — and a build
+older than the proxy's own source, so a binary made before the change the
+release ships cannot pass for it — and then runs the tarball gate with
+`--require-bun --require-builds`, which installs the packed main package in a
+scratch project with bun and with npm and requires each install to land this
+machine's platform package and start its proxy. The freshness rule is the
+built file's mtime against the newest `.go` under `native/cmd`; a copy that
+traveled by archive or a clock skewed backwards still needs `npm run
+native:all` (or `node scripts/build-native.mjs --all`) run in this checkout
+before the release.
 
 An install is one platform's build: `npm install magpie-plugin-codar` (or bun)
 pulls the ~2.5 MB package whose `os`/`cpu` match the machine and skips the other

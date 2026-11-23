@@ -3518,8 +3518,10 @@ test("the token sign-in reads this machine's Codar login, and takes a pasted one
   assert.match((await tokenMethod.authorize({ token: mkToken({ exp: Math.floor(Date.now() / 1000) + 60 }) })).error, /没有账号名/, "a token that names no account is refused")
   assert.match((await tokenMethod.authorize({ token: mkToken({ username: "user_9", exp: 1 }) })).error, /已过期/, "a lapsed token is refused, not saved")
 
-  // a file the app would leave: nested provider → speedai → token
-  const dir = mkdtempSync(join(tmpdir(), "codar-plugin-"))
+  // a file the app would leave: nested provider → speedai → token. The
+  // directory name avoids the proxy sweep's own prefix: a fixture that idled
+  // past the grace beside a real start's sweep would be somebody's dead shell.
+  const dir = mkdtempSync(join(tmpdir(), "codar-appcfg-"))
   const file = join(dir, "config.json")
   const token = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 86400 })
   writeFileSync(file, JSON.stringify({ provider: { speedai: { token, username: "user_1" } } }))
@@ -3783,7 +3785,7 @@ test("without CODAR_HOME the file is the app's under the home directory", () => 
 test("a token with no account name is refused at sign-in, not saved", () => {
   // Every call the plugin makes sends the account name from the token's own
   // claims. A token without one used to be saved and then fail on the card.
-  const dir = mkdtempSync(join(tmpdir(), "codar-plugin-"))
+  const dir = mkdtempSync(join(tmpdir(), "codar-appcfg-"))
   const file = join(dir, "config.json")
   const nameless = mkToken({ exp: Math.floor(Date.now() / 1000) + 86400 })
   writeFileSync(file, JSON.stringify({ provider: { speedai: { token: nameless } } }))

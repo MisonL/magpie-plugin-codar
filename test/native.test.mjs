@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { binaryPath, chatFetch, closeProxy, hosts, officialURL, proxyFetch, sendVia } from "../lib/native.mjs"
 import { binaryFile } from "../native/binary-name.mjs"
-import { binaryName as builtName, buildTargets, missingTargets, toolchainFor } from "../scripts/build-native.mjs"
+import { binaryName as builtName, buildTargets, inspectTarget, missingTargets, newestSourceMtime, toolchainFor } from "../scripts/build-native.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -895,6 +895,31 @@ test("a release refuses a package without every platform's build", { timeout: 60
           resolve({ code: e?.code ?? 0, stdout }),
         )
       })
+    // A build made before the source it claims to be: the header, size and
+    // mode are a real build's, so only the clock can say it predates main.go.
+    // The suite's own fixtures get their freshness from the source's time.
+    const freshSource = newestSourceMtime()
+    // older than the source, not merely "a day ago": a checkout's .go files
+    // may themselves be days old
+    const older = new Date(freshSource - 60 * 60 * 1000)
+    const utime = (path) => utimesSync(path, older, older)
+    assert.ok(freshSource > 0, "the source has no .go files to date the builds by")
+    for (const os of ["darwin", "linux"]) {
+      for (const arch of ["arm64", "amd64"]) utime(join(full, binaryFile(os, arch)))
+    }
+    utime(join(full, binaryFile("win32", "amd64")))
+    const stale = await run(full)
+    assert.equal(stale.code, 1, "a build older than its source passed the strict check")
+    assert.match(stale.stdout, /broken codar-proxy-darwin-arm64: older than its source/)
+    const row = inspectTarget(full, { os: "darwin", arch: "arm64", goos: "darwin" }, freshSource)
+    assert.equal(row.reason, "older than its source; run node scripts/build-native.mjs --all")
+    // restored to now, the same files are this source's builds again
+    const now = new Date()
+    for (const os of ["darwin", "linux"]) {
+      for (const arch of ["arm64", "amd64"]) utimesSync(join(full, binaryFile(os, arch)), now, now)
+    }
+    utimesSync(join(full, binaryFile("win32", "amd64")), now, now)
+
     const refused = await run(empty)
     assert.equal(refused.code, 1, "the strict check passed with no builds")
     assert.match(refused.stdout, /missing codar-proxy-darwin-arm64/)
@@ -1689,6 +1714,15 @@ test("a release ships each build as its own package, and the main package names 
     }
     assert.match(refused?.message ?? "", /no build/, "staging a platform with no build did not refuse")
 
+    // A staging area that outlived its release must not ship its stale files
+    // beside this build: npm packs the directory as it is, not what the copy
+    // wrote. Re-staging replaces each package directory whole.
+    const stale = join(out, packageName("darwin", "arm64"), "bin", "STALE-SHOULD-SHIP")
+    writeFileSync(stale, "left over from an earlier release")
+    stagePackages({ bin, out, version })
+    assert.ok(!existsSync(stale), "a stale file in the staging area was packed with the build")
+    assert.deepEqual(checkPackages({ dir: out, version }).filter((r) => r.state !== "present"), [], "re-staging left the packages broken")
+
     // What the main package must say for the platform packages to be reached.
     const good = {
       name: "magpie-plugin-codar",
@@ -1755,22 +1789,99 @@ test("the packaging CLI answers a broken start with one line, not a stack", { ti
   }
 })
 
+test("the start's own fresh directory is never the sweep's victim, whatever its mtime", { ...NO_UNIX }, async () => {
+  // The grace is the only other thing standing between a just-made directory
+  // and the sweep: a suspended start or a clock jump past it would make the
+  // start's own directory look dead. Its name is named to the sweep instead.
+  const { sweepStaleDirs } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-sweep-own-"))
+  const dir = join(root, "codar-plugin-own0001")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const past = new Date(Date.now() - 60000)
+  utimesSync(dir, past, past)
+  try {
+    assert.deepEqual(await sweepStaleDirs({ root, minAgeMs: 30000, skip: [dir] }), [], "the named directory was swept")
+    assert.ok(existsSync(dir))
+    assert.deepEqual(await sweepStaleDirs({ root, minAgeMs: 30000 }), [dir], "unnamed, the same directory is a dead shell")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("a refused address is death: the probe answers false", async () => {
-  // the other half of the rule — nothing listening at a loopback port
-  // answers ECONNREFUSED inside the window, and that shell can go.
+  // the other half of the rule — a loopback address with nothing listening
+  // answers ECONNREFUSED inside the window, and that shell can go. Port 1 is
+  // the fixture: bind-and-release would race every other test's listen(0)
+  // for the freed port, and the connect that found a new owner would keep a
+  // dead shell forever.
   const { probeAnswering } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "codar-probe-refuse-"))
   const dir = join(root, "codar-plugin-refus1")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
-  // bind a port, then release it: a connect there is refused outright
-  const server = createServer()
-  await new Promise((r) => server.listen(0, "127.0.0.1", r))
-  const port = server.address().port
-  await new Promise((r) => server.close(r))
-  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: `127.0.0.1:${port}` }))
+  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1" }))
   try {
     assert.equal(await probeAnswering(dir), false, "a refused port says nobody is home")
   } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a ready that names something the sweep will not dial leaves the shell alone", async () => {
+  // "refused at every address it publishes" only when every address was
+  // actually dialled. A foreign host, an address an older build wrote, a
+  // port the range does not hold — each is unproven, not dead, and a live
+  // directory must not go over a question the sweep declined to ask.
+  const { probeAnswering } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-probe-unproven-"))
+  const shapes = {
+    "a foreign host": { transport: "tcp", address: "10.255.255.1:65000" },
+    "a bracketed all-interfaces address": { transport: "tcp", address: "[::]:41234" },
+    "a port past the range": { transport: "tcp", address: "127.0.0.1:70000" },
+    "a transport this sweep does not know": { transport: "udp", address: "127.0.0.1:1" },
+    "unreadable JSON": "{ not json",
+  }
+  try {
+    for (const [label, ready] of Object.entries(shapes)) {
+      const dir = join(root, "codar-plugin-" + label.replace(/\W+/g, "").slice(0, 12) + Math.random().toString(36).slice(2, 6))
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writeFileSync(join(dir, "ready.json"), typeof ready === "string" ? ready : JSON.stringify(ready))
+      assert.equal(await probeAnswering(dir), true, `${label}: a shell the sweep could not judge was declared dead`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a live loopback TCP proxy is kept, and a Unix socket that answers is kept", { ...NO_UNIX, timeout: 30_000 }, async () => {
+  // The Unix side is covered by the sweep test; the TCP side is what Windows
+  // ships, and no other test holds a live listener there.
+  const { probeAnswering } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-probe-live-"))
+  const server = createServer()
+  try {
+    await new Promise((r, rej) => {
+      server.once("error", rej)
+      server.listen({ host: "127.0.0.1", port: 0 }, r)
+    })
+    const { port } = server.address()
+    const dir = join(root, "codar-plugin-tcpalive")
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: `127.0.0.1:${port}` }))
+    assert.equal(await probeAnswering(dir), true, "a listener answering on loopback was declared dead")
+    // the bracketed IPv6 form a proxy could write, through the shared parser:
+    // a real listener on ::1, or a skip on a host without IPv6 loopback
+    const six = createServer()
+    const got6 = await new Promise((r) => {
+      six.once("error", () => r(false))
+      six.listen({ host: "::1", port: 0 }, () => r(true))
+    })
+    if (got6) {
+      writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: `[::1]:${six.address().port}` }))
+      assert.equal(await probeAnswering(dir), true, "the bracketed IPv6 form was not parsed")
+      await new Promise((r) => six.close(r))
+    }
+  } finally {
+    await new Promise((r) => server.close(r))
     rmSync(root, { recursive: true, force: true })
   }
 })

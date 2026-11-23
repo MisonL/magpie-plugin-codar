@@ -818,7 +818,7 @@ export async function CodarPlugin(input) {
         // A success word the sentence then denies ("…successful? No, not
         // yet") is no claim: the bare code:200 beside it used to settle the
         // day anyway, and the 2xx branch read it as a claim.
-        const successDenied = (words) => successWord(words) && !failedWords(words) && negatedAt(words, words.search(/成功(?!率)|\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\b/i), true)
+        const successDenied = (words) => successWord(words) && !failedWords(words) && negatedAt(words, head(words).search(/成功(?!率)|\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\b/i), true)
 
         // claimDenied is the day's statement said and then denied: the
         // "already claimed" wording appears, but a negation turns it into
@@ -829,7 +829,7 @@ export async function CodarPlugin(input) {
         // because the pair alone settles a day the vendor said was not
         // claimed, and the card then reports a claim that never happened.
         const claimDenied = (words) => {
-          const m = ALREADY_CLAIMED.exec(words)
+          const m = ALREADY_CLAIMED.exec(head(words))
           return Boolean(m) && negatedAt(words, m.index, true)
         }
         // waitIn says how long a refusal lasts, without saying it twice: request()
@@ -1750,7 +1750,6 @@ export async function CodarPlugin(input) {
       // a loader has a baseURL only when its provider said where to send
       // requests: the address must be read from this config, not from what
       // the host passes the loader.
-      if (!input || typeof input !== "object" || Array.isArray(input)) input = {}
       if (!config || typeof config !== "object" || Array.isArray(config)) config = {}
       if (!config.provider || typeof config.provider !== "object" || Array.isArray(config.provider)) config.provider = {}
       // Same for the provider entry: an array is also an "object", but named
