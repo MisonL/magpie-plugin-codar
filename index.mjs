@@ -798,7 +798,7 @@ export async function CodarPlugin(input) {
         const deepSecs = (inner, fallbackSecs) => checkinWaitSecs(inner?.retry_after) || checkinWaitSecs(unwrapped(inner)?.retry_after) || fallbackSecs
         const deepAnswer = (inner, fallback) => {
           const innerCode = codeOf(inner?.code)
-          if (innerCode === 401 || innerCode === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(errorCodeOf(inner) ?? "")) return { outcome: "failed", message: "登录已过期，请重新登录" }
+          if (innerCode === 401 || innerCode === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/i.test(errorCodeOf(inner) ?? "")) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (restrictedWord(errorCodeOf(inner))) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (clientGated(errorCodeOf(inner), inner?.message)) return { outcome: "failed", message: CLIENT_GATED }
           // the refusal's own words, not the outer layer's success sentence —
@@ -980,7 +980,7 @@ export async function CodarPlugin(input) {
             // happens to contain it, or a server that repeated the word while
             // failing, would otherwise settle the day and stop magpie asking.
             const claimFirst = successSaid && !alreadyFirst(words) && (bc === 200 || bc === 400)
-            if (bc === 401 || bc === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(wordCode)) return { outcome: "failed", message: "登录已过期，请重新登录" }
+            if (bc === 401 || bc === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/i.test(wordCode)) return { outcome: "failed", message: "登录已过期，请重新登录" }
             if (restrictedWord(wordCode)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
             if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
             // The 400-beside-a-wait pair: the vendor's "already claimed" in its
@@ -1150,7 +1150,7 @@ export async function CodarPlugin(input) {
         // as "no code" it let the answer's success word settle the day.
         const wordCode = errorCodeOf(r)
         if (wordCode && wordCode !== "already_claimed") {
-          if (/^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(wordCode) || code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
+          if (/^(?:invalid_token|token_expired|token_invalid|unauthorized)$/i.test(wordCode) || code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (restrictedWord(wordCode)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
           return { outcome: "failed", message: saidCard(waitSaid) || "签到失败" }

@@ -6029,6 +6029,17 @@ test("a restriction's word is read whatever its case, as the gate's is", async (
   const expiredWord = () => new Response(JSON.stringify({ code: 200, message: "Token has expired", data: { code: "INVALID_TOKEN" } }), { status: 200, headers: { "Content-Type": "application/json" } })
   const x = await withFetch({ "/v1/gettoken": expiredWord }, async () => p.auth.usage(auth))
   assert.match(x.error ?? "", /过期/, "the upper-cased expiry word still reads as an expiry")
+
+  // and on the check-in's three word reads: the deep pair (801), the 400
+  // beside a wait (983) and the 2xx early read (1153) compared the lowercase
+  // spellings only, so INVALID_TOKEN answered a generic failure where the
+  // vendor said the sign-in died — the same miss the balance readers had.
+  const deep = { "POST /v1/daily-sign": { body: { code: 200, message: "签到", data: { code: "INVALID_TOKEN" } } } }
+  const rd = await withFetch(deep, async () => p.auth.checkin(auth))
+  assert.match(rd.message, /过期/, "the deep refusal word, upper-cased, is the day's expiry")
+  const flat = { "POST /v1/daily-sign": { body: { code: "INVALID_TOKEN", message: "token is dead", retry_after: 60 } } }
+  const rf = await withFetch(flat, async () => p.auth.checkin(auth))
+  assert.match(rf.message, /过期/, "the flat refusal word, upper-cased, is an expiry too")
 })
 
 test("a word where a number belongs is not a wait, on any of the four fields", () => {

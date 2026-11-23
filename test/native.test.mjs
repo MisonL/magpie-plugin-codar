@@ -1755,7 +1755,7 @@ test("the packaging CLI answers a broken start with one line, not a stack", asyn
   }
 })
 
-test("a sweep drops only dead, aged directories under our prefix", async () => {
+test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, async () => {
   // The rule sweepStaleDirs follows, pinned against a root of its own so no
   // real proxy can be caught in it: under the prefix, past the grace, and
   // answering nothing. Every shape a real machine grew — ready.json naming a
