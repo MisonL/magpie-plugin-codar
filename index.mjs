@@ -694,6 +694,12 @@ export async function CodarPlugin(input) {
         // the rules are regexes, the project's rule is that regexes see the
         // first 8 KiB, and saidBy's answer can be an 8 MB body. The opening
         // words of a message are where a vendor states its outcome.
+        // The prefix contract, same as the cleaners' (MAX_SCRUB_CHARS in
+        // lib/internal.mjs records why): a regex over a megabyte field is a
+        // stack overflow. A day statement buried PAST this window reads as a
+        // plain answer rather than the day's own — no measured vendor wording
+        // puts it that deep, and a card shows 120 characters anyway; the
+        // bound is the price of the stall fix.
         const head = (words) => String(words ?? "").slice(0, MAX_SCRUB_CHARS)
         const successWord = (words) => /成功(?!率)|\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\b(?!\s+(?:rate|ratio)\b)/i.test(head(words))
         // negatedAt says the word at index at is negated: a Chinese negator

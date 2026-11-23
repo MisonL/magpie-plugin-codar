@@ -9,7 +9,7 @@ import { execFile, execFileSync, spawn, spawnSync } from "node:child_process"
 import { test } from "node:test"
 import { createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -1095,7 +1095,7 @@ const alive = (pid) => {
   }
 }
 
-test("a proxy that dies is replaced, not mourned", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+test("a proxy that dies is replaced, not mourned", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1", timeout: 60_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "codar-native-fake-"))
   const bin = join(dir, "fake-proxy.mjs")
   const log = join(dir, "starts.log")
@@ -1278,7 +1278,7 @@ async function withProxyEnv(files, body) {
 
 const later = (ms) => new Promise((r) => setTimeout(r, ms))
 
-test("a start that failed is tried again after a pause, not remembered for the process's life", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+test("a start that failed is tried again after a pause, not remembered for the process's life", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1", timeout: 60_000 }, async () => {
   // One transient failure (a spawn error, the five-second ready deadline, a
   // machine resuming from sleep) used to be cached as "there is no proxy" for
   // as long as the process lived: the desktop transport never came back, and
@@ -1294,7 +1294,7 @@ test("a start that failed is tried again after a pause, not remembered for the p
   })
 })
 
-test("a dead proxy whose replacement also refuses is retried after a pause, not latched off", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+test("a dead proxy whose replacement also refuses is retried after a pause, not latched off", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1", timeout: 60_000 }, async () => {
   // After a refused socket and one refused replacement, proxyFetch set
   // `closing = true`, and proxy() then answered null until an explicit
   // closeProxy the host never makes: one outage kept the whole session on the
@@ -1315,7 +1315,7 @@ test("a dead proxy whose replacement also refuses is retried after a pause, not 
   })
 })
 
-test("a start that failed says so, rather than blaming a missing platform package", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+test("a start that failed says so, rather than blaming a missing platform package", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1", timeout: 60_000 }, async () => {
   // A build that exists but exits before its ready file is not "no platform
   // package for this machine": the fix is different (a broken install, a
   // binary the OS refuses, a transient spawn failure), and the message is
@@ -1367,7 +1367,7 @@ test("a refused streamed answer read as text ends at the caller's own bound", { 
   }
 })
 
-test("the proxy's files live in a directory of this process's own", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+test("the proxy's files live in a directory of this process's own", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1", timeout: 60_000 }, async () => {
   // The ready file tells this plugin where to send the account's credential.
   // In the shared temp directory its name was a pid (public) plus eight
   // characters of Math.random (not a CSPRNG), so another user on the machine
@@ -1488,7 +1488,7 @@ test("an official URL is the desktop's own definition", () => {
   assert.equal(yes("https://api.claw.speedai.com.evil.example/v1/codar/models"), false)
 })
 
-test("only the vendor's official hosts and only the proxy's binary are used", async () => {
+test("only the vendor's official hosts and only the proxy's binary are used", { timeout: 60_000 }, async () => {
   for (const h of ["codar-web.speedai.com", "api.claw.speedai.com", "api.kuaipaper.com", "test.api.kuaipaper.com"]) assert.ok(hosts.has(h), h)
   assert.equal(hosts.has("evil.example"), false)
   // the build script and the lookup agree on every name: a build the script
@@ -1582,7 +1582,7 @@ test("each platform's build ships as its own npm package, under npm's own platfo
   assert.equal(new Set(names).size, names.length)
 })
 
-test("the plugin opens the proxy from the platform package that was installed", async () => {
+test("the plugin opens the proxy from the platform package that was installed", { timeout: 60_000 }, async () => {
   // The package manager decides which platform package lands (bun and npm both
   // filter optionalDependencies by os/cpu, measured 2026-11-15), so the lookup
   // must follow what is installed rather than recompute it: a machine running
@@ -1731,7 +1731,7 @@ test("a release ships each build as its own package, and the main package names 
   }
 })
 
-test("the packaging CLI answers a broken start with one line, not a stack", async () => {
+test("the packaging CLI answers a broken start with one line, not a stack", { timeout: 60_000 }, async () => {
   // build-native answers a thrown start with `build-native: <message>` and
   // exit1, and reserves exit2 for an argument it does not know;
   // native-packages did the same for its argument, but a package.json it
@@ -1750,6 +1750,26 @@ test("the packaging CLI answers a broken start with one line, not a stack", asyn
     // an argument it does not know stays the exit2 it was
     const arg = spawnSync(process.execPath, [join(root, "scripts", "native-packages.mjs"), "--nope"], { encoding: "utf8", timeout: 30000 })
     assert.equal(arg.status, 2, "an unknown argument is still 'this script cannot run'")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a refused address is death: the probe answers false", async () => {
+  // the other half of the rule — nothing listening at a loopback port
+  // answers ECONNREFUSED inside the window, and that shell can go.
+  const { probeAnswering } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-probe-refuse-"))
+  const dir = join(root, "codar-plugin-refus1")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  // bind a port, then release it: a connect there is refused outright
+  const server = createServer()
+  await new Promise((r) => server.listen(0, "127.0.0.1", r))
+  const port = server.address().port
+  await new Promise((r) => server.close(r))
+  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: `127.0.0.1:${port}` }))
+  try {
+    assert.equal(await probeAnswering(dir), false, "a refused port says nobody is home")
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -1797,6 +1817,14 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
     // one real server answers inside `live`, at the address its ready names
     const sock = join(live, "proxy.sock")
     const server = createServer()
+    // track what the probe leaves behind: a client that connects and
+    // destroys itself stays half-open on the server side, and that fd is
+    // what keeps the close callback (and the process) waiting.
+    const accepted = new Set()
+    server.on("connection", (s) => {
+      accepted.add(s)
+      s.on("close", () => accepted.delete(s))
+    })
     await new Promise((r, rej) => {
       server.once("error", rej)
       server.listen(sock, r)
@@ -1804,6 +1832,13 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
     writeFileSync(join(live, "ready.json"), JSON.stringify({ transport: "unix", address: sock }))
     age(live)
     chmodSync(unreadable, 0o000)
+    // a same-user plant could name the directory's socket a SYMLINK to
+    // another process's live socket: the probe reads the link as what it
+    // is — not a socket — dials nothing through it, and the empty shell
+    // goes while the linked socket stands untouched.
+    const linkShell = mk("codar-plugin-link08")
+    symlinkSync(sock, join(linkShell, "proxy.sock"))
+    age(linkShell)
     try {
       const removed = await sweepStaleDirs({ root, minAgeMs: 30000 })
       assert.ok(removed.includes(readyGone), "ready.json over a vanished socket is a dead proxy")
@@ -1814,15 +1849,32 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
       assert.ok(!removed.includes(fresh), "inside the grace: not judged yet")
       assert.ok(!removed.includes(unrelated), "outside the prefix: never ours")
       assert.ok(!removed.includes(unreadable), "unreadable: skipped, not crashed on")
+      assert.ok(removed.includes(linkShell), "a symlink is not a listener: the shell goes")
+      assert.ok(!existsSync(linkShell) && existsSync(sock), "the link is dropped with it, its target untouched")
       assert.ok(existsSync(live) && existsSync(fresh) && existsSync(unrelated) && existsSync(unreadable))
       assert.equal((await sweepStaleDirs({ root, minAgeMs: 30000 })).length, 0, "a second sweep finds nothing new")
     } finally {
-      server.close()
+      for (const s of accepted) s.destroy()
+      await new Promise((r) => server.close(r))
       try { unlinkSync(sock) } catch {}
       chmodSync(unreadable, 0o700)
     }
   } finally {
-    rmSync(root, { recursive: true, force: true })
+    // macOS releases an unlinked socket's directory slot on its own clock,
+    // and a recursive rm racing that answers ENOTEMPTY — which is not in
+    // rmSync's own retry list. The sweep retried loop gives it a moment; a
+    // root that still resists is the OS temp cleaner's to finish, not a
+    // product failure worth failing the test over (every assertion above
+    // has already run by this point).
+    const { rm } = await import("node:fs/promises")
+    for (let i = 0; i < 20; i++) {
+      try {
+        await rm(root, { recursive: true, force: true })
+        break
+      } catch {
+        await new Promise((r) => setTimeout(r, 50))
+      }
+    }
   }
 })
 
