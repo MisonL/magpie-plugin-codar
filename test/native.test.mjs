@@ -5,7 +5,7 @@
 // spawns it, so the suite runs on a checkout with no build.
 
 import assert from "node:assert/strict"
-import { execFile, execFileSync, spawn } from "node:child_process"
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process"
 import { test } from "node:test"
 import { createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
@@ -1728,6 +1728,30 @@ test("a release ships each build as its own package, and the main package names 
   }
   } finally {
     for (const dir of [bin, out]) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("the packaging CLI answers a broken start with one line, not a stack", async () => {
+  // build-native answers a thrown start with `build-native: <message>` and
+  // exit1, and reserves exit2 for an argument it does not know;
+  // native-packages did the same for its argument, but a package.json it
+  // cannot parse (a half-saved file, a merge left open) escaped as Node's
+  // raw stack — the release run's log filled with frames, and the one line
+  // that says what broke was lost at the bottom of them.
+  const root = mkdtempSync(join(tmpdir(), "codar-pkgcli-"))
+  try {
+    cpSync(join(here, "..", "scripts"), join(root, "scripts"), { recursive: true })
+    cpSync(join(here, "..", "native"), join(root, "native"), { recursive: true })
+    writeFileSync(join(root, "package.json"), "{ broken\n")
+    const run = spawnSync(process.execPath, [join(root, "scripts", "native-packages.mjs"), "--check"], { encoding: "utf8", timeout: 30000 })
+    assert.equal(run.status, 1, "a start that cannot read the manifest fails the check")
+    assert.match(run.stderr, /^native-packages: /, "and says so in the script's own one line")
+    assert.ok(!/at .*\.mjs:\d+/.test(run.stderr), `no stack frames in the answer: ${run.stderr.slice(0, 160)}`)
+    // an argument it does not know stays the exit2 it was
+    const arg = spawnSync(process.execPath, [join(root, "scripts", "native-packages.mjs"), "--nope"], { encoding: "utf8", timeout: 30000 })
+    assert.equal(arg.status, 2, "an unknown argument is still 'this script cannot run'")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 

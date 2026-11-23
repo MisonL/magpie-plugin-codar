@@ -41,6 +41,17 @@ test("a redirect off the origin is returned, not followed", async () => {
   assert.equal(asked[0].redirected, "manual", "the request carried the manual redirect mode")
 })
 
+test("the chain stops where the proxy's own checkRedirect stops", async () => {
+  // main.go refuses when five requests were already made — four hops past
+  // the first — and this module's rule must answer at the same request, not
+  // one more: the fallback exists to send what the proxy would send.
+  const { transport, asked } = planned(nextId)
+  const res = await guardedFetch(`${vendor}/chain?n=0`, {}, { transport })
+  assert.equal(res.status, 302, "the redirect after the fourth hop is the answer the caller gets")
+  assert.equal(asked.length, 5, "four hops, five requests: the first plus what Go's via list holds when it refuses")
+  assert.deepEqual(asked.map((a) => a.url), [0, 1, 2, 3, 4].map((n) => `${vendor}/chain?n=${n}`))
+})
+
 test("a redirect is read on its own, and a hop off the origin is not taken", async () => {
   // The rule's steps in the order it takes them: an answer that is a redirect
   // is read for its Location, and a Location off the origin is the answer the

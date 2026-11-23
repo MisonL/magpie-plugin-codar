@@ -290,4 +290,15 @@ const isMain = (() => {
   }
 })()
 
-if (isMain) process.exitCode = main(process.argv.slice(2))
+if (isMain) {
+  // A start that cannot run — a package.json that is not JSON, a staged
+  // tree it cannot read — is one line in the release run's log, as
+  // build-native answers one: the message says what broke. Node's raw
+  // stack buried that line under frames.
+  try {
+    process.exitCode = main(process.argv.slice(2))
+  } catch (e) {
+    console.error(`native-packages: ${e?.message ?? e}`)
+    process.exitCode = 1
+  }
+}

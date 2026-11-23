@@ -29,7 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, restrictedWord, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
@@ -730,7 +730,10 @@ export async function CodarPlugin(input) {
         }
         // how long until the next attempt.
         const claimedWord = (words) => {
-          const m = ALREADY_CLAIMED.exec(words)
+          // the same card-sized prefix the failure scan reads: ALREADY_CLAIMED
+          // is alternation-heavy, and a vendor message of megabytes would cost
+          // a second per exec inside the host's shared hook
+          const m = ALREADY_CLAIMED.exec(head(words))
           return Boolean(m) && !negatedAt(words, m.index, true) && !failedWords(words)
         }
         // The day's statement when the answer names both: whichever comes
@@ -739,9 +742,10 @@ export async function CodarPlugin(input) {
         // while the vendor's words is this attempt's claim with the
         // rule appended (claimed, and the credit is real).
         const alreadyFirst = (words) => {
-          const a = ALREADY_CLAIMED.exec(words)
+          const flat = head(words)
+          const a = ALREADY_CLAIMED.exec(flat)
           if (!a) return false
-          const s = new RegExp("成功(?!率)|\\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\\b(?!\\s+(?:rate|ratio)\\b)", "gi").exec(words)
+          const s = new RegExp("成功(?!率)|\\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\\b(?!\\s+(?:rate|ratio)\\b)", "gi").exec(flat)
           return !s || a.index < s.index
         }
         // successSaidIn is the vendor saying this attempt landed: a success
@@ -752,7 +756,7 @@ export async function CodarPlugin(input) {
         // The negation may also open the next sentence: "Already signed
         // successfully today? No, not yet" is a denial of this attempt, the
         // same way "Already signed today? No, not yet" is of the day.
-        const successSaidIn = (words) => successWord(words) && !failedWords(words) && !negatedAt(words, words.search(/成功(?!率)|\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\b/i), true)
+        const successSaidIn = (words) => successWord(words) && !failedWords(words) && !negatedAt(words, head(words).search(/成功(?!率)|\bsucce(?:ss(?:ful(?:ly)?)?|ed(?:ed|ing|s)?)\b/i), true)
         // deepRefusal is a refusal nested in the answer's data: {code:200,
         // message:"签到成功", data:{code:200, data:{code:500, …}}} or
         // {code:200, data:{data:{success:false}}}. A gateway wraps the
@@ -795,7 +799,7 @@ export async function CodarPlugin(input) {
         const deepAnswer = (inner, fallback) => {
           const innerCode = codeOf(inner?.code)
           if (innerCode === 401 || innerCode === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(errorCodeOf(inner) ?? "")) return { outcome: "failed", message: "登录已过期，请重新登录" }
-          if (errorCodeOf(inner) === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          if (restrictedWord(errorCodeOf(inner))) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (clientGated(errorCodeOf(inner), inner?.message)) return { outcome: "failed", message: CLIENT_GATED }
           // the refusal's own words, not the outer layer's success sentence —
           // and when the deep node has none, a fallback that itself reads as
@@ -977,7 +981,7 @@ export async function CodarPlugin(input) {
             // failing, would otherwise settle the day and stop magpie asking.
             const claimFirst = successSaid && !alreadyFirst(words) && (bc === 200 || bc === 400)
             if (bc === 401 || bc === 403 || /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(wordCode)) return { outcome: "failed", message: "登录已过期，请重新登录" }
-            if (wordCode === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+            if (restrictedWord(wordCode)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
             if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
             // The 400-beside-a-wait pair: the vendor's "already claimed" in its
             // usual shape. A failure word still vetoes it (risk control and
@@ -1137,7 +1141,7 @@ export async function CodarPlugin(input) {
         // an HTTP status — a gateway answers 403 today, and may one day put
         // this word beside 200. This is not expiry; re-login does not fix it
         // (the same decision as in the catch above).
-        if (errorCodeOf(r) === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+        if (restrictedWord(errorCodeOf(r))) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
         // …and when a gateway stripped the code but left the vendor's sentence
         // in a 2xx body, that sentence is still the restriction: read as a claim
         // the card says the day was claimed while chat is refused.
@@ -1147,7 +1151,7 @@ export async function CodarPlugin(input) {
         const wordCode = errorCodeOf(r)
         if (wordCode && wordCode !== "already_claimed") {
           if (/^(?:invalid_token|token_expired|token_invalid|unauthorized)$/.test(wordCode) || code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
-          if (wordCode === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          if (restrictedWord(wordCode)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
           return { outcome: "failed", message: saidCard(waitSaid) || "签到失败" }
         }
@@ -1188,7 +1192,7 @@ export async function CodarPlugin(input) {
         // same way as the flat one.
         if (wrappedRefused) {
           if (wrappedCode === 401 || wrappedCode === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
-          if (errorCodeOf(wrapped) === "account_restricted") return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+          if (restrictedWord(errorCodeOf(wrapped))) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (clientGated(errorCodeOf(wrapped), saidBy(wrapped))) return { outcome: "failed", message: CLIENT_GATED }
           return { outcome: "failed", message: saidCard(waitSaid) || (Number.isFinite(wrappedCode) ? `签到失败（code ${wrappedCode}）` : "签到失败") }
         }

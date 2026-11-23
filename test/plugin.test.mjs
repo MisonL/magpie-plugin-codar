@@ -5993,6 +5993,44 @@ test("a status or activity read that never answers does not sink the card", asyn
   }
 })
 
+test("a restriction's word is read whatever its case, as the gate's is", async () => {
+  // clientGated has always lower-cased the word it compares (a gateway that
+  // rewrote CLIENT_NOT_SUPPORTED once read as an ordinary failure); the
+  // account restriction's readers compared the strict lowercase spelling at
+  // a dozen places. ACCOUNT_RESTRICTED then fell through to a generic
+  // failure or, worse, was read as an expiry by the sibling word — and the
+  // fix the card would offer was a re-login a restriction does not answer.
+  const { restrictedWord, gateWithin, restricted } = testables
+  assert.equal(restrictedWord("ACCOUNT_RESTRICTED"), true)
+  assert.equal(restrictedWord("account_restricted"), true)
+  assert.equal(restrictedWord(" Account_Restricted "), true, "the padded spelling, as errorCodeOf answers it")
+  assert.equal(restrictedWord("invalid_token"), false, "one word is not the other")
+  assert.equal(restricted({ code: "ACCOUNT_RESTRICTED" }), true, "a thrown code reads too")
+
+  const p = await CodarPlugin()
+  const upper = () => new Response(JSON.stringify({ detail: { code: "ACCOUNT_RESTRICTED", message: "API access is restricted." } }), { status:403, headers: { "Content-Type": "application/json" } })
+  const r = await withFetch({ "POST /v1/daily-sign": upper }, async () => p.auth.checkin(auth))
+  assert.match(r.message, /account_restricted/, "the check-in names the restriction")
+  assert.ok(!/过期/.test(r.message), "and does not call it an expiry")
+  const u = await withFetch(
+    {
+      "/v1/gettoken": upper,
+      "/v1/agent/balance": upper,
+      "/v1/daily-sign/status": { body: { code: 200, data: { isSigned: true } } },
+      "/api/codar/activities/mine": { body: { code: 200, data: [] } },
+    },
+    async () => p.auth.usage(auth),
+  )
+  assert.match(u.error ?? "", /受限|support/)
+  assert.equal(u.signIn ?? "", "", "an upper-cased restriction does not sign the account out")
+
+  // the expiry words keep their own rule: they are matched case-insensitively
+  // too, so INVALID_TOKEN is an expiry, not a generic failure
+  const expiredWord = () => new Response(JSON.stringify({ code: 200, message: "Token has expired", data: { code: "INVALID_TOKEN" } }), { status: 200, headers: { "Content-Type": "application/json" } })
+  const x = await withFetch({ "/v1/gettoken": expiredWord }, async () => p.auth.usage(auth))
+  assert.match(x.error ?? "", /过期/, "the upper-cased expiry word still reads as an expiry")
+})
+
 test("a word where a number belongs is not a wait, on any of the four fields", () => {
   // numOf accepts numbers and numeric strings; a boolean, an array and an
   // object are none of them. Every field read with it had its own guard, but
