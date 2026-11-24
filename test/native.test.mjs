@@ -1942,6 +1942,33 @@ test("a pid that is gone is death, whatever its socket says", async () => {
   }
 })
 
+test("only ESRCH is death: another answer to a pid question keeps the shell", async () => {
+  // Codex's injection: an EIO from process.kill(pid, 0) made a live pid read
+  // as dead and its directory swept. The kernel's ESRCH is the only answer
+  // that proves the process gone; permission and error answers prove nothing.
+  const { proxyDead } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-probe-kill-"))
+  const dir = join(root, "codar-plugin-kill01")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid: String(process.pid) }))
+  const realKill = process.kill
+  try {
+    for (const code of ["EPERM", "EIO", "EINVAL", "EACCES", undefined]) {
+      process.kill = () => {
+        throw Object.assign(new Error(String(code)), code ? { code } : {})
+      }
+      assert.equal(proxyDead(dir), false, `${code ?? "an uncoded error"} from the pid question was read as death`)
+    }
+    process.kill = () => {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" })
+    }
+    assert.equal(proxyDead(dir), true, "ESRCH is the one answer that proves the process gone")
+  } finally {
+    process.kill = realKill
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, async () => {
   // The rule sweepStaleDirs follows, pinned against a root of its own so no
   // real proxy can be caught in it: under the prefix, past the grace, and
