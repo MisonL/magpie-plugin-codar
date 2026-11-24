@@ -1942,6 +1942,51 @@ test("a pid that is gone is death, whatever its socket says", async () => {
   }
 })
 
+test("a ready.json that is a symlink is never read, so it cannot prove death", async () => {
+  // Codex, 2026-11-24: the shape check ran on the path and the read on the
+  // path again, so a same-user plant could swap in a symlink to a dead-pid
+  // JSON between them and have a live proxy's directory swept. One open with
+  // O_NOFOLLOW decides shape and bytes together; a link at the name fails
+  // that open, and the shell stays.
+  const { proxyDead } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "cdr-ln-"))
+  const dir = join(root, "codar-plugin-lnk01")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const elsewhere = join(root, "planted.json")
+  const dead = spawn(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { stdio: ["ignore", "pipe", "ignore"] })
+  const deadPid = await new Promise((r) => dead.stdout.once("data", (c) => r(Number(String(c)))))
+  await new Promise((r) => dead.once("exit", r))
+  writeFileSync(elsewhere, JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid: String(deadPid) }))
+  symlinkSync(elsewhere, join(dir, "ready.json"))
+  try {
+    assert.equal(proxyDead(dir), false, "a symlinked ready was followed and its dead pid taken as proof")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a ready.json swapped for a symlink after the open cannot change what was read", async () => {
+  // The other half: even where O_NOFOLLOW is not what the name shows (a real
+  // file is replaced mid-lifetime), the bytes read are the bytes of the inode
+  // that was opened. A directory whose ready is a real file at open time and
+  // a symlink after still reads as the original file's answer.
+  const { proxyDead } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "cdr-sw-"))
+  const dir = join(root, "codar-plugin-swp01")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const ready = join(dir, "ready.json")
+  writeFileSync(ready, JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid: String(process.pid) }))
+  try {
+    const answer = proxyDead(dir)
+    // the read happened on the descriptor, so the answer is the live pid's:
+    // kept whether or not anything was swapped afterwards
+    assert.equal(answer, false, "a live pid's ready was read as death")
+    assert.ok(existsSync(ready))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("only ESRCH is death: another answer to a pid question keeps the shell", async () => {
   // Codex's injection: an EIO from process.kill(pid, 0) made a live pid read
   // as dead and its directory swept. The kernel's ESRCH is the only answer
