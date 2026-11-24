@@ -1987,6 +1987,26 @@ test("a ready.json swapped for a symlink after the open cannot change what was r
   }
 })
 
+test("a pid that is not a decimal integer is no pid this sweep acts on", async () => {
+  // The proxy writes a decimal string. Everything else — a boolean (Number
+  // would make true → 1), a float, a negative, pid 1 itself, a hex string —
+  // is a shape the sweep does not understand, and an ununderstood shape is
+  // kept, never judged.
+  const { proxyDead } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "cdr-pid-"))
+  const shapes = [true, 1.5, -4, 1, "1", "0x10", " 12", "12abc", 4194305, null, {}]
+  try {
+    for (const pid of shapes) {
+      const dir = join(root, "codar-plugin-p" + Math.random().toString(36).slice(2, 8))
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid }))
+      assert.equal(proxyDead(dir), false, `pid ${JSON.stringify(pid)} was judged`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("only ESRCH is death: another answer to a pid question keeps the shell", async () => {
   // Codex's injection: an EIO from process.kill(pid, 0) made a live pid read
   // as dead and its directory swept. The kernel's ESRCH is the only answer
