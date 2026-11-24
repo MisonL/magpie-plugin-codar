@@ -7,7 +7,7 @@
 import assert from "node:assert/strict"
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process"
 import { test } from "node:test"
-import { createServer } from "node:net"
+import { connect, createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -899,6 +899,12 @@ test("a release refuses a package without every platform's build", { timeout: 60
     // mode are a real build's, so only the clock can say it predates main.go.
     // The suite's own fixtures get their freshness from the source's time.
     const freshSource = newestSourceMtime()
+    // an unreadable source is not a pass: the gate must refuse rather than
+    // date the builds against nothing, or a moved tree would wave them through
+    assert.equal(newestSourceMtime(join(tmpdir(), "codar-no-such-source")), null, "an unreadable source dated itself")
+    const undated = inspectTarget(full, { os: "darwin", arch: "arm64", goos: "darwin" }, null)
+    assert.equal(undated.state, "broken", "a build passed while its source could not be read")
+    assert.match(undated.reason, /source cannot be read/)
     // older than the source, not merely "a day ago": a checkout's .go files
     // may themselves be days old
     const older = new Date(freshSource - 60 * 60 * 1000)
@@ -1808,80 +1814,127 @@ test("the start's own fresh directory is never the sweep's victim, whatever its 
   }
 })
 
-test("a refused address is death: the probe answers false", async () => {
-  // the other half of the rule — a loopback address with nothing listening
-  // answers ECONNREFUSED inside the window, and that shell can go. Port 1 is
-  // the fixture: bind-and-release would race every other test's listen(0)
-  // for the freed port, and the connect that found a new owner would keep a
-  // dead shell forever.
+test("a proxy dies and leaves no ready: its refused socket is death", { ...NO_UNIX, timeout: 30_000 }, async () => {
+  // The one shape with no pid to ask: a host killed between mkdtemp and the
+  // ready write. The Unix layout's socket is dialled once, and refusal — the
+  // kernel saying nothing is bound there — is the answer death needs.
   const { probeAnswering } = await import("../lib/native.mjs")
-  const root = mkdtempSync(join(tmpdir(), "codar-probe-refuse-"))
-  const dir = join(root, "codar-plugin-refus1")
+  const root = mkdtempSync(join(tmpdir(), "cdr-r-"))
+  const dir = join(root, "codar-plugin-r1")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
-  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1" }))
+  const sock = join(dir, "proxy.sock")
+  // a child binds the socket and is killed outright: the path stays, bound
+  // to nothing, which is exactly the shell a SIGKILL leaves
+  const child = spawn(process.execPath, ["-e", `
+    const net = require("node:net")
+    const server = net.createServer(() => {})
+    server.listen(process.argv[1], () => console.log("ready"))
+  `, sock], { stdio: ["ignore", "pipe", "ignore"] })
   try {
-    assert.equal(await probeAnswering(dir), false, "a refused port says nobody is home")
+    await new Promise((resolve, reject) => {
+      child.stdout.once("data", () => resolve())
+      child.once("exit", () => reject(new Error("the listener died before binding")))
+    })
+    child.kill("SIGKILL")
+    await new Promise((r) => child.once("exit", r))
+    assert.ok(existsSync(sock), "the killed process's socket path should outlive it")
+    assert.equal(await probeAnswering(dir), false, "a refused socket with no ready says nobody is home")
+    // and a path that is gone, or is a plain file, is no listener either
+    rmSync(sock)
+    assert.equal(await probeAnswering(dir), false, "a vanished socket is nobody home")
+    writeFileSync(sock, "a plain file where a socket was")
+    assert.equal(await probeAnswering(dir), false, "a plain file is not a listener")
   } finally {
+    try { child.kill("SIGKILL") } catch {}
     rmSync(root, { recursive: true, force: true })
   }
 })
 
-test("a ready that names something the sweep will not dial leaves the shell alone", async () => {
-  // "refused at every address it publishes" only when every address was
-  // actually dialled. A foreign host, an address an older build wrote, a
-  // port the range does not hold — each is unproven, not dead, and a live
-  // directory must not go over a question the sweep declined to ask.
+test("a ready without a pid, or in a shape the sweep does not know, leaves the shell alone", async () => {
+  // Every ready that cannot prove death is kept: an older build's (no pid),
+  // a foreign host, an address an older build wrote, an unreadable line, a
+  // FIFO. The sweep never deletes what it could not judge.
   const { probeAnswering } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "codar-probe-unproven-"))
   const shapes = {
-    "a foreign host": { transport: "tcp", address: "10.255.255.1:65000" },
-    "a bracketed all-interfaces address": { transport: "tcp", address: "[::]:41234" },
-    "a port past the range": { transport: "tcp", address: "127.0.0.1:70000" },
-    "a transport this sweep does not know": { transport: "udp", address: "127.0.0.1:1" },
+    "an older build's unix ready": { transport: "unix", address: "/tmp/whatever.sock" },
+    "an older build's tcp ready": { transport: "tcp", address: "127.0.0.1:1" },
+    "a foreign host": { transport: "tcp", address: "10.255.255.1:65000", pid: "1" },
+    "a bracketed all-interfaces address": { transport: "tcp", address: "[::]:41234", pid: "1" },
+    "a pid past any real range": { transport: "tcp", address: "127.0.0.1:1", pid: "999999999999" },
+    "a transport this sweep does not know": { transport: "udp", address: "127.0.0.1:1", pid: "1" },
     "unreadable JSON": "{ not json",
   }
   try {
     for (const [label, ready] of Object.entries(shapes)) {
       const dir = join(root, "codar-plugin-" + label.replace(/\W+/g, "").slice(0, 12) + Math.random().toString(36).slice(2, 6))
       mkdirSync(dir, { recursive: true, mode: 0o700 })
-      writeFileSync(join(dir, "ready.json"), typeof ready === "string" ? ready : JSON.stringify(ready))
+      if (typeof ready === "string") writeFileSync(join(dir, "ready.json"), ready)
+      else writeFileSync(join(dir, "ready.json"), JSON.stringify(ready))
       assert.equal(await probeAnswering(dir), true, `${label}: a shell the sweep could not judge was declared dead`)
     }
+    // a FIFO named ready.json would block a plain read forever
+    const fifo = join(root, "codar-plugin-fifo001")
+    mkdirSync(fifo, { recursive: true, mode: 0o700 })
+    const made = spawnSync("mkfifo", [join(fifo, "ready.json")])
+    if (made.status === 0) assert.equal(await probeAnswering(fifo), true, "a FIFO ready blocked or was judged")
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
 
-test("a live loopback TCP proxy is kept, and a Unix socket that answers is kept", { ...NO_UNIX, timeout: 30_000 }, async () => {
-  // The Unix side is covered by the sweep test; the TCP side is what Windows
-  // ships, and no other test holds a live listener there.
-  const { probeAnswering } = await import("../lib/native.mjs")
-  const root = mkdtempSync(join(tmpdir(), "codar-probe-live-"))
-  const server = createServer()
+test("a live pid keeps the shell even when its socket answers nothing", { ...NO_UNIX, timeout: 30_000 }, async () => {
+  // Codex's reproduction: a paused proxy whose Unix accept queue is full
+  // answers ECONNREFUSED exactly as a dead one does (measured 2026-11-23 on
+  // macOS), so a connect probe deleted a live process's directory. The pid in
+  // the ready is the answer that cannot be confused — a socket that answers
+  // nothing (here: nothing is bound at all, the strongest form) keeps the
+  // shell while the process lives, and a later sweep must too.
+  const { probeAnswering, sweepStaleDirs } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "cdr-w-"))
+  const dir = join(root, "codar-plugin-w1")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const ready = join(dir, "ready.json")
+  // a proxy-shaped child: it records its pid the way the proxy does, then
+  // stops (SIGSTOP stands in for the wedged process whose queue is full)
+  const child = spawn(process.execPath, ["-e", `
+    const fs = require("node:fs")
+    fs.writeFileSync(process.argv[1], JSON.stringify({ transport: "unix", address: process.argv[2], pid: String(process.pid) }))
+    console.log("ready")
+    setInterval(() => {}, 1000)
+  `, ready, join(dir, "proxy.sock")], { stdio: ["ignore", "pipe", "ignore"] })
   try {
-    await new Promise((r, rej) => {
-      server.once("error", rej)
-      server.listen({ host: "127.0.0.1", port: 0 }, r)
+    await new Promise((resolve, reject) => {
+      child.stdout.once("data", () => resolve())
+      child.once("exit", (code) => reject(new Error(`the stand-in exited ${code}`)))
     })
-    const { port } = server.address()
-    const dir = join(root, "codar-plugin-tcpalive")
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
-    writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: `127.0.0.1:${port}` }))
-    assert.equal(await probeAnswering(dir), true, "a listener answering on loopback was declared dead")
-    // the bracketed IPv6 form a proxy could write, through the shared parser:
-    // a real listener on ::1, or a skip on a host without IPv6 loopback
-    const six = createServer()
-    const got6 = await new Promise((r) => {
-      six.once("error", () => r(false))
-      six.listen({ host: "::1", port: 0 }, () => r(true))
-    })
-    if (got6) {
-      writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: `[::1]:${six.address().port}` }))
-      assert.equal(await probeAnswering(dir), true, "the bracketed IPv6 form was not parsed")
-      await new Promise((r) => six.close(r))
-    }
+    child.kill("SIGSTOP")
+    assert.equal(await probeAnswering(dir), true, "a live pid's shell was declared dead over a silent socket")
+    const past = new Date(Date.now() - 60000)
+    utimesSync(dir, past, past)
+    assert.deepEqual(await sweepStaleDirs({ root, minAgeMs: 30000 }), [], "the sweep took a live wedged proxy's directory")
+    assert.ok(existsSync(dir))
   } finally {
-    await new Promise((r) => server.close(r))
+    try { child.kill("SIGKILL") } catch {}
+    await new Promise((r) => child.once("exit", r))
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a pid that is gone is death, whatever its socket says", async () => {
+  // The other side: the proxy wrote its pid and exited. Its socket may even
+  // still answer for a moment (a leftover path) — nobody is behind it.
+  const { probeAnswering } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-probe-deadpid-"))
+  const dir = join(root, "codar-plugin-dead01")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const child = spawn(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { stdio: ["ignore", "pipe", "ignore"] })
+  const pid = await new Promise((resolve) => child.stdout.once("data", (c) => resolve(Number(String(c)))))
+  await new Promise((r) => child.once("exit", r))
+  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: String(pid) }))
+  try {
+    assert.equal(await probeAnswering(dir), false, "a dead pid's shell was kept")
+  } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -1889,11 +1942,10 @@ test("a live loopback TCP proxy is kept, and a Unix socket that answers is kept"
 test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, async () => {
   // The rule sweepStaleDirs follows, pinned against a root of its own so no
   // real proxy can be caught in it: under the prefix, past the grace, and
-  // answering nothing. Every shape a real machine grew — ready.json naming a
-  // vanished socket (a transient CLI host's death), a plain file wearing the
-  // socket's name (the double kill that ran no exit handler), nothing at all,
-  // and the shapes that must survive: one live socket, a fresh start, a name
-  // outside the prefix, a directory that cannot be read.
+  // proven dead — a ready whose pid is gone, or no ready at all with a socket
+  // that is absent or not a socket. The shapes that must survive: a live
+  // pid, an older build's ready (no pid — never guessed at), a fresh start,
+  // a name outside the prefix, a directory that cannot be read.
   const { sweepStaleDirs } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "codar-sweep-test-"))
   const past = new Date(Date.now() - 60000)
@@ -1907,9 +1959,17 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
   // untouched from its death onward
   const age = (dir) => utimesSync(dir, past, past)
   try {
+    // a pid that has exited, recorded the way the proxy writes it
+    const dead = spawn(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { stdio: ["ignore", "pipe", "ignore"] })
+    const deadPid = await new Promise((r) => dead.stdout.once("data", (c) => r(Number(String(c)))))
+    await new Promise((r) => dead.once("exit", r))
     const readyGone = mk("codar-plugin-gone001")
-    writeFileSync(join(readyGone, "ready.json"), JSON.stringify({ transport: "unix", address: join(readyGone, "proxy.sock"), token: "aa" }))
+    writeFileSync(join(readyGone, "ready.json"), JSON.stringify({ transport: "unix", address: join(readyGone, "proxy.sock"), pid: String(deadPid) }))
     age(readyGone)
+    // an older build's ready, naming a socket that is gone: no pid, no proof
+    const oldReady = mk("codar-plugin-oldr004")
+    writeFileSync(join(oldReady, "ready.json"), JSON.stringify({ transport: "unix", address: join(oldReady, "proxy.sock"), token: "aa" }))
+    age(oldReady)
     const staleSock = mk("codar-plugin-oldc002")
     writeFileSync(join(staleSock, "proxy.sock"), "a plain file where a socket was")
     age(staleSock)
@@ -1940,7 +2000,7 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
       server.once("error", rej)
       server.listen(sock, r)
     })
-    writeFileSync(join(live, "ready.json"), JSON.stringify({ transport: "unix", address: sock }))
+    writeFileSync(join(live, "ready.json"), JSON.stringify({ transport: "unix", address: sock, pid: String(process.pid) }))
     age(live)
     chmodSync(unreadable, 0o000)
     // a same-user plant could name the directory's socket a SYMLINK to
@@ -1952,11 +2012,13 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
     age(linkShell)
     try {
       const removed = await sweepStaleDirs({ root, minAgeMs: 30000 })
-      assert.ok(removed.includes(readyGone), "ready.json over a vanished socket is a dead proxy")
+      assert.ok(removed.includes(readyGone), "a ready whose pid is gone is a dead proxy")
       assert.ok(removed.includes(staleSock), "a plain file wearing the socket's name is dead too")
       assert.ok(removed.includes(empty), "an empty aged directory under our prefix is ours to drop")
       assert.ok(!existsSync(readyGone) && !existsSync(staleSock) && !existsSync(empty), "and gone for real")
-      assert.ok(!removed.includes(live), "a socket that answers is a running proxy — kept however old")
+      assert.ok(!removed.includes(oldReady), "an older build's ready cannot prove death: kept")
+      assert.ok(existsSync(oldReady))
+      assert.ok(!removed.includes(live), "a live pid is a running proxy — kept however old")
       assert.ok(!removed.includes(fresh), "inside the grace: not judged yet")
       assert.ok(!removed.includes(unrelated), "outside the prefix: never ours")
       assert.ok(!removed.includes(unreadable), "unreadable: skipped, not crashed on")

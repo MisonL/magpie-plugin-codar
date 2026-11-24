@@ -205,7 +205,8 @@ release ships cannot pass for it — and then runs the tarball gate with
 `--require-bun --require-builds`, which installs the packed main package in a
 scratch project with bun and with npm and requires each install to land this
 machine's platform package and start its proxy. The freshness rule is the
-built file's mtime against the newest `.go` under `native/cmd`; a copy that
+built file's mtime against the newest `.go` under `native/cmd`, and a source
+tree it cannot read refuses every build rather than passing them; a copy that
 traveled by archive or a clock skewed backwards still needs `npm run
 native:all` (or `node scripts/build-native.mjs --all`) run in this checkout
 before the release.

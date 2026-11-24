@@ -85,6 +85,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -189,7 +190,11 @@ func main() {
 	}
 
 	if *ready != "" {
-		info := map[string]string{"transport": network, "address": addr}
+		// pid lets the host tell this proxy's live-but-wedged socket from a
+		// dead one: a full accept queue answers ECONNREFUSED on macOS exactly
+		// as a dead socket does (measured 2026-11-23), so only the process
+		// itself can prove the listener is standing.
+		info := map[string]string{"transport": network, "address": addr, "pid": strconv.Itoa(os.Getpid())}
 		if network == "tcp" {
 			info["token"] = *token
 		}

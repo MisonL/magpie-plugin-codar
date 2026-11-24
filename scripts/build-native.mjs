@@ -148,7 +148,9 @@ const archOf = (head, goos) => {
 // builds made before the source they named, and a header-shaped file cannot
 // tell anyone that. go.mod is left out on purpose: the build loop rewrites it
 // per target and restores it after the last build, so its mtime says nothing
-// about the binaries.
+// about the binaries. An answer of null — the tree unreadable, or no .go in
+// it — is not a pass: every target is refused, because a gate that cannot
+// date the source must not wave a build through.
 export const newestSourceMtime = (srcDir = join(root, "cmd")) => {
   let newest = 0
   const walk = (dir) => {
@@ -161,9 +163,9 @@ export const newestSourceMtime = (srcDir = join(root, "cmd")) => {
   try {
     walk(srcDir)
   } catch {
-    return 0
+    return null // the source cannot be read: nothing can be dated against it
   }
-  return newest
+  return newest > 0 ? newest : null // no .go at all is not "no source change"
 }
 
 // inspectTarget reports one target's state in a directory: "present" when the
@@ -207,6 +209,11 @@ export const inspectTarget = (dir, t, sourceMtime = 0) => {
   if (t.goos !== "windows" && process.platform !== "win32" && (stat.mode & 0o111) === 0) {
     return { name, state: "broken", reason: "not executable" }
   }
+  if (sourceMtime === null) {
+    // an unreadable source is not a pass: the release line must never ship a
+    // build whose freshness nothing could check
+    return { name, state: "broken", reason: "the proxy's source cannot be read, so no build can be dated against it" }
+  }
   if (sourceMtime > 0 && stat.mtimeMs < sourceMtime) {
     return { name, state: "broken", reason: "older than its source; run node scripts/build-native.mjs --all" }
   }
@@ -216,7 +223,7 @@ export const inspectTarget = (dir, t, sourceMtime = 0) => {
 // checkTargets is the whole directory, in the table's order: what --check
 // prints and --strict refuses.
 export const checkTargets = (dir = out, sourceMtime = newestSourceMtime()) =>
-  targets.map((t) => inspectTarget(dir, t, sourceMtime))
+  targets.map((t) => inspectTarget(dir, t, sourceMtime)) // null sourceMtime fails every row
 
 // missingTargets is the builds a directory does not have, by file name: what
 // --check reports, and what --strict refuses.
