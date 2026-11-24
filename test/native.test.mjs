@@ -7,7 +7,7 @@
 import assert from "node:assert/strict"
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process"
 import { test } from "node:test"
-import { connect, createServer } from "node:net"
+import { createServer } from "node:net"
 import { createServer as createServer2 } from "node:http"
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -1803,6 +1803,11 @@ test("the start's own fresh directory is never the sweep's victim, whatever its 
   const root = mkdtempSync(join(tmpdir(), "codar-sweep-own-"))
   const dir = join(root, "codar-plugin-own0001")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
+  // a ready whose pid is gone: were it not named to the sweep, it would go
+  const dead = spawn(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { stdio: ["ignore", "pipe", "ignore"] })
+  const deadPid = await new Promise((r) => dead.stdout.once("data", (c) => r(Number(String(c)))))
+  await new Promise((r) => dead.once("exit", r))
+  writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: String(deadPid) }))
   const past = new Date(Date.now() - 60000)
   utimesSync(dir, past, past)
   try {
@@ -1814,17 +1819,18 @@ test("the start's own fresh directory is never the sweep's victim, whatever its 
   }
 })
 
-test("a proxy dies and leaves no ready: its refused socket is death", { ...NO_UNIX, timeout: 30_000 }, async () => {
-  // The one shape with no pid to ask: a host killed between mkdtemp and the
-  // ready write. The Unix layout's socket is dialled once, and refusal — the
-  // kernel saying nothing is bound there — is the answer death needs.
-  const { probeAnswering } = await import("../lib/native.mjs")
+test("no ready at all is never death: nothing recorded can prove the proxy gone", { ...NO_UNIX, timeout: 30_000 }, async () => {
+  // A directory with no ready is a start between mkdtemp and its ready write
+  // — possibly a live, paused one — or a kill in that sub-second window. The
+  // earlier rule dialled the socket here, and Codex showed a paused proxy
+  // whose queue was full answering ECONNREFUSED like a dead one; the sweep
+  // keeps such a directory and lets the owner (or one manual clean-up tidy
+  // the rare abandoned shell).
+  const { proxyDead } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "cdr-r-"))
   const dir = join(root, "codar-plugin-r1")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const sock = join(dir, "proxy.sock")
-  // a child binds the socket and is killed outright: the path stays, bound
-  // to nothing, which is exactly the shell a SIGKILL leaves
   const child = spawn(process.execPath, ["-e", `
     const net = require("node:net")
     const server = net.createServer(() => {})
@@ -1838,12 +1844,11 @@ test("a proxy dies and leaves no ready: its refused socket is death", { ...NO_UN
     child.kill("SIGKILL")
     await new Promise((r) => child.once("exit", r))
     assert.ok(existsSync(sock), "the killed process's socket path should outlive it")
-    assert.equal(await probeAnswering(dir), false, "a refused socket with no ready says nobody is home")
-    // and a path that is gone, or is a plain file, is no listener either
+    assert.equal(proxyDead(dir), false, "a refused socket with no ready was called dead")
     rmSync(sock)
-    assert.equal(await probeAnswering(dir), false, "a vanished socket is nobody home")
+    assert.equal(proxyDead(dir), false, "an empty directory was called dead")
     writeFileSync(sock, "a plain file where a socket was")
-    assert.equal(await probeAnswering(dir), false, "a plain file is not a listener")
+    assert.equal(proxyDead(dir), false, "a plain file where a socket was was called dead")
   } finally {
     try { child.kill("SIGKILL") } catch {}
     rmSync(root, { recursive: true, force: true })
@@ -1852,17 +1857,15 @@ test("a proxy dies and leaves no ready: its refused socket is death", { ...NO_UN
 
 test("a ready without a pid, or in a shape the sweep does not know, leaves the shell alone", async () => {
   // Every ready that cannot prove death is kept: an older build's (no pid),
-  // a foreign host, an address an older build wrote, an unreadable line, a
-  // FIFO. The sweep never deletes what it could not judge.
-  const { probeAnswering } = await import("../lib/native.mjs")
+  // an unreadable line, a FIFO, an oversized file. The sweep never deletes
+  // what it could not judge.
+  const { proxyDead } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "codar-probe-unproven-"))
   const shapes = {
     "an older build's unix ready": { transport: "unix", address: "/tmp/whatever.sock" },
     "an older build's tcp ready": { transport: "tcp", address: "127.0.0.1:1" },
-    "a foreign host": { transport: "tcp", address: "10.255.255.1:65000", pid: "1" },
-    "a bracketed all-interfaces address": { transport: "tcp", address: "[::]:41234", pid: "1" },
     "a pid past any real range": { transport: "tcp", address: "127.0.0.1:1", pid: "999999999999" },
-    "a transport this sweep does not know": { transport: "udp", address: "127.0.0.1:1", pid: "1" },
+    "a pid that is not a number": { transport: "tcp", address: "127.0.0.1:1", pid: "me" },
     "unreadable JSON": "{ not json",
   }
   try {
@@ -1871,13 +1874,13 @@ test("a ready without a pid, or in a shape the sweep does not know, leaves the s
       mkdirSync(dir, { recursive: true, mode: 0o700 })
       if (typeof ready === "string") writeFileSync(join(dir, "ready.json"), ready)
       else writeFileSync(join(dir, "ready.json"), JSON.stringify(ready))
-      assert.equal(await probeAnswering(dir), true, `${label}: a shell the sweep could not judge was declared dead`)
+      assert.equal(proxyDead(dir), false, `${label}: a shell the sweep could not judge was declared dead`)
     }
     // a FIFO named ready.json would block a plain read forever
     const fifo = join(root, "codar-plugin-fifo001")
     mkdirSync(fifo, { recursive: true, mode: 0o700 })
     const made = spawnSync("mkfifo", [join(fifo, "ready.json")])
-    if (made.status === 0) assert.equal(await probeAnswering(fifo), true, "a FIFO ready blocked or was judged")
+    if (made.status === 0) assert.equal(proxyDead(fifo), false, "a FIFO ready blocked or was judged")
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -1890,7 +1893,7 @@ test("a live pid keeps the shell even when its socket answers nothing", { ...NO_
   // the ready is the answer that cannot be confused — a socket that answers
   // nothing (here: nothing is bound at all, the strongest form) keeps the
   // shell while the process lives, and a later sweep must too.
-  const { probeAnswering, sweepStaleDirs } = await import("../lib/native.mjs")
+  const { proxyDead, sweepStaleDirs } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "cdr-w-"))
   const dir = join(root, "codar-plugin-w1")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -1909,7 +1912,7 @@ test("a live pid keeps the shell even when its socket answers nothing", { ...NO_
       child.once("exit", (code) => reject(new Error(`the stand-in exited ${code}`)))
     })
     child.kill("SIGSTOP")
-    assert.equal(await probeAnswering(dir), true, "a live pid's shell was declared dead over a silent socket")
+    assert.equal(proxyDead(dir), false, "a live pid's shell was declared dead over a silent socket")
     const past = new Date(Date.now() - 60000)
     utimesSync(dir, past, past)
     assert.deepEqual(await sweepStaleDirs({ root, minAgeMs: 30000 }), [], "the sweep took a live wedged proxy's directory")
@@ -1924,7 +1927,7 @@ test("a live pid keeps the shell even when its socket answers nothing", { ...NO_
 test("a pid that is gone is death, whatever its socket says", async () => {
   // The other side: the proxy wrote its pid and exited. Its socket may even
   // still answer for a moment (a leftover path) — nobody is behind it.
-  const { probeAnswering } = await import("../lib/native.mjs")
+  const { proxyDead } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "codar-probe-deadpid-"))
   const dir = join(root, "codar-plugin-dead01")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -1933,7 +1936,7 @@ test("a pid that is gone is death, whatever its socket says", async () => {
   await new Promise((r) => child.once("exit", r))
   writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: String(pid) }))
   try {
-    assert.equal(await probeAnswering(dir), false, "a dead pid's shell was kept")
+    assert.equal(proxyDead(dir), true, "a dead pid's shell was kept")
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -1942,10 +1945,11 @@ test("a pid that is gone is death, whatever its socket says", async () => {
 test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, async () => {
   // The rule sweepStaleDirs follows, pinned against a root of its own so no
   // real proxy can be caught in it: under the prefix, past the grace, and
-  // proven dead — a ready whose pid is gone, or no ready at all with a socket
-  // that is absent or not a socket. The shapes that must survive: a live
-  // pid, an older build's ready (no pid — never guessed at), a fresh start,
-  // a name outside the prefix, a directory that cannot be read.
+  // proven dead by its own ready — a recorded pid that is gone. Every other
+  // shape survives: a live pid, an older build's ready (no pid — never
+  // guessed at), no ready at all, an empty shell, a planted link, a socket
+  // path that is a plain file, a fresh start, a name outside the prefix, a
+  // directory that cannot be read.
   const { sweepStaleDirs } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "codar-sweep-test-"))
   const past = new Date(Date.now() - 60000)
@@ -2004,27 +2008,30 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
     age(live)
     chmodSync(unreadable, 0o000)
     // a same-user plant could name the directory's socket a SYMLINK to
-    // another process's live socket: the probe reads the link as what it
-    // is — not a socket — dials nothing through it, and the empty shell
-    // goes while the linked socket stands untouched.
+    // another process's live socket: with no ready there is no pid and no
+    // verdict, so the shell stays and nothing is dialled through the link.
     const linkShell = mk("codar-plugin-link08")
     symlinkSync(sock, join(linkShell, "proxy.sock"))
     age(linkShell)
     try {
       const removed = await sweepStaleDirs({ root, minAgeMs: 30000 })
-      assert.ok(removed.includes(readyGone), "a ready whose pid is gone is a dead proxy")
-      assert.ok(removed.includes(staleSock), "a plain file wearing the socket's name is dead too")
-      assert.ok(removed.includes(empty), "an empty aged directory under our prefix is ours to drop")
-      assert.ok(!existsSync(readyGone) && !existsSync(staleSock) && !existsSync(empty), "and gone for real")
-      assert.ok(!removed.includes(oldReady), "an older build's ready cannot prove death: kept")
-      assert.ok(existsSync(oldReady))
-      assert.ok(!removed.includes(live), "a live pid is a running proxy — kept however old")
-      assert.ok(!removed.includes(fresh), "inside the grace: not judged yet")
-      assert.ok(!removed.includes(unrelated), "outside the prefix: never ours")
-      assert.ok(!removed.includes(unreadable), "unreadable: skipped, not crashed on")
-      assert.ok(removed.includes(linkShell), "a symlink is not a listener: the shell goes")
-      assert.ok(!existsSync(linkShell) && existsSync(sock), "the link is dropped with it, its target untouched")
-      assert.ok(existsSync(live) && existsSync(fresh) && existsSync(unrelated) && existsSync(unreadable))
+      assert.deepEqual(removed, [readyGone], "only the ready with a dead pid is death")
+      assert.ok(!existsSync(readyGone), "the dead shell is gone for real")
+      // everything the sweep cannot prove dead stays, however it looks
+      for (const [label, dir] of [
+        ["an older build's ready", oldReady],
+        ["a plain file wearing the socket's name", staleSock],
+        ["an empty directory", empty],
+        ["a live pid", live],
+        ["a planted link", linkShell],
+        ["inside the grace", fresh],
+        ["outside the prefix", unrelated],
+        ["unreadable", unreadable],
+      ]) {
+        assert.ok(!removed.includes(dir), `${label} was swept`)
+        assert.ok(existsSync(dir), `${label} was removed`)
+      }
+      assert.ok(existsSync(sock), "the linked socket's target stands")
       assert.equal((await sweepStaleDirs({ root, minAgeMs: 30000 })).length, 0, "a second sweep finds nothing new")
     } finally {
       for (const s of accepted) s.destroy()

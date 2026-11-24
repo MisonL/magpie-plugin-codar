@@ -123,7 +123,12 @@ The proxy lives in a private (0700) directory under the temp root, made for it
 by the plugin and holding its socket and ready file. The plugin removes that
 directory when the proxy exits, and so does the proxy itself on its way out —
 so a plugin process killed outright, whose own cleanup never runs, still
-leaves nothing behind once the proxy it started sees its stdin close.
+leaves nothing behind once the proxy it started sees its stdin close. When
+both die without a handler, the next start sweeps such a directory away, and
+only on proof: the ready file records the proxy's pid, and a shell is dropped
+only when that process is gone. A directory the sweep cannot judge (an older
+build's ready with no pid, no ready at all) is left standing rather than
+guessed at.
 
 A package manager installs the one whose `os`/`cpu` match the machine and skips
 the other four, so an install is one 5.8–6.6 MB build (2.4–2.8 MB of tarball,
