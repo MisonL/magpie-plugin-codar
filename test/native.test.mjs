@@ -1978,6 +1978,39 @@ test("a ready.json that is a symlink is never read, so it cannot prove death", a
   }
 })
 
+test("a ready that marks another PID namespace is kept, not swept", async () => {
+  // ESRCH is a question about THIS namespace: process.kill(pid, 0) answers it
+  // only inside the caller's own PID namespace, and a shared temp root across
+  // containers (one uid, different namespaces — the adversarial review's
+  // finding, 2026-11-24) would make a live proxy in another namespace read as
+  // gone. The proxy therefore marks its namespace in the ready file, and a
+  // mark this sweep cannot match against its own is unproven: kept.
+  const { proxyDead } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "cdr-ns-"))
+  try {
+    const dead = spawn(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { stdio: ["ignore", "pipe", "ignore"] })
+    const deadPid = await new Promise((r) => dead.stdout.once("data", (c) => r(Number(String(c)))))
+    await new Promise((r) => dead.once("exit", r))
+    const other = join(root, "codar-plugin-ns1")
+    mkdirSync(other, { recursive: true, mode: 0o700 })
+    writeFileSync(join(other, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: String(deadPid), nsid: "pid:[not-this-one]" }))
+    assert.equal(proxyDead(other), false, "a ready from another namespace was swept on this namespace's ESRCH")
+    // a ready with no mark at all is a macOS/Windows proxy (no PID namespaces,
+    // no /proc to mark from): judged by its pid as usual
+    const unmarked = join(root, "codar-plugin-ns2")
+    mkdirSync(unmarked, { recursive: true, mode: 0o700 })
+    writeFileSync(join(unmarked, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: String(deadPid) }))
+    assert.equal(proxyDead(unmarked), true, "an unmarked dead pid was kept")
+    // a mark in a shape this sweep does not understand is not judged either
+    const odd = join(root, "codar-plugin-ns3")
+    mkdirSync(odd, { recursive: true, mode: 0o700 })
+    writeFileSync(join(odd, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: String(deadPid), nsid: 42 }))
+    assert.equal(proxyDead(odd), false, "a numeric namespace mark was judged")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("a pid that is not a decimal integer is no pid this sweep acts on", async () => {
   // The proxy writes a decimal string. Everything else — a boolean (Number
   // would make true → 1), a float, a negative, pid 1 itself, a hex string —

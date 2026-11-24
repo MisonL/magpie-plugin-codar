@@ -1029,11 +1029,24 @@ func TestReadyInfoPublishesTheAddressItsPidAndTheTCPToken(t *testing.T) {
 	// — safe, but a shell that never goes. Pin the shape exactly.
 	unix := readyInfo("unix", "/tmp/x/proxy.sock", 4242, "")
 	want := map[string]string{"transport": "unix", "address": "/tmp/x/proxy.sock", "pid": "4242"}
+	if ns := pidNamespaceID(); ns != "" {
+		want["nsid"] = ns
+	}
 	if !reflect.DeepEqual(unix, want) {
 		t.Fatalf("unix ready = %v, want %v", unix, want)
 	}
 	tcp := readyInfo("tcp", "127.0.0.1:5000", 4242, "ab12")
 	wantTCP := map[string]string{"transport": "tcp", "address": "127.0.0.1:5000", "pid": "4242", "token": "ab12"}
+	if ns := pidNamespaceID(); ns != "" {
+		// Linux: the mark travels with the pid, so a host in another PID
+		// namespace cannot read this pid's ESRCH as death.
+		wantTCP["nsid"] = ns
+		if unix := readyInfo("unix", "/tmp/x/proxy.sock", 4242, ""); unix["nsid"] != ns {
+			t.Fatalf("unix ready nsid = %q, want %q", unix["nsid"], ns)
+		}
+	} else if _, ok := tcp["nsid"]; ok {
+		t.Fatalf("tcp ready carries an nsid on a platform that shows no namespace: %v", tcp)
+	}
 	if !reflect.DeepEqual(tcp, wantTCP) {
 		t.Fatalf("tcp ready = %v, want %v", tcp, wantTCP)
 	}

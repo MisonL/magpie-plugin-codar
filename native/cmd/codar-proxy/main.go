@@ -85,6 +85,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -473,10 +474,37 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 // the host's sweep into "keep everything", which is safe but never cleans.
 func readyInfo(network, addr string, pid int, token string) map[string]string {
 	info := map[string]string{"transport": network, "address": addr, "pid": strconv.Itoa(pid)}
+	// nsid marks the PID namespace the pid is numbered in. kill(pid, 0)
+	// answers ESRCH only for the caller's own namespace, so a temp root
+	// shared across containers (one uid) would let one host's sweep call
+	// another namespace's live proxy dead. Where /proc shows the namespace
+	// (Linux), the mark travels with the pid; where it does not (macOS,
+	// Windows — no PID namespaces), there is nothing to mark and the pid
+	// stands alone. A host that cannot match a mark keeps the directory.
+	if ns := pidNamespaceID(); ns != "" {
+		info["nsid"] = ns
+	}
 	if network == "tcp" {
 		info["token"] = token
 	}
 	return info
+}
+
+// pidNamespaceID names this process's PID namespace the way the host reads it
+// back ("pid:[4026531836]"), or "" where the OS shows no namespace files
+// (everything but Linux). /proc/self/ns/pid is a magic symlink: its target is
+// the name, and resolving the link itself would fail. The check is on the
+// build's target OS, not a probe: a linux binary run where /proc is hidden
+// answers "" too, and an unmarked ready is the ordinary case elsewhere.
+func pidNamespaceID() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	name, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		return ""
+	}
+	return name
 }
 
 func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
