@@ -62,7 +62,7 @@
 // the wire from this binary and from the 0.3.17 sidecars, and match.
 //
 // The socket's mode is 0600 and it is removed on exit. When ready-file is
-// given, the listener's JSON {"transport", "address", "token"} is written
+// given, the listener's JSON {"transport", "address", "pid", "token"} is written
 // there once the listener is up and removed on exit. SIGTERM and SIGINT stop
 // it; with a ready-file it also stops when stdin closes, the way the sidecar
 // stops when the desktop it serves goes away.
@@ -190,15 +190,7 @@ func main() {
 	}
 
 	if *ready != "" {
-		// pid lets the host tell this proxy's live-but-wedged socket from a
-		// dead one: a full accept queue answers ECONNREFUSED on macOS exactly
-		// as a dead socket does (measured 2026-11-23), so only the process
-		// itself can prove the listener is standing.
-		info := map[string]string{"transport": network, "address": addr, "pid": strconv.Itoa(os.Getpid())}
-		if network == "tcp" {
-			info["token"] = *token
-		}
-		data, _ := json.Marshal(info)
+		data, _ := json.Marshal(readyInfo(network, addr, os.Getpid(), *token))
 		if err := os.WriteFile(*ready, data, 0o600); err != nil {
 			failStartup("ready file %s: %v", *ready, err)
 		}
@@ -471,6 +463,20 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 		return errors.New("codar-proxy: redirect changes host")
 	}
 	return nil
+}
+
+// readyInfo is what the ready file publishes: the listener's address, the
+// proxy's own pid — which lets the host tell a live-but-wedged socket from a
+// dead one, since a full accept queue answers ECONNREFUSED on macOS exactly as
+// a dead socket does (measured 2026-11-23) — and, on TCP, the per-run header
+// token. A test pins the shape: a renamed or missing pid would quietly turn
+// the host's sweep into "keep everything", which is safe but never cleans.
+func readyInfo(network, addr string, pid int, token string) map[string]string {
+	info := map[string]string{"transport": network, "address": addr, "pid": strconv.Itoa(pid)}
+	if network == "tcp" {
+		info["token"] = token
+	}
+	return info
 }
 
 func (f *forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {

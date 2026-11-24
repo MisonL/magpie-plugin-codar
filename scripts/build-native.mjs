@@ -143,7 +143,8 @@ const archOf = (head, goos) => {
 }
 
 // newestSourceMtime is when the proxy's own source last changed — the .go
-// files under native/cmd, the content each build carries. A build older than
+// files under native/cmd that go into each build (`_test.go` excluded: it is
+// not compiled in, so a test-only change cannot make a build stale). A build older than
 // one of them was made from something else; the release line once shipped
 // builds made before the source they named, and a header-shaped file cannot
 // tell anyone that. go.mod is left out on purpose: the build loop rewrites it
@@ -157,7 +158,9 @@ export const newestSourceMtime = (srcDir = join(root, "cmd")) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name)
       if (entry.isDirectory()) walk(path)
-      else if (entry.name.endsWith(".go")) newest = Math.max(newest, statSync(path).mtimeMs)
+      // _test.go is not compiled into the build: a test-only change cannot
+      // make a binary stale (and would otherwise force five rebuilds)
+      else if (entry.name.endsWith(".go") && !entry.name.endsWith("_test.go")) newest = Math.max(newest, statSync(path).mtimeMs)
     }
   }
   try {

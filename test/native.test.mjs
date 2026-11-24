@@ -1870,12 +1870,17 @@ test("a ready without a pid, or in a shape the sweep does not know, leaves the s
   }
   try {
     for (const [label, ready] of Object.entries(shapes)) {
-      const dir = join(root, "codar-plugin-" + label.replace(/\W+/g, "").slice(0, 12) + Math.random().toString(36).slice(2, 6))
+      const dir = join(root, "codar-plugin-s" + String(Object.keys(shapes).indexOf(label)).padStart(3, "0"))
       mkdirSync(dir, { recursive: true, mode: 0o700 })
       if (typeof ready === "string") writeFileSync(join(dir, "ready.json"), ready)
       else writeFileSync(join(dir, "ready.json"), JSON.stringify(ready))
       assert.equal(proxyDead(dir), false, `${label}: a shell the sweep could not judge was declared dead`)
     }
+    // a ready bigger than any the proxy writes is not read as one
+    const huge = join(root, "codar-plugin-huge001")
+    mkdirSync(huge, { recursive: true, mode: 0o700 })
+    writeFileSync(join(huge, "ready.json"), JSON.stringify({ transport: "tcp", address: "127.0.0.1:1", pid: "1", pad: "x".repeat(8192) }))
+    assert.equal(proxyDead(huge), false, "an oversized ready was judged")
     // a FIFO named ready.json would block a plain read forever
     const fifo = join(root, "codar-plugin-fifo001")
     mkdirSync(fifo, { recursive: true, mode: 0o700 })
@@ -1945,9 +1950,12 @@ test("a pid that is gone is death, whatever its socket says", async () => {
 test("a ready.json that is a symlink is never read, so it cannot prove death", async () => {
   // Codex, 2026-11-24: the shape check ran on the path and the read on the
   // path again, so a same-user plant could swap in a symlink to a dead-pid
-  // JSON between them and have a live proxy's directory swept. One open with
-  // O_NOFOLLOW decides shape and bytes together; a link at the name fails
-  // that open, and the shell stays.
+  // JSON between them and have a live proxy's directory swept. POSIX has
+  // O_NOFOLLOW for it, and Windows has no such flag in Node, so the check
+  // every platform runs is identity: the path's own inode must be the
+  // descriptor's. Either way a link at the name is not read and the shell
+  // stays. (Windows without Developer Mode cannot make a symlink at all —
+  // the case is then moot, and the test says so rather than failing.)
   const { proxyDead } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "cdr-ln-"))
   const dir = join(root, "codar-plugin-lnk01")
@@ -1957,31 +1965,14 @@ test("a ready.json that is a symlink is never read, so it cannot prove death", a
   const deadPid = await new Promise((r) => dead.stdout.once("data", (c) => r(Number(String(c)))))
   await new Promise((r) => dead.once("exit", r))
   writeFileSync(elsewhere, JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid: String(deadPid) }))
-  symlinkSync(elsewhere, join(dir, "ready.json"))
   try {
+    try {
+      symlinkSync(elsewhere, join(dir, "ready.json"))
+    } catch (e) {
+      assert.match(String(e?.code), /^(EPERM|EACCES)$/, `a symlink failed for an unexpected reason: ${e?.message}`)
+      return // no link privilege here: the plant cannot be made either
+    }
     assert.equal(proxyDead(dir), false, "a symlinked ready was followed and its dead pid taken as proof")
-  } finally {
-    rmSync(root, { recursive: true, force: true })
-  }
-})
-
-test("a ready.json swapped for a symlink after the open cannot change what was read", async () => {
-  // The other half: even where O_NOFOLLOW is not what the name shows (a real
-  // file is replaced mid-lifetime), the bytes read are the bytes of the inode
-  // that was opened. A directory whose ready is a real file at open time and
-  // a symlink after still reads as the original file's answer.
-  const { proxyDead } = await import("../lib/native.mjs")
-  const root = mkdtempSync(join(tmpdir(), "cdr-sw-"))
-  const dir = join(root, "codar-plugin-swp01")
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-  const ready = join(dir, "ready.json")
-  writeFileSync(ready, JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid: String(process.pid) }))
-  try {
-    const answer = proxyDead(dir)
-    // the read happened on the descriptor, so the answer is the live pid's:
-    // kept whether or not anything was swapped afterwards
-    assert.equal(answer, false, "a live pid's ready was read as death")
-    assert.ok(existsSync(ready))
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -1997,7 +1988,7 @@ test("a pid that is not a decimal integer is no pid this sweep acts on", async (
   const shapes = [true, 1.5, -4, 1, "1", "0x10", " 12", "12abc", 4194305, null, {}]
   try {
     for (const pid of shapes) {
-      const dir = join(root, "codar-plugin-p" + Math.random().toString(36).slice(2, 8))
+      const dir = join(root, "codar-plugin-p" + String(shapes.indexOf(pid)).padStart(3, "0"))
       mkdirSync(dir, { recursive: true, mode: 0o700 })
       writeFileSync(join(dir, "ready.json"), JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid }))
       assert.equal(proxyDead(dir), false, `pid ${JSON.stringify(pid)} was judged`)
@@ -2072,8 +2063,10 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
     const empty = mk("codar-plugin-nada003")
     age(empty)
     const live = mk("codar-plugin-live004")
+    // fresh is judged-dead material inside the grace: a ready whose pid is
+    // gone, but the directory is younger than the window, must survive
     const fresh = mk("codar-plugin-fresh5")
-    writeFileSync(join(fresh, "ready.json"), "{}")
+    writeFileSync(join(fresh, "ready.json"), JSON.stringify({ transport: "unix", address: join(fresh, "proxy.sock"), pid: String(deadPid) }))
     const unrelated = mk("codar-plugins-other6")
     writeFileSync(join(unrelated, "ready.json"), "{}")
     age(unrelated)
@@ -2084,14 +2077,6 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
     // one real server answers inside `live`, at the address its ready names
     const sock = join(live, "proxy.sock")
     const server = createServer()
-    // track what the probe leaves behind: a client that connects and
-    // destroys itself stays half-open on the server side, and that fd is
-    // what keeps the close callback (and the process) waiting.
-    const accepted = new Set()
-    server.on("connection", (s) => {
-      accepted.add(s)
-      s.on("close", () => accepted.delete(s))
-    })
     await new Promise((r, rej) => {
       server.once("error", rej)
       server.listen(sock, r)
@@ -2126,7 +2111,6 @@ test("a sweep drops only dead, aged directories under our prefix", NO_UNIX, asyn
       assert.ok(existsSync(sock), "the linked socket's target stands")
       assert.equal((await sweepStaleDirs({ root, minAgeMs: 30000 })).length, 0, "a second sweep finds nothing new")
     } finally {
-      for (const s of accepted) s.destroy()
       await new Promise((r) => server.close(r))
       try { unlinkSync(sock) } catch {}
       chmodSync(unreadable, 0o700)

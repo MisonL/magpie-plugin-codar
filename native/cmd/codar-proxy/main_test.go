@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1019,5 +1020,21 @@ func TestASlowButLiveStreamIsNotCutAtTheHeadTimeout(t *testing.T) {
 	}
 	if want, got := 8, strings.Count(string(body), "data: piece"); got != want {
 		t.Fatalf("%d pieces arrived, want %d: the stream was cut at the head timeout", got, want)
+	}
+}
+
+func TestReadyInfoPublishesTheAddressItsPidAndTheTCPToken(t *testing.T) {
+	// The host's sweep asks the pid to tell a live proxy from a dead shell;
+	// a renamed or dropped key would quietly turn it into "keep everything"
+	// — safe, but a shell that never goes. Pin the shape exactly.
+	unix := readyInfo("unix", "/tmp/x/proxy.sock", 4242, "")
+	want := map[string]string{"transport": "unix", "address": "/tmp/x/proxy.sock", "pid": "4242"}
+	if !reflect.DeepEqual(unix, want) {
+		t.Fatalf("unix ready = %v, want %v", unix, want)
+	}
+	tcp := readyInfo("tcp", "127.0.0.1:5000", 4242, "ab12")
+	wantTCP := map[string]string{"transport": "tcp", "address": "127.0.0.1:5000", "pid": "4242", "token": "ab12"}
+	if !reflect.DeepEqual(tcp, wantTCP) {
+		t.Fatalf("tcp ready = %v, want %v", tcp, wantTCP)
 	}
 }
