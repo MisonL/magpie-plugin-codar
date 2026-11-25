@@ -1106,7 +1106,7 @@ test("the packed main package installs and starts exactly this machine's platfor
       // With nothing offered there is no proxy, and the plugin says which
       // reason rather than pretending it has one.
       const bare = await consumerInstall({ dir: join(work, `bare-${manager}`), manager, main: mainTarball, platform: [], probe: { url: "https://api.claw.speedai.com/v1/codar/models" } })
-      assert.deepEqual(bare.installed, [], `${manager} installed a platform package with none offered`)
+      assert.deepEqual(bare.installed, [], `${manager} installed a platform package with none offered: ${JSON.stringify(bare)}`)
       assert.equal(bare.proxy, null, "a proxy path was found with no platform package")
       assert.equal(bare.unavailable, "no platform package for this machine", JSON.stringify(bare))
     }

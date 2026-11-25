@@ -226,8 +226,24 @@ export const consumerInstall = async ({ dir, manager, main, platform, probe = {}
     // HTTP server, and a synchronous child blocks the event loop that has to
     // answer it — the install then waits for a registry that cannot speak and
     // the gate hangs with nothing to show for it.
+    //
+    // Each install gets caches of its own, so nothing an earlier call
+    // downloaded is reachable from this one: a manager's global cache is
+    // keyed by name@version (bun adds the registry's own address), and these
+    // calls serve a fresh random port each. It also keeps the suite's fixture
+    // packages out of the developer's ~/.bun and ~/.npm caches — bun's held
+    // 505 of them (282 MB) on 2026-11-25, from these runs alone.
     const said = await new Promise((resolve) => {
-      const child = spawn(manager, ["add", main], { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, npm_config_registry: registry } })
+      const child = spawn(manager, ["add", main], {
+        cwd: dir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          npm_config_registry: registry,
+          BUN_INSTALL_CACHE_DIR: join(dir, ".bun-cache"),
+          npm_config_cache: join(dir, ".npm-cache"),
+        },
+      })
       let out = ""
       child.stdout.on("data", (d) => (out += d))
       child.stderr.on("data", (d) => (out += d))
@@ -249,7 +265,11 @@ export const consumerInstall = async ({ dir, manager, main, platform, probe = {}
   }
 
   const modules = join(dir, "node_modules")
-  const installed = readdirSync(modules).filter((n) => n.startsWith("magpie-plugin-codar-"))
+  // Installed means a package a manager actually unpacked: the directory
+  // carries a manifest. A manager that leaves a placeholder under an optional
+  // package's name (or half-writes one) has installed nothing, and counting
+  // the name alone would read it as an install.
+  const installed = readdirSync(modules).filter((n) => n.startsWith("magpie-plugin-codar-") && existsSync(join(modules, n, "package.json")))
   const entry = pathToFileURL(join(modules, "magpie-plugin-codar", "lib", "native.mjs")).href
   const probeScript = join(dir, "probe.mjs")
   writeFileSync(
