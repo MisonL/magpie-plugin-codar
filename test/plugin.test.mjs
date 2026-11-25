@@ -1688,13 +1688,13 @@ test("a QR state the vendor will not finish settles the wait, not five minutes l
     // the page's own status poll is what makes the listener ask the vendor
     const polled = await (await fetch(`${page.url}status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene: "scene-2" }) })).json()
     assert.equal(polled.state, "error")
-    const started = Date.now()
     const answer = await Promise.race([
       page.wait(),
       new Promise((r) => setTimeout(() => r("timeout"), 2000)),
     ])
+    // settling before the race's own deadline is the proof; a wall-clock
+    // bound here only rebuilt that deadline out of the machine's load
     assert.notEqual(answer, "timeout", "wait() answered without the TTL running out")
-    assert.ok(Date.now() - started < 2000)
     assert.match(answer.error, /短信安全验证/, "and the vendor's sentence is the answer")
     assert.equal(answer.token, undefined, "no token is invented")
   } finally {

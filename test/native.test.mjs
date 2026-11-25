@@ -798,9 +798,11 @@ test("a bodiless answer is complete at its head, whatever its headers say", NO_U
       if (!hold) socket.end()
     })
     try {
-      const started = Date.now()
+      // A deadline hit rejects (the silence bound), so reaching the assertion
+      // is itself the proof the answer settled at the head rather than
+      // waiting for a body the peer never sends. A wall-clock bound here only
+      // measured the machine's load.
       const ans = await request(s.path, { timeoutMs: 800 })
-      assert.ok(Date.now() - started < 500, `${label}: the answer waited for a body it never has`)
       assert.equal(await ans.text(), "")
     } finally {
       await s.close()
@@ -2012,13 +2014,15 @@ test("a ready that marks another PID namespace is kept, not swept", async () => 
 })
 
 test("a pid that is not a decimal integer is no pid this sweep acts on", async () => {
-  // The proxy writes a decimal string. Everything else — a boolean (Number
-  // would make true → 1), a float, a negative, pid 1 itself, a hex string —
-  // is a shape the sweep does not understand, and an ununderstood shape is
-  // kept, never judged.
+  // The proxy writes a decimal string. Everything else — a JSON number, a
+  // boolean (Number would make true → 1), a float, a negative, pid 1 itself,
+  // a hex or space-padded string — is a shape the sweep does not understand,
+  // and an ununderstood shape is kept, never judged. The number 4242 is in
+  // the list on purpose: it is a well-formed pid, and only the string shape
+  // is what the proxy writes.
   const { proxyDead } = await import("../lib/native.mjs")
   const root = mkdtempSync(join(tmpdir(), "cdr-pid-"))
-  const shapes = [true, 1.5, -4, 1, "1", "0x10", " 12", "12abc", 4194305, null, {}]
+  const shapes = [true, 1.5, -4, 1, 4242, "1", "0x10", " 12", "12abc", 4194305, null, {}]
   try {
     for (const pid of shapes) {
       const dir = join(root, "codar-plugin-p" + String(shapes.indexOf(pid)).padStart(3, "0"))
