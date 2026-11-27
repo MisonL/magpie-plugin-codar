@@ -1438,8 +1438,16 @@ test("a build is checked against the source it was made from, and a foreign one 
   try {
     const fake = join(dir, "fake.bin")
     writeFileSync(fake, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(4096, 7)]))
-    const got = buildInfoOf(fake)
+    // The reader is driven with a stub here and in the two lines below: the
+    // answer comes from `go version -m`, and a runner without a Go toolchain
+    // (the macOS CI job has none) must not turn this into a skipped check that
+    // still reads as a pass.
+    const got = buildInfoOf(fake, () => ({ status: 1, stdout: "", stderr: "could not read Go build info: unrecognized file format" }))
     assert.equal(got?.ok, false, "a file with no Go build record read as this repo's build")
+    const mine = buildInfoOf(fake, () => ({ status: 0, stdout: "x: go1.26.7\n\tpath\tgithub.com/MisonL/magpie-plugin-codar/native/cmd/codar-proxy\n" }))
+    assert.equal(mine?.ok, true, "this repo's own build record was refused")
+    const other = buildInfoOf(fake, () => ({ status: 0, stdout: "x: go1.26.7\n\tpath\tgithub.com/someone/else\n" }))
+    assert.equal(other?.ok, false, "another module's build record was accepted")
     // Go absent is "no answer", not a pass
     assert.equal(buildInfoOf(fake, () => ({ error: { code: "ENOENT" } })), null, "a machine without go was read as a pass")
   } finally {
