@@ -269,14 +269,8 @@ export const inspectTarget = (dir, t, sourceMtime = 0, want = sourceHash()) => {
   // The fingerprint is what a copy cannot fake: `cp` refreshes the mtime, so a
   // stale binary from this same repo passed every other check. A build made
   // before this marker existed has none, and is refused like any other.
-  if (want) {
-    let has = false
-    try {
-      has = readFileSync(path).includes(Buffer.from(`${SOURCE_MARKER}${want}`))
-    } catch {
-      has = false
-    }
-    if (!has) return { name, state: "broken", reason: "built from other sources than the tree has; run node scripts/build-native.mjs --all" }
+  if (want && !carriesSource(path, want)) {
+    return { name, state: "broken", reason: "built from other sources than the tree has; run node scripts/build-native.mjs --all" }
   }
   return { name, state: "present" }
 }
@@ -295,11 +289,22 @@ export const BUILD_PATH = "github.com/MisonL/magpie-plugin-codar/native/cmd/coda
 // is told so rather than waved through. `go version -m` exits 1 on a file that
 // is not a Go binary at all, which is the refusal this gate exists for.
 export const buildInfoOf = (file, run = spawnSync) => {
-  const out = run("go", ["version", "-m", file], { encoding: "utf8" })
+  const out = run(process.env.GO || "go", ["version", "-m", file], { encoding: "utf8" })
   if (out?.error?.code === "ENOENT") return null
   const text = `${out?.stdout ?? ""}${out?.stderr ?? ""}`
   const stated = text.split("\n").find((line) => line.startsWith("\tpath\t"))
   return { ok: out?.status === 0 && stated?.trim() === `path\t${BUILD_PATH}`, said: stated?.trim() ?? text.trim().split("\n")[0] ?? "" }
+}
+
+// carriesSource says whether a file carries this tree's fingerprint. It is the
+// whole evidence a copy cannot fake: the string is inside the binary, written
+// by the linker from the sources that were compiled.
+export const carriesSource = (file, hash = sourceHash()) => {
+  try {
+    return readFileSync(file).includes(Buffer.from(`${SOURCE_MARKER}${hash}`))
+  } catch {
+    return false
+  }
 }
 
 export const checkTargets = (dir = out, sourceMtime = newestSourceMtime()) =>
@@ -340,7 +345,10 @@ function build(argv) {
     for (const t of targets) {
       const file = join(out, binaryName(t))
       if (!existsSync(file)) {
-        console.log(`absent ${binaryName(t)}`)
+        // A file this pass cannot read is not a pass: the answer it is asked
+        // for ("is this artifact the proxy this tree builds?") is "no".
+        bad++
+        console.error(`build-native: ${binaryName(t)} is not there to be identified`)
         continue
       }
       const got = buildInfoOf(file)
@@ -349,11 +357,17 @@ function build(argv) {
         console.error("build-native: `go` is not on PATH; it is what reads a build's own record")
         return 2
       }
-      if (got.ok) console.log(`identified ${binaryName(t)}`)
-      else {
+      if (!got.ok) {
         bad++
         console.error(`build-native: ${binaryName(t)} is not this repo's proxy (${got.said || "no build record"})`)
+        continue
       }
+      if (!carriesSource(file)) {
+        bad++
+        console.error(`build-native: ${binaryName(t)} is this repo's proxy but not this tree's build; run node scripts/build-native.mjs --all`)
+        continue
+      }
+      console.log(`identified ${binaryName(t)}`)
     }
     if (!sawGo) return 2
     if (bad) {

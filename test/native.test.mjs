@@ -1415,6 +1415,42 @@ test("staging refuses an empty build directory before it writes anything", { tim
   }
 })
 
+test("a staged package that is not the build it claims is refused", async () => {
+  // Staging copies, so the file in the package must be the file in native/bin.
+  // Size and mode alone passed a stale file left from an earlier version and a
+  // hand-edited one (2026-11-27 review).
+  const { stagePackages, checkPackages } = await import("../scripts/native-packages.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-staged-"))
+  const bin = join(root, "bin")
+  const out = join(root, "packages")
+  mkdirSync(bin, { recursive: true })
+  const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version
+  const { binaryFile } = await import("../native/binary-name.mjs")
+  const targets = [{ os: "darwin", arch: "arm64", file: binaryFile("darwin", "arm64") }, { os: "linux", arch: "arm64", file: binaryFile("linux", "arm64") }]
+  try {
+    for (const t of targets) {
+      writeFileSync(join(bin, t.file), Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(8192, 1)]))
+      chmodSync(join(bin, t.file), 0o755)
+    }
+    const wrote = stagePackages({ bin, out, version, targets })
+    assert.equal(wrote.length, 2, "staging did not write the packages")
+    const ok = checkPackages({ dir: out, version, bin, targets })
+    assert.deepEqual(ok.map((r) => r.state), ["present", "present"], `freshly staged packages were refused: ${JSON.stringify(ok)}`)
+
+    // the same size and mode, different bytes
+    const victim = join(out, wrote[0].name, "bin", targets[0].file)
+    const bytes = readFileSync(victim)
+    bytes[bytes.length - 1] ^= 0xff
+    writeFileSync(victim, bytes)
+    chmodSync(victim, 0o755)
+    const rows = checkPackages({ dir: out, version, bin, targets })
+    assert.equal(rows[0].state, "broken", "a package carrying bytes that are not the build passed")
+    assert.match(rows[0].reason, /is not the build in/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("a publish that failed is asked about, and only a version the registry has counts", async () => {
   // npm can report an error while the registry took the version, and the
   // packument lags the write. The release loop used to stop on the exit code
@@ -1450,6 +1486,10 @@ test("a build is checked against the source it was made from, and a foreign one 
     assert.equal(other?.ok, false, "another module's build record was accepted")
     // Go absent is "no answer", not a pass
     assert.equal(buildInfoOf(fake, () => ({ error: { code: "ENOENT" } })), null, "a machine without go was read as a pass")
+    // and a file with this repo's record but another tree's bytes is not this
+    // tree's build: the fingerprint is carried inside the binary
+    const { carriesSource } = await import("../scripts/build-native.mjs")
+    assert.equal(carriesSource(fake), false, "a file with no fingerprint was read as this tree's build")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

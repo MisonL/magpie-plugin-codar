@@ -100,7 +100,7 @@ export function stagePackages({ bin, out, version, targets = buildTargets }) {
 // cpu are npm's spelling of the target, and a non-empty executable build is
 // there. The version is the argument rather than read off the main package, so
 // a caller checking a different version sees every package drift at once.
-export function checkPackages({ dir, version, targets = buildTargets }) {
+export function checkPackages({ dir, version, targets = buildTargets, bin = null }) {
   return platformPackages(targets).map((p) => {
     const where = join(dir, p.name)
     const manifest = readManifest(join(where, "package.json"))
@@ -118,6 +118,20 @@ export function checkPackages({ dir, version, targets = buildTargets }) {
     }
     if (stat.size < 4096) return { name: p.name, state: "broken", reason: `bin/${p.file} only ${stat.size} bytes` }
     if (process.platform !== "win32" && (stat.mode & 0o111) === 0) return { name: p.name, state: "broken", reason: `bin/${p.file} not executable` }
+    // With the build directory in hand, the staged file must BE that build:
+    // staging copies, so anything else is a package carrying bytes the strict
+    // check never saw (a stale file left in the staging tree from an earlier
+    // version, or a hand edit). Size and mode alone passed all of those
+    // (2026-11-27 review).
+    if (bin) {
+      try {
+        const want = readFileSync(join(bin, p.file))
+        const got = readFileSync(join(where, "bin", p.file))
+        if (Buffer.compare(want, got) !== 0) return { name: p.name, state: "broken", reason: `bin/${p.file} is not the build in ${bin}` }
+      } catch (e) {
+        return { name: p.name, state: "broken", reason: `bin/${p.file} could not be compared with the build: ${e.message}` }
+      }
+    }
     return { name: p.name, state: "present" }
   })
 }
@@ -199,7 +213,7 @@ function main(argv) {
   if (args.has("--check")) {
     for (const r of brokenBuilds) console.error(`native-packages: ${r.name} ${r.reason ?? "no build"}`)
     if (brokenBuilds.length) console.error("native-packages: run `npm run native:all` first")
-    const rows = checkPackages({ dir: staged, version: manifest.version })
+    const rows = checkPackages({ dir: staged, version: manifest.version, bin: buildDir(pkgRoot) })
     for (const r of rows) console.log(r.state === "present" ? `present ${r.name}@${manifest.version}` : `broken ${r.name}: ${r.reason}`)
     return problems.length || brokenBuilds.length || rows.some((r) => r.state !== "present") ? 1 : 0
   }
@@ -217,7 +231,7 @@ function main(argv) {
   const wrote = stageFromTree()
   for (const p of wrote) console.log(`staged ${p.name}@${manifest.version} -> ${p.dir}`)
   if (!args.has("--publish")) return 0
-  const rows = checkPackages({ dir: staged, version: manifest.version })
+  const rows = checkPackages({ dir: staged, version: manifest.version, bin: buildDir(pkgRoot) })
   const bad = rows.filter((r) => r.state !== "present")
   if (bad.length) {
     console.error(`native-packages: ${bad.map((r) => `${r.name} ${r.reason}`).join("; ")}`)

@@ -8206,6 +8206,83 @@ test("a token spelled in two-character groups around dots is cut where no key is
   assert.equal(scrubShapes("See U.S.A. and U.K. for details", ""), "See U.S.A. and U.K. for details")
 })
 
+test("the host's cancellation is found in the argument it actually arrives in", async () => {
+  // magpie 0.1.4824 calls usage(getAuth, provider, { signal }) and
+  // checkin(getAuth, provider): the second argument is a serialized copy of the
+  // provider, so a hook that read only its second argument saw no signal at all
+  // (2026-11-27 review, verified against the host's own JS).
+  const p = await CodarPlugin()
+  const ac = new AbortController()
+  ac.abort()
+  const u = await p.auth.usage(auth, { id: "codar", options: {} }, { signal: ac.signal })
+  assert.equal(u.signIn, "")
+  assert.match(u.error, /取消/)
+  const c = await p.auth.checkin(auth, { id: "codar", options: {} }, { signal: ac.signal })
+  assert.equal(c.outcome, "failed")
+  assert.match(c.message, /取消/)
+  // and the second-argument shape a host might use still works
+  const u2 = await p.auth.usage(auth, { signal: ac.signal })
+  assert.match(u2.error, /取消/)
+})
+
+test("a cancellation that arrives mid-flight does not write the claim", async () => {
+  // The day is spent by the POST; an answer nobody waits for would leave the
+  // card saying failed over a claim that landed. The check-in's own read
+  // aborts first, and the write is never sent.
+  const p = await CodarPlugin()
+  const ac = new AbortController()
+  const seen = []
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    seen.push(String(url))
+    // The points read before the claim is where the host gives up; the read
+    // fails with the abort and the hook must not go on to write.
+    ac.abort()
+    throw Object.assign(new Error("aborted"), { name: "AbortError" })
+  }
+  try {
+    const r = await p.auth.checkin(auth, { id: "codar" }, { signal: ac.signal })
+    assert.equal(r.outcome, "failed", `a cancelled check-in reported ${JSON.stringify(r)}`)
+    assert.match(r.message, /取消/)
+    assert.equal(seen.some((u) => u.includes("/v1/daily-sign")), false, "the claim was written after the host cancelled")
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test("a claim word beside a false boolean is the day claimed", async () => {
+  // {code:"already_claimed", isSigned:false} drew 「今天还没领，现在可以领」 and
+  // the click answered 400 (2026-11-27 review): the word is the vendor's own
+  // statement that the day is gone.
+  const p = await CodarPlugin()
+  const rowFor = async (body) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, agent_token: 0 } },
+        "/v1/agent/balance": { body: { code: 200, data: {} } },
+        "/api/user/self": { body: { code: 200, data: {} } },
+        "/v1/daily-sign/status": { body },
+      },
+      async () => (await p.auth.usage(auth)).windows?.find((w) => w.name === "每日签到"),
+    )
+  const conflict = await rowFor({ code: 200, data: { code: "already_claimed", isSigned: false, retry_after: 0 } })
+  assert.equal(conflict?.display, "今天已领", "a claim word beside isSigned:false offered the claim again")
+  const plain = await rowFor({ code: 200, data: { isSigned: false, retry_after: 0 } })
+  assert.equal(plain?.display, "今天还没领，现在可以领", "a plain false stopped offering the claim")
+})
+
+test("a negative remaining quota keeps the free-model row instead of dropping it", () => {
+  // -1 is the vendor's "no number" sentinel. The filter read `<= 0` and the row
+  // vanished while the models were still free (2026-11-27 review); 0 is the one
+  // value that means exhausted.
+  const future = Math.floor(Date.now() / 1000) + 3600
+  const rows = (remaining) => runningActivities({ code: 200, data: [{ free_until: future, model_ids: ["a"], remaining_quota: remaining, user_quota_limit: 500 }] })
+  assert.equal(rows(-1).length, 1, "a negative sentinel dropped the activity")
+  assert.equal(rows(0).length, 0, "an exhausted pool kept the activity")
+  assert.equal(rows(null).length, 1, "an unlimited pool dropped the activity")
+  assert.equal(rows("x").length, 0, "an unreadable value was drawn as unlimited")
+})
+
 test("a hook the host has given up on stops, instead of reading for its own deadline", async () => {
   // magpie can cancel a card (a closed panel, a refresh it abandoned). Without
   // the signal the four reads still ran for their own 8 s and a proxy start

@@ -412,7 +412,7 @@ const main = async () => {
         cannot.exitCode = 2
         throw cannot
       }
-      const broken = checkPackages({ dir: staged, version }).filter((r) => r.state !== "present")
+      const broken = checkPackages({ dir: staged, version, bin }).filter((r) => r.state !== "present")
       if (broken.length) throw new Error(`a staged platform package is unusable: ${broken.map((r) => `${r.name} ${r.reason}`).join("; ")}`)
       const platform = wrote.map((p) => packedPackage(p.dir, join(root, "platform-tgz")))
       // Both runtimes magpie loads plugins on, not whichever happens to be

@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The install path was checked nowhere on Windows: the suite's packed-install test is skipped there (npm is a `.cmd` shim, and that check's own local registry cannot be reached through it). `scripts/check-packed-install.mjs` installs the two packed tarballs with npm into a scratch project, opens the installed plugin's own `binaryPath()`, and runs the proxy's `-version`; the Windows CI job runs it against the native job's artifact, kept out of `native/bin` so the gate's registry-based check still skips as before.
 
+- The two codex reviews of this batch (2026-11-27) found five things the first pass had wrong, all fixed:
+  - The host's cancellation was read from the wrong argument: magpie 0.1.4824 calls `usage(getAuth, provider, { signal })` and `checkin(getAuth, provider)` — the second argument is a copy of the provider, not options — so neither hook ever saw a signal. The argument carrying one is searched for now, and the check-in's write request carries it too: a cancelled check-in no longer sends `/v1/daily-sign` after the host has given up (the day is spent by the POST, and the card would say failed over a claim that landed). The models hook's catalog read takes the host's signal as well.
+  - A staged platform package was checked by size and mode only, so a stale file left in the staging tree from an earlier version, or a hand-edited one, could be published. The staged file must now be byte-for-byte the build in the directory the strict check passed — staging copies, so anything else is an artifact no check looked at. `--buildinfo` refuses a file that is missing, and reads the GO environment variable like the build does.
+  - The free-model row disappeared when the activity reported `remaining_quota: -1` (the vendor's "no number" sentinel read as an exhausted pool); only 0 means exhausted now.
+  - A claim word beside a false boolean (`{code:"already_claimed", isSigned:false}`) drew 「今天还没领，现在可以领」 and the click answered 400: the word wins.
+  - The short-credential scrub cut inside longer runs: a hash whose middle spelled the key's hex lost that middle, and a key that is its own base64's prefix was cut before its encoding could be found. The encoded forms are cut first, on whole tokens only, and mixed-case hex is cut too.
+
 ## [0.3.4] - 2026-11-21
 
 ### Fixed

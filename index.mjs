@@ -241,6 +241,19 @@ const normalizeModels = (raw) => {
   ))
 }
 
+// signalOf finds the host's cancellation in whichever argument it arrives in.
+// magpie 0.1.4824 calls `usage(getAuth, provider, { signal })` and
+// `checkin(getAuth, provider)` (the second argument is a serialized copy of the
+// provider, not options), so the argument that carries a signal is searched for
+// rather than assumed — and a host that passes one somewhere else keeps working.
+const signalOf = (args) => {
+  for (const a of args) {
+    const signal = a && typeof a === "object" ? a.signal : undefined
+    if (signal && typeof signal.addEventListener === "function") return signal
+  }
+  return undefined
+}
+
 export async function CodarPlugin(input) {
   // Read fresh on every call instead of capturing one at plugin build time:
   // tests swap the global one after this point. The host does not put fetch
@@ -658,8 +671,9 @@ export async function CodarPlugin(input) {
       // passes outcome/credit/streak/message/until to magpie (host.js's
       // checkinOf), and flagging an expired account is usage's job (usage's
       // signIn is what gets read).
-      async checkin(getAuth, ctx = {}) {
-        const signal = ctx?.signal
+      async checkin(...args) {
+        const getAuth = args[0]
+        const signal = signalOf(args.slice(1))
         if (signal?.aborted) return { outcome: "failed", message: "签到已取消" }
         let auth, token
         try {
@@ -966,6 +980,10 @@ export async function CodarPlugin(input) {
           }
           return false
         }
+        // A cancelled check-in must not write: the day is spent even if the
+        // answer never comes back, and the card would say failed over a claim
+        // that landed (2026-11-27 review).
+        if (signal?.aborted) return { outcome: "failed", message: "签到已取消" }
         let r
         try {
           r = await request(`${ACCOUNT}${SIGN_PATH}`, {
@@ -974,6 +992,7 @@ export async function CodarPlugin(input) {
             token,
             fetchImpl,
             timeoutMs: Math.min(TIMEOUT_MS, left()),
+            ...(signal ? { signal } : {}),
           })
         } catch (e) {
           // Account restriction and an expired sign-in both answer 403, but
@@ -1366,11 +1385,12 @@ export async function CodarPlugin(input) {
 
       // Usage: point balance + today's check-in state + free model activities
       // (omit what can't be fetched).
-      async usage(getAuth, ctx = {}) {
+      async usage(...args) {
+        const getAuth = args[0]
         // The host can give up on a card (a closed panel, a timed-out refresh);
         // without the signal the four reads keep the process busy for their own
         // 8 s after nobody is waiting, and a proxy start behind them holds.
-        const signal = ctx?.signal
+        const signal = signalOf(args.slice(1))
         if (signal?.aborted) return { error: "已取消", signIn: "" }
         let auth, token
         try {
@@ -1504,7 +1524,12 @@ export async function CodarPlugin(input) {
 // nothing, and drawing the vendor's words over it offered a claim
         // the account may not have. An array is "an object" too, and is not a
         // state either.
-        const signed = signStateOf(data)
+        // A claim word beside a false boolean is the vendor contradicting
+        // itself; the word is the one thing that says the day is gone
+        // ({code:"already_claimed", isSigned:false} drew 「现在可以领」 and the
+        // click answered 400 — 2026-11-27 review).
+        const claimWord = /(?:^|[^a-z])already[\s_-]*claimed(?:$|[^a-z])/i.test(`${errorCodeOf(status)} ${errorCodeOf(data)}`)
+        const signed = signStateOf(data) === false && claimWord ? true : signStateOf(data)
         if (signed !== null) {
           // Seconds must first be statable, and within what check-in can
           // state: when not (absent, 0, or too large for the calendar to
@@ -1732,7 +1757,7 @@ export async function CodarPlugin(input) {
           // is one of OFFICIAL_HOSTS. The outbound request is the sidecar's Go
           // client with its own UA, not a Node fetch, so this request goes the
           // same way (request() prefers the native transport).
-          const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl })
+          const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ...(options?.signal ? { signal: options.signal } : {}) })
           // The key goes to catalogOf so the token is cut out of the raw
           // strings, before their 120-character clean: a record whose id
           // echoes the token is dropped there (an id that has to be renamed
