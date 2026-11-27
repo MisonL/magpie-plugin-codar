@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A short credential — a six-digit SMS code, a nine-character password — had its encoded spellings left readable: every encoded-run rule looks for sixteen characters or more, so `验证码 MjQ2ODAy 已失效` reached the page and the card intact. The exact base64, base64url and hex forms of a KNOWN key are now cut at any length (a run that spells this key cannot be anything else), while the sentence around them keeps its words.
 - A free-model activity reporting `remaining_quota: -1` (the vendor's "no number" sentinel) drew 「还剩 -1」 and 「已用 501 / 500」; a negative remaining is read as unpriced, so the row says the total it can state instead.
 - The proxy start — the ready's descriptor rules, its address check, the pid comparison, and the tcp transport Windows uses — had no check on Windows at all: the suite skips every test that starts a proxy there. A standalone `node scripts/check-proxy-start.mjs` drives the real start path with a fixture proxy that binds the way each platform's Go build does, and the Windows CI job runs it.
+- `CODAR_PROXY_BIN` may now name a JS file: it runs under this runtime, because Windows cannot spawn a `.mjs` at all. That is what the plugin's own tests and the Windows CI check name — the real proxy is a native binary, so nothing changes in production.
 
 ## [0.3.4] - 2026-11-21
 
