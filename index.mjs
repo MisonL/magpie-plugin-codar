@@ -995,6 +995,13 @@ export async function CodarPlugin(input) {
             ...(signal ? { signal } : {}),
           })
         } catch (e) {
+          // The host gave up, or this request's own clock ran out, while the
+          // write may already have landed: the day is spent either way, so the
+          // card says the result is unknown instead of "failed" over a claim
+          // that counted (2026-11-27 review).
+          if (e?.cancelled || (signal?.aborted && whyOf(e) === "请求已取消")) {
+            return { outcome: "failed", message: "签到请求已取消，结果未知，请稍后查看卡片" }
+          }
           // Account restriction and an expired sign-in both answer 403, but
           // the fix is completely different: the former means contacting the
           // vendor, only the latter means signing in again. Recognize the
@@ -1528,8 +1535,18 @@ export async function CodarPlugin(input) {
         // itself; the word is the one thing that says the day is gone
         // ({code:"already_claimed", isSigned:false} drew 「现在可以领」 and the
         // click answered 400 — 2026-11-27 review).
-        const claimWord = /(?:^|[^a-z])already[\s_-]*claimed(?:$|[^a-z])/i.test(`${errorCodeOf(status)} ${errorCodeOf(data)}`)
-        const signed = signStateOf(data) === false && claimWord ? true : signStateOf(data)
+        // Every code the wrapper chain states, not just the two errorCodeOf
+        // reaches: a claim word two `data` levels down is still the vendor's
+        // word, and an expiry or a restriction beside it is not a claim at all
+        // (2026-11-27 review: `{code:"already_claimed", error:{code:
+        // "account_restricted"}}` was drawn as 「今天已领」).
+        const saidCodes = []
+        for (let node = status, i = 0; i < 9 && node && typeof node === "object" && !Array.isArray(node); i++, node = node.data) {
+          for (const c of [node.code, node.error?.code, node.detail?.code]) if (typeof c === "string" && c.trim()) saidCodes.push(c.trim())
+        }
+        const claimWord = saidCodes.some((c) => /^already[\s_-]*claimed$/i.test(c))
+        const refusedWord = saidCodes.some((c) => /account_restricted|token_expired|invalid_token|unauthorized/i.test(c))
+        const signed = signStateOf(data) === false && claimWord && !refusedWord ? true : signStateOf(data)
         if (signed !== null) {
           // Seconds must first be statable, and within what check-in can
           // state: when not (absent, 0, or too large for the calendar to

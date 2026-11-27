@@ -35,7 +35,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { platformPackages, stagePackages, checkPackages } from "./native-packages.mjs"
-import { buildDir } from "./build-native.mjs"
+import { buildDir, checkTargets } from "./build-native.mjs"
 
 // The checkout this script lives in, not the caller's directory: `npm pack`
 // packs the directory it runs in, and a release script is often run from
@@ -399,6 +399,18 @@ const main = async () => {
     const packedRun = process.env.CODAR_TARBALL_GATE === "1" && !requireBuilds
     if (packedRun) console.log("install: skipped, this is a packed run of the suite (see CODAR_TARBALL_GATE)")
     else if (existsSync(bin) && readdirSync(bin).length) {
+      // The builds this gate installs must be the ones the release checks
+      // accept — the same shape, machine, freshness and embedded fingerprint.
+      // Staging copies whatever is in the directory, so without this the gate
+      // installed and started a plain `go build` that `--buildinfo` and
+      // `--check --strict` both refuse (2026-11-27 review).
+      // Files that are there but are not this tree's builds. A directory with
+      // no build at all is staging's own answer ("no build at", exit 2), not a
+      // broken artifact.
+      const refused = checkTargets(bin).filter((r) => r.state !== "present" && r.state !== "missing")
+      if (refused.length) {
+        throw new Error(`the builds in ${bin} are not this tree's: ${refused.map((r) => `${r.name} ${r.reason}`).join("; ")}; run node scripts/build-native.mjs --all`)
+      }
       const version = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8")).version
       const staged = join(root, "packages")
       let wrote

@@ -8269,6 +8269,17 @@ test("a claim word beside a false boolean is the day claimed", async () => {
   assert.equal(conflict?.display, "今天已领", "a claim word beside isSigned:false offered the claim again")
   const plain = await rowFor({ code: 200, data: { isSigned: false, retry_after: 0 } })
   assert.equal(plain?.display, "今天还没领，现在可以领", "a plain false stopped offering the claim")
+  // A refusal or an expiry beside the claim word is the fix the user needs,
+  // not a claim: reading the word alone drew 「今天已领」 over an account
+  // restriction and over a dead token (2026-11-27 review).
+  const restrictedWord = await rowFor({ code: 200, data: { code: "already_claimed", isSigned: false, error: { code: "account_restricted" } } })
+  assert.notEqual(restrictedWord?.display, "今天已领", "an account restriction was drawn as a claimed day")
+  const expiredWord = await rowFor({ code: 200, data: { code: "already_claimed", isSigned: false, detail: { code: "token_expired" } } })
+  assert.notEqual(expiredWord?.display, "今天已领", "an expired token was drawn as a claimed day")
+  // The word is read wherever the wrapper chain states it, not only one level
+  // down: wrapping the same answer in another data object hid it.
+  const deep = await rowFor({ code: 200, data: { code: 200, data: { code: "already_claimed", data: { isSigned: false, retry_after: 0 } } } })
+  assert.equal(deep?.display, "今天已领", "a claim word two levels down was missed")
 })
 
 test("a negative remaining quota keeps the free-model row instead of dropping it", () => {
@@ -8299,6 +8310,23 @@ test("a hook the host has given up on stops, instead of reading for its own dead
   // a signal the host did not pass is the same as no cancellation
   const ok = await withFetch({ "/v1/gettoken": { body: { code: 200, token: 5, agent_token: 0 } } }, async () => p.auth.usage(auth))
   assert.equal(ok.signIn, undefined, "a healthy read with no signal lost its answer")
+})
+
+test("a labelled echo is cut, and a two-character key does not cut a port or a hash", () => {
+  // A gateway writes the value against a label — "code=…", "hex 0x…" — and
+  // reading the "=" or the "0x" as part of the run left the value readable
+  // (2026-11-27 review). A two-character key is the other way round: its two
+  // bytes are a port number and a slice of any digest, and searching encodings
+  // for them cut whole hashes that had nothing to do with it.
+  const code = "246802"
+  assert.match(scrubShapes("验证码 code=MjQ2ODAy 已失效", code), /code=…/, "a base64 echo after = survived")
+  assert.match(scrubShapes("验证码 hex=0x323436383032 已失效", code), /0x…/, "a hex echo after 0x survived")
+  const port = "端口 6162 连接失败，版本 0.3.5"
+  assert.equal(scrubShapes(port, "ab"), port, "a two-character key cut a port number")
+  const digest = "sha1 09f7e02fd1b93e1ee6b7bdd0f5a4b0c7d8e9f012，版本 0.3.5"
+  assert.equal(scrubShapes(digest, "ab"), digest, "a two-character key cut a whole digest")
+  // and the key itself is still cut plainly, wherever it stands
+  assert.match(scrubShapes("password ab rejected", "ab"), /…/, "the plain key was not cut")
 })
 
 test("a short credential's encoded forms are cut too, and only its own", () => {

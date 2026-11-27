@@ -75,6 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A claim word beside a false boolean (`{code:"already_claimed", isSigned:false}`) drew 「今天还没领，现在可以领」 and the click answered 400: the word wins.
   - The short-credential scrub cut inside longer runs: a hash whose middle spelled the key's hex lost that middle, and a key that is its own base64's prefix was cut before its encoding could be found. The encoded forms are cut first, on whole tokens only, and mixed-case hex is cut too.
 
+- The second review pass (2026-11-27, both reviewers) found five more, all fixed:
+  - The tarball gate staged and installed whatever was in `native/bin`: a plain `go build` that `--buildinfo` and `--check --strict` both refuse was installed and started, and the gate exited 0. The gate now runs the same per-build check first (a directory with no build at all is still its own "no build" answer, exit 2).
+  - Windows' shared temp was still used when `%LOCALAPPDATA%` was missing or could not be created. The per-user tree is now also derived from `%USERPROFILE%` before falling back, so the shared temp remains only for a machine that has neither.
+  - A claim word beside a refusal or an expiry no longer reads as a claimed day (`{code:"already_claimed", error:{code:"account_restricted"}}` drew 「今天已领」), and the word is read wherever the wrapper chain states it, not only one level down.
+  - The short-credential scrub cut too much and too little: a two-character key's hex matched any port number or digest slice and cut whole hashes, while a gateway's labelled echo (`code=…`, `hex 0x…`) was left readable because `=` and `0x` were read as encoding. Encoded forms are cut only for keys of four characters or more, and a label is a boundary.
+  - A check-in the host cancels while its write is in flight says the result is unknown («签到请求已取消，结果未知，请稍后查看卡片») instead of "failed" over a claim that may have landed; an abort and a timeout are told apart, since the host's own `checkin(getAuth, provider)` passes no signal, so only a direct caller can cancel at all.
+
 ## [0.3.4] - 2026-11-21
 
 ### Fixed

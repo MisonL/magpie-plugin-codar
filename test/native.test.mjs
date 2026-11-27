@@ -1508,6 +1508,12 @@ test("the temp root is per user on Windows, and the loopback spellings are this 
     const shared = tempRoot({ LOCALAPPDATA: la, SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp")
     assert.equal(shared, join(la, "codar-plugin"), "a shared temp was used for the private directory")
     assert.equal(tempRoot({ SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp"), "C:\\Windows\\temp", "with no LOCALAPPDATA the shared temp stays the answer")
+    // A service can lack %LOCALAPPDATA% and still have the profile: the same
+    // per-user tree is derived from it before the shared temp is used.
+    const home = mkdtempSync(join(la, "home-"))
+    mkdirSync(join(home, "AppData", "Local"), { recursive: true })
+    const fromProfile = tempRoot({ USERPROFILE: home, SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp")
+    assert.equal(fromProfile, join(home, "AppData", "Local", "codar-plugin"), "the profile's own local directory was not used")
     assert.equal(tempRoot({ LOCALAPPDATA: join(la, "missing"), SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp"), "C:\\Windows\\temp", "a LOCALAPPDATA that is not there falls back")
   } finally {
     rmSync(la, { recursive: true, force: true })
