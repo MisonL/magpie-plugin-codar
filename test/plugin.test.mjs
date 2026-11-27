@@ -464,7 +464,11 @@ test("a name the vendor echoed into the IP check reaches the page as text, not a
   }
 })
 
-test("the config read refuses a FIFO and a socket without waiting, and still reads a file", async () => {
+// Windows has neither: `mkfifo` is not there, and a socket is not a path the
+// config could sit at (its AF_UNIX support is recent and not a file the app
+// would name). The branch this pins — O_NONBLOCK answering instead of waiting —
+// is POSIX-only by construction, so the test is too.
+test("the config read refuses a FIFO and a socket without waiting, and still reads a file", { skip: process.platform === "win32" }, async () => {
   // This hook runs in the one host process every plugin shares, so anything
   // that can block the read blocks magpie. A FIFO is the shape that used to
   // hang it; a socket answers open() with a platform errno instead of bytes
