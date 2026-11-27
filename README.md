@@ -150,12 +150,14 @@ all five in `optionalDependencies`:
 The proxy lives in a private (0700) directory under the temp root, made for it
 by the plugin and holding its socket and ready file. On Windows those modes
 are the read-only bit and nothing more: the ready file's access token is
-protected by the per-user `%TEMP%` rather than by an ACL, and a service whose
-`TEMP` is unset falls back to the shared `%windir%\temp` (the known exception;
-the token in that file is swapped for a new one on every start, and it stops
-matching anything the moment its proxy is gone — so a file left behind is a
-stale value, not a live key. A proxy killed outright rather than asked to stop
-can leave that file until the next start sweeps the directory). The plugin removes that
+protected by a per-user directory rather than by an ACL. The runtime's `%TEMP%`
+is already per user in the ordinary case; when it is not — a service whose
+`TEMP` is unset falls back to the shared `%windir%\temp` — the plugin makes
+its directory under `%LOCALAPPDATA%\codar-plugin` instead, which is per user by
+construction. Should `%LOCALAPPDATA%` be missing too, it falls back to the
+shared temp and the token there is a stale value rather than a live key: it is
+swapped for a new one on every start and stops matching anything the moment its
+proxy is gone. The plugin removes that
 directory when the proxy exits, and so does the proxy itself on its way out —
 so a plugin process killed outright, whose own cleanup never runs, still
 leaves nothing behind once the proxy it started sees its stdin close. When

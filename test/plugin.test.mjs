@@ -8206,6 +8206,24 @@ test("a token spelled in two-character groups around dots is cut where no key is
   assert.equal(scrubShapes("See U.S.A. and U.K. for details", ""), "See U.S.A. and U.K. for details")
 })
 
+test("a hook the host has given up on stops, instead of reading for its own deadline", async () => {
+  // magpie can cancel a card (a closed panel, a refresh it abandoned). Without
+  // the signal the four reads still ran for their own 8 s and a proxy start
+  // behind them held the one process every plugin shares.
+  const p = await CodarPlugin()
+  const ac = new AbortController()
+  ac.abort()
+  const u = await p.auth.usage(auth, { signal: ac.signal })
+  assert.equal(u.signIn, "", "an aborted card asked for a re-login")
+  assert.match(u.error, /取消/)
+  const c = await p.auth.checkin(auth, { signal: ac.signal })
+  assert.equal(c.outcome, "failed")
+  assert.match(c.message, /取消/)
+  // a signal the host did not pass is the same as no cancellation
+  const ok = await withFetch({ "/v1/gettoken": { body: { code: 200, token: 5, agent_token: 0 } } }, async () => p.auth.usage(auth))
+  assert.equal(ok.signIn, undefined, "a healthy read with no signal lost its answer")
+})
+
 test("a short credential's encoded forms are cut too, and only its own", () => {
   // A six-digit SMS code or a nine-character password is under the length
   // every encoded-run rule looks for, so a gateway that echoed it in base64 or

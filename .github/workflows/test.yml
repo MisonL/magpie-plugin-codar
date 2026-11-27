@@ -73,6 +73,9 @@ jobs:
       # back read-only, and the gate rightly refuses a package whose proxy
       # cannot be run. A local build leaves them executable; restore that.
       - run: chmod +x native/bin/*
+      # -check reads a file's shape; this reads its own build record and the
+      # source fingerprint embedded in it, which a copied binary cannot carry.
+      - run: node scripts/build-native.mjs --buildinfo
       - run: node scripts/tarball.mjs --require-bun
 
   # the plugin reads a file under the user's home directory on every platform

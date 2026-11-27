@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { binaryPath, chatFetch, closeProxy, hosts, officialURL, proxyFetch, sendVia } from "../lib/native.mjs"
 import { binaryFile } from "../native/binary-name.mjs"
-import { binaryName as builtName, buildDir, buildTargets, inspectTarget, missingTargets, newestSourceMtime, toolchainFor } from "../scripts/build-native.mjs"
+import { binaryName as builtName, buildDir, buildTargets, inspectTarget, missingTargets, newestSourceMtime, sourceHash, SOURCE_MARKER, toolchainFor } from "../scripts/build-native.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -881,7 +881,10 @@ test("a release refuses a package without every platform's build", { timeout: 60
   // to be a plausible file; the gate reads the header and the size, and
   // deliberately does not need a Go toolchain or a real build here
   const fill = (path, header) => {
-    writeFileSync(path, Buffer.concat([header, Buffer.alloc(8192)]))
+    // A build's evidence that it came from this source is the fingerprint
+    // -ldflags embeds; a fixture without it is what a copied or hand-made file
+    // looks like, and the gate refuses exactly that.
+    writeFileSync(path, Buffer.concat([header, Buffer.from(`${SOURCE_MARKER}${sourceHash()}`), Buffer.alloc(8192)]))
     chmodSync(path, 0o755)
   }
   try {
@@ -933,6 +936,17 @@ test("a release refuses a package without every platform's build", { timeout: 60
     assert.match(refused.stdout, /missing codar-proxy-darwin-arm64/)
     const accepted = await run(full)
     assert.equal(accepted.code, 0, "the strict check refused a directory with every build")
+
+    // A file whose header, size and mode are a build's, copied from another
+    // tree (or made by hand): only the embedded fingerprint tells it apart, and
+    // `cp` refreshes the mtime that used to be the only evidence.
+    const unmarked = join(full, binaryFile("darwin", "amd64"))
+    writeFileSync(unmarked, Buffer.concat([headerFor("darwin", "amd64"), Buffer.alloc(8192)]))
+    chmodSync(unmarked, 0o755)
+    const foreign = await run(full)
+    assert.equal(foreign.code, 1, "a build with no fingerprint passed the strict check")
+    assert.match(foreign.stdout, /broken codar-proxy-darwin-amd64: built from other sources/)
+    fill(unmarked, headerFor("darwin", "amd64"))
 
     // Names alone used to be the check: an empty file, or one carrying the
     // wrong platform's header, would have shipped.
@@ -1399,6 +1413,74 @@ test("staging refuses an empty build directory before it writes anything", { tim
   } finally {
     rmSync(empty, { recursive: true, force: true })
   }
+})
+
+test("a publish that failed is asked about, and only a version the registry has counts", async () => {
+  // npm can report an error while the registry took the version, and the
+  // packument lags the write. The release loop used to stop on the exit code
+  // alone, which left four of five packages published and no way forward at
+  // the same version.
+  const { landed } = await import("../scripts/native-packages.mjs")
+  let calls = 0
+  assert.equal(landed("x", "1.0.0", { tookFn: () => (++calls < 3 ? [] : ["x"]), attempts: 3, pauseMs: 5 }), true, "a version that appeared after a moment was read as missing")
+  assert.equal(calls, 3, "the registry was not asked again")
+  assert.equal(landed("x", "1.0.0", { tookFn: () => [], attempts: 2, pauseMs: 5 }), false, "a version that never landed was read as published")
+  assert.equal(landed("x", "1.0.0", { tookFn: () => { throw new Error("down") }, attempts: 2, pauseMs: 5 }), false, "an unreachable registry counted as a pass")
+})
+
+test("a build is checked against the source it was made from, and a foreign one is refused", { timeout: 120_000 }, async () => {
+  // mtime says when a file was touched, and `cp` touches it: a stale binary
+  // from this same repo passed every other check before the fingerprint. The
+  // record `go version -m` reads says which program a file is; the fingerprint
+  // built into it says which sources.
+  const { buildInfoOf } = await import("../scripts/build-native.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "codar-buildinfo-"))
+  try {
+    const fake = join(dir, "fake.bin")
+    writeFileSync(fake, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(4096, 7)]))
+    const got = buildInfoOf(fake)
+    assert.equal(got?.ok, false, "a file with no Go build record read as this repo's build")
+    // Go absent is "no answer", not a pass
+    assert.equal(buildInfoOf(fake, () => ({ error: { code: "ENOENT" } })), null, "a machine without go was read as a pass")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("the temp root is per user on Windows, and the loopback spellings are this start's", { skip: process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+  // A service whose TEMP is unset falls back to %windir%\temp, which every
+  // user can read — and the ready names the socket and (in tcp mode) the token
+  // that proves a request came from this plugin. %LOCALAPPDATA% is per user by
+  // construction. Outside that case the runtime's own temp is the answer.
+  const { tempRoot } = await import("../lib/native.mjs")
+  const la = mkdtempSync(join(tmpdir(), "codar-localappdata-"))
+  try {
+    assert.equal(tempRoot({}, "darwin", "/tmp/x"), "/tmp/x", "POSIX keeps the temp it was given")
+    assert.equal(tempRoot({ LOCALAPPDATA: la }, "win32", "C:\\Users\\me\\Temp"), "C:\\Users\\me\\Temp", "a per-user temp is used as it is")
+    const shared = tempRoot({ LOCALAPPDATA: la, SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp")
+    assert.equal(shared, join(la, "codar-plugin"), "a shared temp was used for the private directory")
+    assert.equal(tempRoot({ SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp"), "C:\\Windows\\temp", "with no LOCALAPPDATA the shared temp stays the answer")
+    assert.equal(tempRoot({ LOCALAPPDATA: join(la, "missing"), SystemRoot: "C:\\Windows" }, "win32", "C:\\Windows\\temp"), "C:\\Windows\\temp", "a LOCALAPPDATA that is not there falls back")
+  } finally {
+    rmSync(la, { recursive: true, force: true })
+  }
+
+  // The ready names a loopback port on Windows; both spellings loopback has are
+  // this start's, and a port outside the range is not a listener at all.
+  const { readyAddressOk } = await import("../lib/native.mjs")
+  for (const [said, want] of [
+    ["127.0.0.1:51234", true],
+    ["[::1]:51234", true],
+    ["localhost:51234", true],
+    ["127.0.0.1:0", false],
+    ["127.0.0.1:99999", false],
+    ["0.0.0.0:8080", false],
+    ["127.0.0.1", false],
+  ]) {
+    assert.equal(readyAddressOk({ address: said }, "\\.\\pipe\\x", "win32"), want, `${said} was read as ${!want}`)
+  }
+  assert.equal(readyAddressOk({ address: "/tmp/a" }, "/tmp/a", "darwin"), true, "POSIX still compares the exact path")
+  assert.equal(readyAddressOk({ address: "/tmp/b" }, "/tmp/a", "darwin"), false, "and another path is not this start's")
 })
 
 test("a ready that is a link, a directory or oversized is no ready at all", { skip: process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {

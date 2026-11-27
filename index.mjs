@@ -658,7 +658,9 @@ export async function CodarPlugin(input) {
       // passes outcome/credit/streak/message/until to magpie (host.js's
       // checkinOf), and flagging an expired account is usage's job (usage's
       // signIn is what gets read).
-      async checkin(getAuth) {
+      async checkin(getAuth, ctx = {}) {
+        const signal = ctx?.signal
+        if (signal?.aborted) return { outcome: "failed", message: "签到已取消" }
         let auth, token
         try {
           auth = await getAuth()
@@ -677,6 +679,7 @@ export async function CodarPlugin(input) {
 
         const deadline = Date.now() + CHECKIN_BUDGET_MS
         const left = () => Math.max(1000, deadline - Date.now())
+        const sopts = () => ({ fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()), ...(signal ? { signal } : {}) })
 
         // How a claimed day answers: done, plus until. until is the contract
         // since magpie 0.1.1795 ("a plugin's until is when its answer stops
@@ -912,7 +915,7 @@ export async function CodarPlugin(input) {
         const withFreeModels = async (answer) => {
           let got = null
           try {
-            got = await claimFreeModelsOnce(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
+            got = await claimFreeModelsOnce(token, username, sopts())
           } catch {
             got = null
           }
@@ -931,7 +934,7 @@ export async function CodarPlugin(input) {
         // reported honestly. If unreadable, omit credit rather than report 0.
         let before = null
         try {
-          before = await pointsOf(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
+          before = await pointsOf(token, username, sopts())
         } catch {
           before = null
         }
@@ -1336,7 +1339,7 @@ export async function CodarPlugin(input) {
         // claim with no number, which is the truth.
         let credit = null
         try {
-          const after = await pointsOf(token, username, { fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
+          const after = await pointsOf(token, username, sopts())
           const grew = (was, now) => (was == null || now == null ? null : Math.max(0, now - was))
           const general = grew(before?.general, after?.general)
           const agent = grew(before?.agent, after?.agent)
@@ -1363,7 +1366,12 @@ export async function CodarPlugin(input) {
 
       // Usage: point balance + today's check-in state + free model activities
       // (omit what can't be fetched).
-      async usage(getAuth) {
+      async usage(getAuth, ctx = {}) {
+        // The host can give up on a card (a closed panel, a timed-out refresh);
+        // without the signal the four reads keep the process busy for their own
+        // 8 s after nobody is waiting, and a proxy start behind them holds.
+        const signal = ctx?.signal
+        if (signal?.aborted) return { error: "已取消", signIn: "" }
         let auth, token
         try {
           auth = await getAuth()
@@ -1382,7 +1390,7 @@ export async function CodarPlugin(input) {
 
         const deadline = Date.now() + USAGE_BUDGET_MS
         const left = () => Math.max(1000, deadline - Date.now())
-        const opts = () => ({ fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()) })
+        const opts = () => ({ fetchImpl, timeoutMs: Math.min(TIMEOUT_MS, left()), ...(signal ? { signal } : {}) })
 
         // Four reads are independent, fire them together (the vendor's own
         // client does the same: app.asar's S0 uses allSettled on

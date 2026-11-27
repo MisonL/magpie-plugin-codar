@@ -36,8 +36,9 @@
 // --check reads (default native/bin).
 
 import { execFileSync, spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs"
-import { dirname, join, resolve } from "node:path"
+import { dirname, join, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { binaryFile } from "../native/binary-name.mjs"
@@ -92,7 +93,13 @@ const builtIn = (dir) => (existsSync(dir) ? readdirSync(dir).filter((n) => n.sta
 // source, and the 0.2.x builds carried vcs.revision=c90d4d9 (v0.1.2) with
 // vcs.modified=true because they were made before the 0.2.0 tree. A stamp
 // that disagrees with the source is worse than none for a review.
-export const buildArgs = (output) => ["build", "-trimpath", "-buildvcs=false", "-ldflags", "-s -w", "-o", output, "./cmd/codar-proxy"]
+export const buildArgs = (output, hash = sourceHash()) => [
+  "build", "-trimpath", "-buildvcs=false",
+  // The fingerprint is the gate's evidence that these bytes came from these
+  // sources: mtime says when a file was touched, and a copy touches it.
+  "-ldflags", `-s -w -X main.sourceHash=${SOURCE_MARKER}${hash}`,
+  "-o", output, "./cmd/codar-proxy",
+]
 
 // A real build of this program is several megabytes; anything under a page is
 // a placeholder, a truncated copy or a text file that happens to have the name.
@@ -148,6 +155,39 @@ const archOf = (head, goos) => {
   return arches
 }
 
+// SOURCE_MARKER prefixes the source fingerprint every build carries. It is a
+// string constant inside the binary (ldflags -X), so it survives -s -w and can
+// be read with the file alone — no Go, no execution, no platform of its own.
+export const SOURCE_MARKER = "codar-proxy-source:"
+
+// sourceHash is a fingerprint of exactly what goes into the proxy: every .go
+// file under native/cmd that is compiled in (_test.go is not), plus go.mod and
+// go.sum, in walking order, path and bytes both. Two trees with the same hash
+// produce the same binary; a build made from anything else does not carry it.
+export const sourceHash = (root = join(here, "..")) => {
+  const h = createHash("sha256")
+  const files = []
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) walk(path)
+      else if (entry.name.endsWith(".go") && !entry.name.endsWith("_test.go")) files.push(path)
+    }
+  }
+  walk(join(root, "native", "cmd"))
+  // go.mod and go.sum are left out: the build loop rewrites go.mod per target
+  // and restores it after the last one, so a hash taken during the build and
+  // one taken after it disagree on a byte nothing about the program changed.
+  // Which program this is at all is `--buildinfo`'s question, not this one's.
+  for (const path of files) {
+    h.update(path.slice(root.length).split(sep).join("/"))
+    h.update("\0")
+    h.update(readFileSync(path))
+    h.update("\0")
+  }
+  return h.digest("hex")
+}
+
 // newestSourceMtime is when the proxy's own source last changed — the .go
 // files under native/cmd that go into each build (`_test.go` excluded: it is
 // not compiled in, so a test-only change cannot make a build stale). A build older than
@@ -182,7 +222,7 @@ export const newestSourceMtime = (srcDir = join(root, "cmd")) => {
 // it is not there; "broken" with a reason when it is there but cannot be what
 // the plugin will exec. The name used to be the whole check, which let an
 // empty file (or a `.gitignore`d placeholder) pass for a release.
-export const inspectTarget = (dir, t, sourceMtime = 0) => {
+export const inspectTarget = (dir, t, sourceMtime = 0, want = sourceHash()) => {
   const name = binaryName(t)
   const path = join(dir, name)
   let stat
@@ -226,11 +266,42 @@ export const inspectTarget = (dir, t, sourceMtime = 0) => {
   if (sourceMtime > 0 && stat.mtimeMs < sourceMtime) {
     return { name, state: "broken", reason: "older than its source; run node scripts/build-native.mjs --all" }
   }
+  // The fingerprint is what a copy cannot fake: `cp` refreshes the mtime, so a
+  // stale binary from this same repo passed every other check. A build made
+  // before this marker existed has none, and is refused like any other.
+  if (want) {
+    let has = false
+    try {
+      has = readFileSync(path).includes(Buffer.from(`${SOURCE_MARKER}${want}`))
+    } catch {
+      has = false
+    }
+    if (!has) return { name, state: "broken", reason: "built from other sources than the tree has; run node scripts/build-native.mjs --all" }
+  }
   return { name, state: "present" }
 }
 
 // checkTargets is the whole directory, in the table's order: what --check
 // prints and --strict refuses.
+// BUILD_PATH is the command path every build must carry in its own Go build
+// record. A file with the right header, size and machine type can still be
+// another program — an old copy from another module, or bytes that merely look
+// like a binary — and the build record is the one thing that says which program
+// it is. `go version -m` reads that record; nothing else in this repo does.
+export const BUILD_PATH = "github.com/MisonL/magpie-plugin-codar/native/cmd/codar-proxy"
+
+// buildInfoOf reads one file's build record. null means "no answer": Go is not
+// installed (the tool that reads the record), and a release machine without it
+// is told so rather than waved through. `go version -m` exits 1 on a file that
+// is not a Go binary at all, which is the refusal this gate exists for.
+export const buildInfoOf = (file, run = spawnSync) => {
+  const out = run("go", ["version", "-m", file], { encoding: "utf8" })
+  if (out?.error?.code === "ENOENT") return null
+  const text = `${out?.stdout ?? ""}${out?.stderr ?? ""}`
+  const stated = text.split("\n").find((line) => line.startsWith("\tpath\t"))
+  return { ok: out?.status === 0 && stated?.trim() === `path\t${BUILD_PATH}`, said: stated?.trim() ?? text.trim().split("\n")[0] ?? "" }
+}
+
 export const checkTargets = (dir = out, sourceMtime = newestSourceMtime()) =>
   targets.map((t) => inspectTarget(dir, t, sourceMtime)) // null sourceMtime fails every row
 
@@ -255,10 +326,41 @@ function build(argv) {
   // An argument this script does not know is exit 2, the same answer the
   // tarball gate and the catalog generator give: a misspelt --strict used to
   // be ignored, and a release-time check silently ran without it.
-  const unknown = [...args].filter((a) => a !== "--all" && a !== "--check" && a !== "--strict")
+  const unknown = [...args].filter((a) => a !== "--all" && a !== "--check" && a !== "--strict" && a !== "--buildinfo")
   if (unknown.length) {
-    console.error(`build-native: unrecognized argument ${unknown.join(" ")} (try --all, --check or --strict)`)
+    console.error(`build-native: unrecognized argument ${unknown.join(" ")} (try --all, --check, --strict or --buildinfo)`)
     return 2
+  }
+  // --buildinfo is its own pass and its own flag: it needs a Go toolchain to
+  // read the record, which --check (a file's shape) does not, and a machine
+  // that has the builds but not Go should learn that rather than fail silently.
+  if (args.has("--buildinfo")) {
+    let bad = 0
+    let sawGo = true
+    for (const t of targets) {
+      const file = join(out, binaryName(t))
+      if (!existsSync(file)) {
+        console.log(`absent ${binaryName(t)}`)
+        continue
+      }
+      const got = buildInfoOf(file)
+      if (got === null) {
+        sawGo = false
+        console.error("build-native: `go` is not on PATH; it is what reads a build's own record")
+        return 2
+      }
+      if (got.ok) console.log(`identified ${binaryName(t)}`)
+      else {
+        bad++
+        console.error(`build-native: ${binaryName(t)} is not this repo's proxy (${got.said || "no build record"})`)
+      }
+    }
+    if (!sawGo) return 2
+    if (bad) {
+      console.error(`build-native: ${bad} build(s) are not the proxy this repo builds; run node scripts/build-native.mjs --all`)
+      return 1
+    }
+    return 0
   }
   if (args.has("--check")) {
     const rows = checkTargets(out)

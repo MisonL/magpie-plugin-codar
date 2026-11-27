@@ -40,7 +40,7 @@
 // scripts/build-native.mjs checks each finished binary against the sidecar's
 // own defaults rather than against "none".
 //
-// Usage: codar-proxy -listen unix|<tcp> -address <path|host:port> [-token <hex>] [-ready <file>]
+// Usage: codar-proxy -listen unix|<tcp> -address <path|host:port> [-ready <file>] [-version]
 //
 // The plugin sends plain HTTP/1.1 over the socket or loopback port it started
 // with requests the plugin itself wrote the credentials into; the proxy
@@ -108,6 +108,11 @@ var officialHosts = map[string]bool{
 	"test.api.kuaipaper.com": true,
 }
 
+// sourceHash is the fingerprint of the sources this binary was built from. The
+// release scripts set it with -ldflags -X; a build that carries none is one the
+// gate refuses, because a copied or hand-made file can look like a build.
+var sourceHash = ""
+
 // tokenHeader is how TCP-mode requests prove they come from the plugin.
 const tokenHeader = "X-Codar-Proxy-Token"
 
@@ -136,9 +141,16 @@ func main() {
 
 	listen := flag.String("listen", defaultListen(), "unix or tcp")
 	address := flag.String("address", "", "socket path, or 127.0.0.1:0 for tcp")
-	token := flag.String("token", "", "shared token for tcp mode (generated when empty)")
 	ready := flag.String("ready", "", "file to publish the listener's address in")
+	version := flag.Bool("version", false, "print the source fingerprint this binary was built from, and exit")
 	flag.Parse()
+
+	// Reading it is what keeps it: a package-level var nothing references is
+	// not emitted at all, and -X then sets nothing (the gate saw exactly that).
+	if *version {
+		fmt.Println(sourceHash)
+		return
+	}
 
 	if *address == "" {
 		log.Fatalf("missing -address")
@@ -182,23 +194,27 @@ func main() {
 		log.Fatalf(format, args...)
 	}
 
-	if network == "tcp" && *token == "" {
+	// The token is always generated here, never taken from the command line:
+	// an argument is readable by any process of the same user on Linux
+	// (/proc/pid/cmdline), and nothing ever passed one.
+	var token string
+	if network == "tcp" {
 		b := make([]byte, 16)
 		if _, err := rand.Read(b); err != nil {
 			failStartup("token: %v", err)
 		}
-		*token = hex.EncodeToString(b)
+		token = hex.EncodeToString(b)
 	}
 
 	if *ready != "" {
-		data, _ := json.Marshal(readyInfo(network, addr, os.Getpid(), *token))
+		data, _ := json.Marshal(readyInfo(network, addr, os.Getpid(), token))
 		if err := os.WriteFile(*ready, data, 0o600); err != nil {
 			failStartup("ready file %s: %v", *ready, err)
 		}
 	}
 
 	server := &http.Server{
-		Handler:           &forwarder{token: *token},
+		Handler:           &forwarder{token: token},
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}

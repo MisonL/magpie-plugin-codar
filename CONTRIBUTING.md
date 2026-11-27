@@ -167,9 +167,10 @@ git tag v<version>
 node scripts/build-native.mjs --check --strict      # the five builds are real — headers, bits, no stub, newer than the proxy's source — before any of them is staged, published, or shipped
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
+node scripts/build-native.mjs --buildinfo           # each build's own record says it is this repo's proxy
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
 node scripts/native-packages.mjs --publish          # the five platform packages, first
-npm publish                                         # prepublishOnly re-runs the same gates: --strict builds, the packed suite and install check (--require-bun --require-builds), the staged set (--check)
+npm publish                                         # prepublishOnly re-runs the same gates: --strict builds and the fingerprint, --buildinfo, the packed suite and install check (--require-bun --require-builds), the staged set (--check)
 git push --follow-tags                              # after the packages are up: a tag pushed before a failed publish would be public alone
 gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
 ```
@@ -199,9 +200,13 @@ scripts/native-packages.mjs --publish` stages all five from `native/bin` and
 publishes them; `--check` says what is staged and refuses a version that is not
 the main package's. `prepublishOnly` starts with
 `node scripts/build-native.mjs --check --strict`, which refuses a release that
-has no build (or only a stub where one belongs) for any platform — and a build
-older than the proxy's own source, so a binary made before the change the
-release ships cannot pass for it — and then runs the tarball gate with
+has no build (or only a stub where one belongs) for any platform, a build older
+than the proxy's own source, and a build whose embedded source fingerprint is
+not this tree's — `cp` refreshes an mtime, so a copied binary used to pass the
+clock rule; the fingerprint is what a copy cannot carry. `--buildinfo` then
+reads each file's Go build record (`go version -m`) and refuses a file that is
+not this repo's `cmd/codar-proxy` at all; a machine without Go gets exit 2
+rather than a silent pass. After that it runs the tarball gate with
 `--require-bun --require-builds`, which installs the packed main package in a
 scratch project with bun and with npm and requires each install to land this
 machine's platform package and start its proxy. The freshness rule is the

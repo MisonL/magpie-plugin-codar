@@ -244,11 +244,35 @@ function main(argv) {
       ? spawnSync(["npm", ...argv].map((a) => (String(a).includes(" ") ? `"${a}"` : a)).join(" "), { cwd: p.dir, stdio: "inherit", shell: true })
       : spawnSync("npm", argv, { cwd: p.dir, stdio: "inherit" })
     if (out.status !== 0) {
+      // A publish can fail after the registry took it — npm reports an error
+      // it met while writing, and the packument lags the write by a moment.
+      // Asking again is what tells "it is there, the client was wrong" (carry
+      // on with the next package) from "nothing landed" (stop, bump).
+      if (landed(p.name, manifest.version)) {
+        console.log(`published ${p.name}@${manifest.version} (the client exited ${out.status}, the registry has it)`)
+        continue
+      }
       console.error(`native-packages: publishing ${p.name} failed (exit ${out.status}); the packages before it are published, and this version cannot be completed — bump the version for the rest`)
       return 1
     }
   }
   return 0
+}
+
+// landed asks whether a version is really in the registry after a publish
+// said it failed. A registry answers a moment behind the write, so the answer
+// is asked for a few times with a pause between; an unreachable registry is
+// no evidence either way and does not count as a pass.
+export const landed = (name, version, { tookFn = took, attempts = 4, pauseMs = 1500 } = {}) => {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (tookFn([{ name }], version).length) return true
+    } catch {
+      // keep asking: a preflight that cannot reach the registry proves nothing
+    }
+    if (i + 1 < attempts) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pauseMs)
+  }
+  return false
 }
 
 // took names the packages in wrote that the registry already has at version.
