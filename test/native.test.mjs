@@ -1522,6 +1522,45 @@ test("a fingerprint appended to another build is not this tree's build", { timeo
   }
 })
 
+test("a request that says stream:false in its body gets an answer text() can read", async () => {
+  // chatFetch takes the streaming branch on init.stream alone, which the host
+  // sets. A caller that speaks the OpenAI way — `{"stream": false}` in the
+  // body, no out-of-band flag — had its ordinary JSON answer handed over as a
+  // stream, whose text()/json() throw "the answer was streamed"
+  // (2026-11-27 review).
+  const { sendVia, wantsStream } = await import("../lib/native.mjs")
+  const { createServer } = await import("node:net")
+  const body = JSON.stringify({ choices: [{ message: { content: "hi" } }] })
+  const server = createServer((socket) => {
+    socket.once("data", () => {
+      socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`)
+      socket.end()
+    })
+  })
+  await new Promise((r) => server.listen(0, "127.0.0.1", r))
+  const port = server.address().port
+  try {
+    // what chatFetch decides (it used to pass stream: true for everything but
+    // an explicit false) and what sendVia then does with it
+    const said = JSON.stringify({ model: "m", stream: false, messages: [] })
+    assert.equal(wantsStream(undefined, said), false, "a stream:false body was taken as a stream")
+    assert.equal(wantsStream(undefined, JSON.stringify({ stream: true })), true, "a stream:true body was not a stream")
+    assert.equal(wantsStream(true, said), true, "an explicit stream:true was overruled by the body")
+    assert.equal(wantsStream(false, JSON.stringify({ stream: true })), false, "an explicit stream:false was overruled by the body")
+    const send = () =>
+      sendVia({ transport: "tcp", address: `127.0.0.1:${port}`, token: "t" }, new URL("https://api.kuaipaper.com/v1/chat/completions"), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "k" },
+        body: said,
+      })
+    const res = await send()
+    assert.equal(await res.text(), body, "the buffered answer was not readable as text")
+    assert.deepEqual(await (await send()).json(), JSON.parse(body), "the buffered answer was not readable as json")
+  } finally {
+    server.close()
+  }
+})
+
 test("a build record says which platform and toolchain it was made for", async () => {
   // `go version -m` states GOOS, GOARCH, the toolchain and DefaultGODEBUG.
   // A file copied from the linux build is this repo's proxy and still not the
