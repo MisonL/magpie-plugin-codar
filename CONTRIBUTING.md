@@ -4,6 +4,27 @@ Thanks for looking at this. A few things about the plugin are load-bearing, and
 the test suite pins each of them — the notes below say why, so a change that
 trips one is a change to argue for, not to route around.
 
+## Deliberate limits
+
+Two things the reviews raised a second time and that stay as they are, with the
+reason written down so the next review does not have to rediscover it:
+
+- **The ready file is the handshake, not a socket probe.** A start reads the
+  address the proxy wrote into its own private directory, checks it names this
+  start's pid and (on Windows) a loopback port, and connects. It does not
+  authenticate the peer on the connection. The alternative — reporting the
+  address and token over a private stdout pipe — moves the same secret from a
+  0600 file in a directory only this user can write into, to a pipe with the
+  same owner; a process of the same user can read either one, and the Codar
+  desktop app's own token file is already readable by it. The file stays for
+  the sweep to find abandoned proxies by.
+- **`landed()` asks whether the version is in the registry, not whose bytes.**
+  A packument's `dist.integrity` would say which tarball the registry holds,
+  but npm builds the tarball during `publish`, so its bytes are not known
+  before the call that may fail. Two publishers racing at the same name and
+  version is a serial-release procedure's problem: publish the platform
+  packages first, then the main package, in one run.
+
 ## The rules the suite defends
 
 **Where each file lives.**
