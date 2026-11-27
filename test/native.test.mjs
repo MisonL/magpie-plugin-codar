@@ -1495,6 +1495,56 @@ test("a build is checked against the source it was made from, and a foreign one 
   }
 })
 
+test("a fingerprint appended to another build is not this tree's build", { timeout: 120_000 }, async () => {
+  // The marker inside a binary is a string the linker wrote, and a string can
+  // be appended to any file: the review of 2026-11-27 appended this tree's
+  // marker to a build from other sources and watched --check --strict and
+  // --buildinfo both pass. The manifest records the sha256 of the bytes the
+  // build produced, which an append cannot satisfy.
+  const { manifestProblems, recordBuild, sourceHash, sha256Of, binaryName } = await import("../scripts/build-native.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "codar-manifest-"))
+  try {
+    const t = { os: "darwin", goos: "darwin", arch: "amd64", go: "1.24.3", directive: "1.24.0", godebug: "" }
+    const file = join(dir, binaryName(t))
+    writeFileSync(file, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.alloc(4096, 7)]))
+    // no manifest yet: nothing can vouch for it
+    assert.match(manifestProblems(dir, t)[0] ?? "", /no builds\.json/, "a directory with no manifest read as vouched for")
+    recordBuild(dir, binaryName(t), { sha256: sha256Of(file), goos: t.goos, goarch: t.arch, go: "go1.24.3", godebug: "" })
+    assert.deepEqual(manifestProblems(dir, t), [], "a recorded build was refused")
+    // the review's attack: same tree's marker, bytes that are not the build
+    writeFileSync(file, Buffer.concat([readFileSync(file), Buffer.from(`codar-proxy-source:${sourceHash()}`)]))
+    assert.match(manifestProblems(dir, t)[0] ?? "", /not the bytes this tree built/, "an appended fingerprint satisfied the manifest")
+    // a manifest for other sources vouches for nothing
+    recordBuild(dir, binaryName(t), { sha256: sha256Of(file), goos: t.goos, goarch: t.arch, go: "go1.24.3", godebug: "" }, "0".repeat(64))
+    assert.match(manifestProblems(dir, t)[0] ?? "", /other sources/, "a manifest for another tree was accepted")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a build record says which platform and toolchain it was made for", async () => {
+  // `go version -m` states GOOS, GOARCH, the toolchain and DefaultGODEBUG.
+  // A file copied from the linux build is this repo's proxy and still not the
+  // darwin artifact, and the review of 2026-11-27 found --buildinfo accepting
+  // one copy under five names.
+  const { artifactProblems, buildInfoOf } = await import("../scripts/build-native.mjs")
+  const t = { os: "darwin", goos: "darwin", arch: "arm64", go: "1.24.3", directive: "1.24.0", godebug: "" }
+  const record = (fields) =>
+    buildInfoOf("/x", () => ({
+      status: 0,
+      stdout: `x: ${fields.go ?? "go1.24.3"}\n\tpath\tgithub.com/MisonL/magpie-plugin-codar/native/cmd/codar-proxy\n${Object.entries(fields)
+        .filter(([k]) => k !== "go")
+        .map(([k, v]) => `\tbuild\t${k}=${v}`)
+        .join("\n")}\n`,
+    }))
+  const good = record({ GOOS: "darwin", GOARCH: "arm64" })
+  assert.deepEqual(artifactProblems(good, t), [], "a correct record was refused")
+  assert.match(artifactProblems(record({ GOOS: "linux", GOARCH: "arm64" }), t).join(" "), /built for linux, not darwin/)
+  assert.match(artifactProblems(record({ GOOS: "darwin", GOARCH: "amd64" }), t).join(" "), /built for amd64, not arm64/)
+  assert.match(artifactProblems(record({ GOOS: "darwin", GOARCH: "arm64", go: "go1.27.1" }), t).join(" "), /built by go1.27.1, not go1.24.3/)
+  assert.match(artifactProblems(record({ GOOS: "darwin", GOARCH: "arm64", DefaultGODEBUG: "tlssecpmlkem=0" }), t).join(" "), /DefaultGODEBUG/)
+})
+
 test("the temp root is per user on Windows, and the loopback spellings are this start's", { skip: process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
   // A service whose TEMP is unset falls back to %windir%\temp, which every
   // user can read — and the ready names the socket and (in tcp mode) the token

@@ -292,8 +292,92 @@ export const buildInfoOf = (file, run = spawnSync) => {
   const out = run(process.env.GO || "go", ["version", "-m", file], { encoding: "utf8" })
   if (out?.error?.code === "ENOENT") return null
   const text = `${out?.stdout ?? ""}${out?.stderr ?? ""}`
-  const stated = text.split("\n").find((line) => line.startsWith("\tpath\t"))
-  return { ok: out?.status === 0 && stated?.trim() === `path\t${BUILD_PATH}`, said: stated?.trim() ?? text.trim().split("\n")[0] ?? "" }
+  const lines = text.split("\n")
+  const stated = lines.find((line) => line.startsWith("\tpath\t"))
+  const field = (name) => lines.map((l) => new RegExp(`^\\tbuild\\t${name}=(.*)$`).exec(l)?.[1]).find((v) => v !== undefined) ?? ""
+  return {
+    ok: out?.status === 0 && stated?.trim() === `path\t${BUILD_PATH}`,
+    said: stated?.trim() ?? text.trim().split("\n")[0] ?? "",
+    // The record states the platform, the toolchain and the defaults the build
+    // ran with: a file built for another platform, or by another Go, is the
+    // proxy this repo builds and still not the artifact this target needs.
+    goos: field("GOOS"),
+    goarch: field("GOARCH"),
+    godebug: field("DefaultGODEBUG"),
+    toolchain: lines[0]?.trim() ?? "",
+  }
+}
+
+// artifactProblems names what is wrong with one build for one target, using the
+// record the binary carries. A shape check reads the header; this reads what
+// the compiler wrote down: the platform it was built for, the toolchain (the
+// sidecar's own, pinned per target) and the GODEBUG defaults that decide its
+// TLS behaviour. Empty means the artifact answers for this target.
+export const artifactProblems = (got, t) => {
+  const problems = []
+  if (!got) return ["no build record could be read"]
+  if (!got.ok) return [`not this repo's proxy (${got.said || "no build record"})`]
+  if (got.goos !== t.goos) problems.push(`built for ${got.goos || "no platform"}, not ${t.goos}`)
+  if (got.goarch !== t.arch) problems.push(`built for ${got.goarch || "no arch"}, not ${t.arch}`)
+  // `go version -m` prints "<file>: go1.24.3 X:…" on its first line; the
+  // version is the go-prefixed token in it, and the table states it without
+  // the prefix.
+  const built = (got.toolchain.match(/go\d+(?:\.\d+)*/) ?? [""])[0]
+  if (built && built !== `go${t.go}`) problems.push(`built by ${built}, not go${t.go}`)
+  if ((got.godebug ?? "") !== (t.godebug ?? "")) {
+    problems.push(`DefaultGODEBUG=${got.godebug || "(none)"}, want ${t.godebug || "(none)"}`)
+  }
+  return problems
+}
+
+// BUILD_MANIFEST is what the build wrote: for each file, the sha256 of the
+// bytes it produced, beside the platform, toolchain and TLS defaults it was
+// built with. The fingerprint inside a binary is a string the linker wrote, and
+// a string can be appended to any file — the review of 2026-11-27 appended it
+// to a binary from other sources and watched every gate pass. A digest of the
+// bytes cannot be appended to: it either is the file's digest or it is not.
+export const BUILD_MANIFEST = "builds.json"
+
+export const sha256Of = (file) => {
+  try {
+    return createHash("sha256").update(readFileSync(file)).digest("hex")
+  } catch {
+    return ""
+  }
+}
+
+export const readManifest = (dir = out) => {
+  try {
+    const said = JSON.parse(readFileSync(join(dir, BUILD_MANIFEST), "utf8"))
+    return said && typeof said === "object" && typeof said.builds === "object" && said.builds !== null ? said : null
+  } catch {
+    return null
+  }
+}
+
+// recordBuild appends one file to the manifest, starting a new one when the
+// sources changed (an entry for another tree's bytes is worse than none).
+export const recordBuild = (dir, name, entry, hash = sourceHash()) => {
+  const held = readManifest(dir)
+  const builds = held && held.sourceHash === hash ? { ...held.builds } : {}
+  builds[name] = entry
+  writeFileSync(join(dir, BUILD_MANIFEST), `${JSON.stringify({ sourceHash: hash, builds }, null, 2)}\n`)
+}
+
+// manifestProblems names why a directory's manifest cannot vouch for one
+// target, or [] when it can: the manifest is this tree's, it knows this file,
+// and the bytes on disk are the ones it recorded.
+export const manifestProblems = (dir, t, hash = sourceHash()) => {
+  const held = readManifest(dir)
+  if (!held) return [`no ${BUILD_MANIFEST} in ${dir}; run node scripts/build-native.mjs --all`]
+  if (held.sourceHash !== hash) return [`its ${BUILD_MANIFEST} is for other sources; run node scripts/build-native.mjs --all`]
+  const name = binaryName(t)
+  const entry = held.builds[name]
+  if (!entry || typeof entry !== "object") return [`${name} is not in its ${BUILD_MANIFEST}; run node scripts/build-native.mjs --all`]
+  const now = sha256Of(join(dir, name))
+  if (!now || now !== entry.sha256) return [`${name} is not the bytes this tree built (the manifest says ${String(entry.sha256).slice(0, 12)}…); run node scripts/build-native.mjs --all`]
+  if (entry.goos !== t.goos || entry.goarch !== t.arch) return [`${name} is recorded as ${entry.goos ?? "?"}/${entry.goarch ?? "?"}, not ${t.goos}/${t.arch}`]
+  return []
 }
 
 // carriesSource says whether a file carries this tree's fingerprint. It is the
@@ -362,9 +446,30 @@ function build(argv) {
         console.error(`build-native: ${binaryName(t)} is not this repo's proxy (${got.said || "no build record"})`)
         continue
       }
+      // The record also says which platform, which toolchain and which TLS
+      // defaults the build ran with. A file copied from another target — or
+      // built by a developer's newer Go — is this repo's proxy and still not
+      // this target's artifact; the build path asserts the same three things
+      // (2026-11-27 review), and this is the pass that reads the artifact as
+      // it is shipped.
+      const wrong = artifactProblems(got, t)
+      if (wrong.length) {
+        bad++
+        console.error(`build-native: ${binaryName(t)} ${wrong.join("; ")}`)
+        continue
+      }
       if (!carriesSource(file)) {
         bad++
         console.error(`build-native: ${binaryName(t)} is this repo's proxy but not this tree's build; run node scripts/build-native.mjs --all`)
+        continue
+      }
+      // The fingerprint above is a string; the manifest is the bytes. A file
+      // from other sources with this tree's marker appended passes the string
+      // and fails the digest (2026-11-27 review).
+      const unsure = manifestProblems(out, t)
+      if (unsure.length) {
+        bad++
+        console.error(`build-native: ${binaryName(t)}: ${unsure.join("; ")}`)
         continue
       }
       console.log(`identified ${binaryName(t)}`)
@@ -437,6 +542,10 @@ function build(argv) {
         // not the sidecar's client, so it is refused rather than shipped.
         throw new Error(`${name} carries DefaultGODEBUG=${got || "(none)"}, want ${t.godebug || "(none)"}: the go directive is wrong for this platform's sidecar`)
       }
+      // What was built, as bytes: the manifest is what a gate downstream can
+      // compare against without a Go toolchain, and what an appended
+      // fingerprint cannot satisfy (see BUILD_MANIFEST).
+      recordBuild(out, name, { sha256: sha256Of(join(out, name)), goos: t.goos, goarch: t.arch, go: (toolchainUsed.match(/go\d+(?:\.\d+)*/) ?? [""])[0], godebug: got })
     } finally {
       if (patched) writeFileSync(original, originalText)
     }

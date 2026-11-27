@@ -73,8 +73,13 @@ jobs:
       # back read-only, and the gate rightly refuses a package whose proxy
       # cannot be run. A local build leaves them executable; restore that.
       - run: chmod +x native/bin/*
-      # -check reads a file's shape; this reads its own build record and the
-      # source fingerprint embedded in it, which a copied binary cannot carry.
+      # -check reads a file's shape and mtime; --buildinfo reads its own build
+      # record (this repo's proxy, the platform, the toolchain, the sidecar's
+      # DefaultGODEBUG) and the manifest's sha256 for the bytes. This is the
+      # only step that reads the artifact after it crossed jobs, so it runs
+      # both: a linux build copied under five names passed --buildinfo alone
+      # (2026-11-27 review).
+      - run: node scripts/build-native.mjs --check --strict
       - run: node scripts/build-native.mjs --buildinfo
       - run: node scripts/tarball.mjs --require-bun
 

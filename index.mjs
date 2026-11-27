@@ -199,7 +199,11 @@ const claimFreeModelsOnce = (token, username, opts) => {
   const inFlight = claimingCampaign.get(username)
   if (inFlight) return inFlight
   const run = (async () => {
-    const got = await claimFreeModel(token, { ...opts, claimed: (id) => claimedCampaigns.has(key(id)) })
+    // The work is shared, so it cannot be bound to one caller's signal: the
+    // first check-in to arrive aborted, the second (still live) would lose
+    // the claim with it (2026-11-27 review). The vendor's own budget bounds
+    // it instead.
+    const got = await claimFreeModel(token, { ...opts, signal: undefined, claimed: (id) => claimedCampaigns.has(key(id)) })
     if (got?.activityId) claimedCampaigns.add(key(got.activityId))
     return got
   })().finally(() => claimingCampaign.delete(username))
@@ -410,7 +414,13 @@ export async function CodarPlugin(input) {
                 // knows the age of.
                 if (pending && Date.now() - pending.at > PENDING_VERIFY_MS) return Promise.reject(new Error("安全验证已超过十分钟，请回到 magpie 重新登录"))
                 return verify(phone, code, pageSignal).catch((e) => {
-                  throw new Error(scrub(scrub(whyOf(e), code), pending?.tempToken ?? "") || (pending ? "安全验证失败" : "登录失败"))
+                  // Both secrets cut on the whole sentence, then cut once: a
+                  // scrub() per secret truncates at 400 code points each time,
+                  // and a sentence cut before the second secret was looked for
+                  // could lose the run that spelled it (2026-11-27 review).
+                  let said = scrubLine(whyOf(e), code)
+                  if (pending?.tempToken) said = scrubLine(said, pending.tempToken)
+                  throw new Error(cut(said, 400) || (pending ? "安全验证失败" : "登录失败"))
                 })
               },
             })
@@ -505,6 +515,17 @@ export async function CodarPlugin(input) {
                 ...(qr ?? {}),
                 verify,
                 copy: verify ? { title: "科搭短信安全验证", button: "完成验证" } : {},
+                // What this page already knows is cut out of a vendor sentence
+                // before it is shown: a refusal that quotes the number sent or
+                // the code typed back is not a refusal the page may show in
+                // full, and the temp token a handover carries is not for the
+                // page either.
+                clean: (said, body) => {
+                  const known = [body?.phone, body?.code, pending?.tempToken, pending?.username]
+                  let out = String(said ?? "")
+                  for (const v of known) if (typeof v === "string" && v) out = scrubLine(out, v)
+                  return cut(out, 400)
+                },
               })
             } catch (e) {
               // The page never opened, so the handover was not spent: put it
@@ -639,8 +660,18 @@ export async function CodarPlugin(input) {
           // logs it (host.js's unrenewed, renewed:false), and the request it
           // came from carried the token: cut it here as every card line is
           // cut, so nothing that echoes it back is ever stored.
-          if (typeof e?.message === "string") e.message = scrub(e.message, token) || "续期失败"
-          throw e
+          //
+          // A new error, not the one caught: an ApiError carries the vendor's
+          // parsed answer on an enumerable `body`, and a vendor that echoes
+          // the token into a refusal field would put the credential where the
+          // sentence's cutting cannot reach. What leaves here is a cut
+          // sentence and the two fields the host reads.
+          const said = scrub(typeof e?.message === "string" ? e.message : "", token) || "续期失败"
+          const out = new Error(said)
+          if (typeof e?.status === "number") out.status = e.status
+          if (typeof e?.code === "string" || typeof e?.code === "number") out.code = e.code
+          if (typeof e?.signIn === "string" && e.signIn) out.signIn = e.signIn
+          throw out
         }
         return renewResult(next)
       },
@@ -1206,6 +1237,15 @@ export async function CodarPlugin(input) {
         const wrappedRefused = wrapped && (saidNo(wrapped.success) || refusedCode(wrappedCode) || Boolean(wrappedWord && wrappedWord !== "already_claimed"))
         // The card line: the vendor's words cut to leave the wait's room.
         const saidCard = (tail) => capped(said, tail)
+        // A failed card must not read as a claim. The vendor answers some
+        // refusals with 「签到成功」 (or a plain "Success") beside the code or a
+        // false flag, and the failure line showed that sentence over an
+        // outcome of failed (2026-11-27 review). The deep path already keeps
+        // its own guard; this is the flat one's.
+        const saneCard = (tail) => {
+          const maybe = saidCard(tail)
+          return maybe && !successSaidIn(maybe) ? maybe : ""
+        }
         // Both waits: the body's data.retry_after is what the business layer
         // said, and a 2xx answer's Retry-After header is what the gateway said
         // (request() keeps it beside the body — see headerWaitOf). Without the
@@ -1281,7 +1321,7 @@ export async function CodarPlugin(input) {
           if (/^(?:invalid_token|token_expired|token_invalid|unauthorized)$/i.test(wordCode) || code === 401 || code === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (restrictedWord(wordCode)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (wordCode === "client_not_supported") return { outcome: "failed", message: CLIENT_GATED }
-          return { outcome: "failed", message: saidCard(waitSaid) || "签到失败" }
+          return { outcome: "failed", message: saneCard(waitSaid) || "签到失败" }
         }
         // A refusal one wrapper deeper than `data` ({data:{data:{code:500,
         // success:false}}}): the envelope says 200 and the refusal is two
@@ -1322,7 +1362,7 @@ export async function CodarPlugin(input) {
           if (wrappedCode === 401 || wrappedCode === 403) return { outcome: "failed", message: "登录已过期，请重新登录" }
           if (restrictedWord(errorCodeOf(wrapped))) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
           if (clientGated(errorCodeOf(wrapped), saidBy(wrapped))) return { outcome: "failed", message: CLIENT_GATED }
-          return { outcome: "failed", message: saidCard(waitSaid) || (Number.isFinite(wrappedCode) ? `签到失败（code ${wrappedCode}）` : "签到失败") }
+          return { outcome: "failed", message: saneCard(waitSaid) || (Number.isFinite(wrappedCode) ? `签到失败（code ${wrappedCode}）` : "签到失败") }
         }
         // One place does not follow the client: when the answer itself says
         // `success: false` (the flag the vendor uses on its activity
@@ -1338,7 +1378,7 @@ export async function CodarPlugin(input) {
         // claimed answer is kept until the moment the vendor stated. No
         // balance read for credit on a refusal — credit is for a claim that
         // actually landed.
-        if (saidNo(r?.success) && !already) return { outcome: "failed", message: saidCard(waitSaid) || (Number.isFinite(code) ? `签到失败（code ${code}）` : "签到失败") }
+        if (saidNo(r?.success) && !already) return { outcome: "failed", message: saneCard(waitSaid) || (Number.isFinite(code) ? `签到失败（code ${code}）` : "签到失败") }
 
         // The code gate follows the vendor's client, which only treats a
         // non-200 number as failure. A 400 that spells this attempt's success
@@ -1346,7 +1386,7 @@ export async function CodarPlugin(input) {
         // is this attempt's claim, not a refusal: the success word decides, as
         // the order rule above says. Other codes keep refusing — a 500 that
         // happens to carry a success word is still a server failure.
-        if (refusedCode(code) && !already && !(code === 400 && successSaid)) return { outcome: "failed", message: saidCard(waitSaid) || `签到失败（code ${code}）` }
+        if (refusedCode(code) && !already && !(code === 400 && successSaid)) return { outcome: "failed", message: saneCard(waitSaid) || `签到失败（code ${code}）` }
         if (already) return alreadyAnswer(earlySecs)
         // At this point, only two shapes can still be a real claim: code:200,
         // or a code-less answer with success:true (the vendor's activity
@@ -1370,7 +1410,7 @@ export async function CodarPlugin(input) {
         // have not already claimed today" used to settle the day as claimed.
         const positive = ((code === 200 || r?.success === true) && !claimDenied(words) && !successDenied(words)) && !failedWords(words)
         if (!(positive || successSaid))
-          return { outcome: "failed", message: saidCard(waitSaid) || "签到失败（应答没有说明结果）" }
+          return { outcome: "failed", message: saneCard(waitSaid) || "签到失败（应答没有说明结果）" }
         // Read balance for credit (the difference at two points, counting only
         // non-decreases). Report whatever was read, omit if unreadable; do
         // not fabricate 0.
@@ -1801,8 +1841,12 @@ export async function CodarPlugin(input) {
           // renders: one read per account per five minutes, with the answer
           // kept for the renders that follow. A failed read never fills the
           // cache, so the next call asks again.
-          const who = usernameOf(token) || "?"
-          const held = catalogCache.get(who)
+          // A token with no account name gets no slot: an opaque token cannot
+          // be told from another, and two accounts sharing "?" would share a
+          // catalog the vendor may one day address per account (2026-11-27
+          // review).
+          const who = usernameOf(token)
+          const held = who ? catalogCache.get(who) : null
           let list = held && Date.now() - held.at < CATALOG_TTL_MS ? held.list : null
           if (!list) {
             const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ...(options?.signal ? { signal: options.signal } : {}) })
@@ -1811,7 +1855,7 @@ export async function CodarPlugin(input) {
             // echoes the token is dropped there (an id that has to be renamed
             // is not an id a request can ask for), and a name is cut and kept.
             list = catalogOf(body, token)
-            if (list) catalogCache.set(who, { at: Date.now(), list })
+            if (list && who) catalogCache.set(who, { at: Date.now(), list })
           }
           if (!list) throw new Error("the vendor's catalog was not a list")
           // The vendor's catalog has the final say on its own models; entries

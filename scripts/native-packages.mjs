@@ -30,7 +30,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { binaryFile } from "../native/binary-name.mjs"
-import { buildDir, buildTargets, checkTargets, newestSourceMtime } from "./build-native.mjs"
+import { artifactProblems, binaryName, buildDir, buildInfoOf, buildTargets, checkTargets, manifestProblems, newestSourceMtime } from "./build-native.mjs"
 
 // npm spells a platform with the Node platform name and an architecture of
 // x64/arm64 — never Go's amd64. npm refuses a cpu it does not recognize
@@ -40,6 +40,25 @@ import { buildDir, buildTargets, checkTargets, newestSourceMtime } from "./build
 // uses to find these packages by the same names.
 const packageCpu = (arch) => (arch === "amd64" ? "x64" : arch)
 const packageName = (os, arch) => `magpie-plugin-codar-${os}-${packageCpu(arch)}`
+
+// verifyArtifacts is the release door's own reading of each build: the Go
+// record says which program it is, for which platform, by which toolchain and
+// with which TLS defaults; the manifest says the bytes are the ones this tree
+// built. Empty means every target answered. A machine without Go cannot be
+// asked, and publishing without asking is what this closes.
+const verifyArtifacts = (dir) => {
+  const out = []
+  for (const t of buildTargets) {
+    const name = binaryName(t)
+    const got = buildInfoOf(join(dir, name))
+    if (got === null) return [`\`go\` is not on PATH; it is what reads a build's own record`]
+    const wrong = artifactProblems(got, t)
+    if (wrong.length) out.push(`${name} ${wrong.join("; ")}`)
+    const unsure = manifestProblems(dir, t)
+    if (unsure.length) out.push(`${name}: ${unsure.join("; ")}`)
+  }
+  return out
+}
 
 // Every target, in the order scripts/build-native.mjs builds them: the build
 // table is the one authority for what exists, so this package layout cannot
@@ -227,6 +246,15 @@ function main(argv) {
   if (brokenBuilds.length) {
     console.error(`native-packages: ${brokenBuilds.map((r) => `${r.name} ${r.reason ?? "no build"}`).join("; ")}; run \`npm run native:all\` first`)
     return 1
+  }
+  // An upload cannot be withdrawn, and the checks above read a file's shape
+  // and its source string: the review of 2026-11-27 showed five 6 KB files of
+  // magic bytes and a marker passing every one of them, because the record and
+  // the digest were somebody else's step. They are this step's now.
+  const unverified = verifyArtifacts(buildDir(pkgRoot))
+  if (unverified.length) {
+    console.error(`native-packages: ${unverified.join("; ")}`)
+    return unverified.some((why) => /\bgo\b is not on PATH/.test(why)) ? 2 : 1
   }
   const wrote = stageFromTree()
   for (const p of wrote) console.log(`staged ${p.name}@${manifest.version} -> ${p.dir}`)

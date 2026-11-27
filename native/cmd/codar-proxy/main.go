@@ -467,6 +467,14 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if req.URL.Scheme != "https" {
 		return errors.New("codar-proxy: redirect leaves https")
 	}
+	// A Location that writes a user in its authority is no hop either: the
+	// host comparison ignores userinfo, so "https://someone@vendor/…" would
+	// pass every check below while the name means something else to a cookie
+	// store or a credential helper. The JS fallback's hopOf refuses the same
+	// shape (2026-11-27 review).
+	if req.URL.User != nil {
+		return errors.New("codar-proxy: redirect names a user")
+	}
 	// The first request is checked portless (officialURL), and a redirect that
 	// keeps the host name but not the port is a different service.
 	if req.URL.Port() != "" {

@@ -182,19 +182,24 @@ npm run native:all # the five platform builds, freshly
 # change as the release commit, and tag it, so the commit the tag names
 # carries pins that match its own version.
 npm version <patch|minor|major> --no-git-tag-version # package.json's version only
-# then edit package.json's five optionalDependencies to the same version
-git add -u && git commit -m "release: v<version>" # or name every file the release touched
-git tag v<version>
+# then edit package.json's five optionalDependencies to the same version,
+# rename [Unreleased] in CHANGELOG.md to [X.Y.Z] - <today's date>, and leave a
+# fresh empty [Unreleased] above it: the release commit's notes are that
+# section, and prepublishOnly cannot tell whether they were written
+git add -u && git add CHANGELOG.md && git commit -m "release: v<version>"
 node scripts/build-native.mjs --check --strict      # the five builds are real — headers, bits, no stub, newer than the proxy's source — before any of them is staged, published, or shipped
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
-node scripts/build-native.mjs --buildinfo           # each build's own record says it is this repo's proxy
+node scripts/build-native.mjs --buildinfo           # each build's own record says it is this repo's proxy, for this platform, by the pinned toolchain, and its bytes are the ones the build recorded
 node scripts/check-packed-install.mjs               # the packed pair installs with npm and the proxy runs (Windows CI does this)
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
+# Tag only once every gate has passed: a tag made before them names a commit
+# nothing verified, and an interrupted release leaves it behind.
+git tag -a v<version> -m "v<version>"               # annotated: --follow-tags pushes annotated tags only
 node scripts/native-packages.mjs --publish          # the five platform packages, first
 npm publish                                         # prepublishOnly re-runs the same gates: --strict builds and the fingerprint, --buildinfo, the packed suite and install check (--require-bun --require-builds), the staged set (--check)
-git push --follow-tags                              # after the packages are up: a tag pushed before a failed publish would be public alone
-gh release create vX.Y.Z --title vX.Y.Z --notes "<the CHANGELOG section>"
+git push origin main && git push origin v<version>   # after the packages are up: a tag pushed before a failed publish would be public alone
+gh release create v<version> --target <the release commit> --title v<version> --notes "<the CHANGELOG section>"
 ```
 
 The staging step comes before its check: `--check` reads the staged set, and a

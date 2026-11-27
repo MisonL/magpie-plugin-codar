@@ -471,7 +471,13 @@ const main = async () => {
         // CODAR_TARBALL_GATE tells the suite it is running inside this check:
         // the test of the gate itself skips there, or the suite would run the
         // gate again from inside the tarball, each level packing another one.
-        execFileSync(cmd, args, { cwd: pkg, stdio: "inherit", env: { ...process.env, CODAR_TARBALL_GATE: "1", CODAR_PLUGIN_DISABLE_NATIVE: "1" } })
+        // CODAR_NATIVE_OUT is this gate's own redirection of the build
+        // directory, not something the packed suite should inherit: a suite
+        // that reads it expects the package's own native/bin, and the review
+        // of 2026-11-27 saw a correct tree refused for setting it
+        // (README documents it as a release hook).
+        const { CODAR_NATIVE_OUT: _out, ...innerEnv } = process.env
+        execFileSync(cmd, args, { cwd: pkg, stdio: "inherit", env: { ...innerEnv, CODAR_TARBALL_GATE: "1", CODAR_PLUGIN_DISABLE_NATIVE: "1" } })
       } catch (e) {
         if (e?.code === "ENOENT") {
           const missing = new Error(`${cmd} was not found in PATH; this check needs it`)

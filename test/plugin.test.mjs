@@ -184,6 +184,31 @@ test("a password sign-in that wants an SMS check names the way that works", asyn
   }
 })
 
+test("a failed renewal hands the host a sentence, not the answer that carried the token", async () => {
+  // An ApiError keeps the vendor's parsed answer on an enumerable `body`, and
+  // the renewal hook rethrew the same error after cutting only its message: a
+  // vendor that echoed the token into a field of that answer put it where the
+  // sentence's cutting could not reach (2026-11-27 review).
+  const p = await CodarPlugin()
+  const live = await auth()
+  await withFetch(
+    {
+      "POST /v1/token/refresh": {
+        status: 503,
+        body: { detail: `service unavailable for ${TOKEN}`, echo: TOKEN, nested: { token: TOKEN } },
+      },
+    },
+    async () => {
+      await assert.rejects(p.auth.refresh(live), (e) => {
+        assert.equal(e.body, undefined, "the vendor's parsed answer crossed into the host")
+        assert.equal(e.message.includes(TOKEN), false, `the token survived in the message: ${e.message}`)
+        assert.match(e.message, /service unavailable/, "the sentence itself was lost")
+        return true
+      })
+    },
+  )
+})
+
 test("a renewal keeps the sign-in ahead of its exp, and a refused one marks it expired", async () => {
   const next = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 604800 })
   const p = await CodarPlugin()
@@ -331,6 +356,39 @@ test("the verify page's send button retries a captcha that never loaded", async 
     assert.match(html, /if \(!cap\) \{ ensureCaptcha\(\); return \}/, "a click without a widget asks for it again")
   } finally {
     sms.close()
+  }
+})
+
+test("a refusal the page shows has what the page knows cut out of it", async () => {
+  // The page's own cutting is the shape rules: they cannot see the phone
+  // number it just sent or the code it just took, so a vendor sentence
+  // quoting either back was shown as written (2026-11-27 review). The caller
+  // that started the page knows those values, and hands the page a cleaner.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const seen = []
+  const page = await startSignIn({
+    sendCode: async () => {
+      throw new Error("13800138000 已被拒绝")
+    },
+    verifyCode: async () => ({ token: TOKEN, username: "user_1" }),
+    clean: (said, body) => {
+      seen.push([said, body?.phone])
+      const phone = typeof body?.phone === "string" ? body.phone : ""
+      return phone ? String(said).split(phone).join("…") : String(said)
+    },
+  })
+  try {
+    const res = await fetch(`${page.url}send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: "13800138000", captcha: { lot_number: "a", captcha_output: "b", pass_token: "c", gen_time: "d" } }),
+    })
+    const said = await res.json()
+    assert.equal(seen[0]?.[1], "13800138000", "the cleaner was not given what the page sent")
+    assert.equal(/13800138000/.test(said.error), false, `the number reached the page: ${said.error}`)
+    assert.match(said.error, /已被拒绝/)
+  } finally {
+    page.close()
   }
 })
 

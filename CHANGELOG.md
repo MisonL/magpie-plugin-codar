@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The fingerprint could be appended to any build, and every gate believed it.** `codar-proxy-source:<hash>` is a string the linker writes, so a file from other sources with that string added passed `--check --strict` and `--buildinfo`; the review of 2026-11-27 published a chain doing it (six kilobytes of magic bytes and a marker also passed `native-packages`, which never asked for a build record at all). The build now writes `native/bin/builds.json` — the sha256 of each file it produced, with its platform, toolchain and TLS defaults — and `--buildinfo` and the publish step compare against it: an appended marker changes the digest, and the release door itself reads `go version -m`, so a file that is not a Go program, or was built for another platform or by another Go, is refused before anything is uploaded.
+- `--buildinfo` now reads the record it already had: `build GOOS`, `GOARCH`, the toolchain's version and `DefaultGODEBUG`, each against its target. A linux build copied under five names passed before; so did one made by the developer's go1.27 rather than the pinned 1.24.3/1.26.7.
+- The Go proxy refuses a redirect whose Location names a user (`https://someone@vendor/…`), as the JS fallback's `hopOf` already did: the host comparison ignores userinfo, so such a Location passed every other check.
+- A failed renewal hands the host a cut sentence instead of the error that carried the vendor's parsed answer: an `ApiError` keeps that answer on an enumerable `body`, and a refusal echoing the token into a field put the credential where the sentence's cutting could not reach.
+- The sign-in page cuts what it already knows out of a sentence before showing it — the number it sent, the code it was given, the handover's temp token — where the shape rules alone could not see them. The verify side also cuts both secrets before its single 400-code-point truncation instead of truncating between them.
+- A short key (a name, a two-character password) is cut on whole tokens only: an account called "cat" turned 「catalog service unavailable」 into 「…alog service unavailable」.
+
+### Fixed
+
+- `check-packed-install` stages the platform packages from `bin` every time instead of trusting a directory an earlier run left, compares the installed proxy's `-version` against this tree's exact fingerprint rather than the shape of one, and the tarball gate no longer passes its own `CODAR_NATIVE_OUT` into the packed suite (a documented release hook that made a correct tree fail).
+- Staged builds left unreclaimed in `%TEMP%`: an empty `codar-plugin-*` directory has no pid to prove dead, so nothing ever collected it (35 in 26 hours on one machine). One older than a day is now removed — longer than any suspended start, shorter than forever.
+- The shared free-model claim no longer carries the first caller's cancellation signal, so a check-in the host abandons cannot take the claim away from one that is still live; a card whose catalog has no account name is no longer cached under a shared slot.
+
 ### Changed
 
 - `CODAR_PROXY_BIN` may now name a JS file: it runs under this runtime, because Windows cannot spawn a `.mjs` at all. That is what the plugin's own tests and the Windows CI check name — the real proxy is a native binary, so nothing changes in production.
@@ -1240,7 +1255,7 @@ Initial release.
 - A test suite (187 tests) on Node 18–24 and Bun across Linux, macOS and
   Windows, including a formatting test that pins `.editorconfig`.
 
-[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/MisonL/magpie-plugin-codar/compare/v0.3.4...HEAD
 [0.3.5]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.5
 [0.3.4]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.4
 [0.3.3]: https://github.com/MisonL/magpie-plugin-codar/releases/tag/v0.3.3

@@ -3,11 +3,14 @@
 // plugin's own binaryPath opened and run. The packed-install test in
 // test/native.test.mjs is skipped on Windows (npm is a .cmd shim there and the
 // check's own local registry cannot be reached through it), so without this the
-// Windows install — optionalDependencies, the tarball's file list, npm's shim
-// handling — was checked nowhere.
+// Windows install — the tarball's file list, npm's shim handling, and the
+// binaryPath the installed plugin resolves — was checked nowhere.
 //
 // It does not need a registry: npm installs the two local tarballs directly,
-// which is the part the suite's registry-based check cannot do on Windows.
+// which is the part the suite's registry-based check cannot do on Windows. That
+// also means it does NOT prove optionalDependencies pick this machine's package;
+// the registry-based check in scripts/tarball.mjs does, on Linux (2026-11-27
+// review).
 //
 // Usage: node scripts/check-packed-install.mjs   (exit 0 = installed and ran)
 //        CODAR_NATIVE_OUT names where the builds are, as everywhere else.
@@ -35,8 +38,12 @@ const { packedPackage } = await import("./tarball.mjs")
 const platform = packageName(process.platform, process.arch)
 const platformDir = join(pkgRoot, "native", "packages", platform)
 // native/packages is generated, not checked in: a fresh clone (and CI) has
-// none. Staging writes them from the same builds this check packs.
-if (!existsSync(join(platformDir, "package.json"))) {
+// none. Staged every time, not only when the directory is missing: a staging
+// left by an earlier run is not this `bin`'s, and the review of 2026-11-27
+// showed a stale 0.3.4 package reporting "installed and ran" beside a 0.3.5
+// main package, with `CODAR_NATIVE_OUT` never consulted at all (2026-11-27
+// review).
+{
   const { stageFromTree } = await import("./native-packages.mjs")
   try {
     stageFromTree()
@@ -85,7 +92,12 @@ try {
   const ran = spawnSync(file, ["-version"], { encoding: "utf8", timeout: 30_000 })
   const said = `${ran.stdout ?? ""}${ran.stderr ?? ""}`
   if (ran.status !== 0) fail(1, `the installed proxy did not run (exit ${ran.status}): ${said.trim()}`)
-  if (!/codar-proxy-source:[0-9a-f]{64}/.test(said)) fail(1, `the installed proxy printed no source fingerprint: ${said.trim()}`)
+  // The value, not its shape: a marker appended to another build prints the
+  // same shape and a different hash, and the release is this tree's or it is
+  // not (2026-11-27 review).
+  const { SOURCE_MARKER, sourceHash } = await import("./build-native.mjs")
+  const want = `${SOURCE_MARKER}${sourceHash()}`
+  if (said.trim() !== want) fail(1, `the installed proxy named ${said.trim() || "nothing"}, not this tree's ${want}`)
   console.log(`check-packed-install: ${platform} installed and ran (${said.trim()})`)
 } finally {
   // Windows keeps a handle on a file its child just closed; retry, and never
