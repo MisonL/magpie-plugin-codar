@@ -78,7 +78,12 @@ try {
   else process.env.CODAR_PROXY_BIN = saved.bin
   if (saved.retry === undefined) delete process.env.CODAR_PROXY_RETRY_MS
   else process.env.CODAR_PROXY_RETRY_MS = saved.retry
-  rmSync(dir, { recursive: true, force: true })
+  // Windows keeps a handle on a file its child is still closing: the fixture
+  // was asked to stop a moment ago, so the directory can refuse to go for a
+  // few hundred milliseconds. Retry, and never turn cleanup into the result.
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  } catch {}
 }
 if (code !== 0) {
   // A leftover fixture would keep holding a port; the plugin's own closeProxy
