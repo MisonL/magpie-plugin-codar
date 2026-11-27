@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-codar",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Codar (科搭) for magpie — its models as a provider, the daily check-in, and the account's points on the card",
   "author": "MisonL",
   "type": "module",
@@ -64,11 +64,11 @@
     "native:pack": "node scripts/native-packages.mjs"
   },
   "optionalDependencies": {
-    "magpie-plugin-codar-darwin-arm64": "0.3.4",
-    "magpie-plugin-codar-darwin-x64": "0.3.4",
-    "magpie-plugin-codar-linux-arm64": "0.3.4",
-    "magpie-plugin-codar-linux-x64": "0.3.4",
-    "magpie-plugin-codar-win32-x64": "0.3.4"
+    "magpie-plugin-codar-darwin-arm64": "0.3.5",
+    "magpie-plugin-codar-darwin-x64": "0.3.5",
+    "magpie-plugin-codar-linux-arm64": "0.3.5",
+    "magpie-plugin-codar-linux-x64": "0.3.5",
+    "magpie-plugin-codar-win32-x64": "0.3.5"
   },
   "publishConfig": {
     "access": "public"
