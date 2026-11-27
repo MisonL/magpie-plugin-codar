@@ -82,6 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The short-credential scrub cut too much and too little: a two-character key's hex matched any port number or digest slice and cut whole hashes, while a gateway's labelled echo (`code=…`, `hex 0x…`) was left readable because `=` and `0x` were read as encoding. Encoded forms are cut only for keys of four characters or more, and a label is a boundary.
   - A check-in the host cancels while its write is in flight says the result is unknown («签到请求已取消，结果未知，请稍后查看卡片») instead of "failed" over a claim that may have landed; an abort and a timeout are told apart, since the host's own `checkin(getAuth, provider)` passes no signal, so only a direct caller can cancel at all.
 
+- The models hook read the vendor's catalog on every call, and the host calls it whenever it draws the provider list: every settings open and every model picker waited on a round trip, up to the 8-second bound when the vendor was slow. The list is now held per account for five minutes (a model is added to that catalog every few weeks), a failed read never fills the hold, and `testables.resetCatalogCache()` clears it — hanging off `testables` rather than being exported, because the host runs every exported function as a hook.
+
 ## [0.3.4] - 2026-11-21
 
 ### Fixed

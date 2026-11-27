@@ -29,7 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, restrictedWord, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, restrictedWord, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, testables, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
@@ -173,6 +173,22 @@ const chatTransport = async (url, init) => {
 // only — a restarted magpie asks the vendor again and follows its answer.
 const claimedCampaigns = new Set()
 const claimingCampaign = new Map()
+
+// catalogCache holds the vendor's model list per account for a few minutes.
+// The host draws the provider list more often than the vendor adds a model,
+// and each read is a round trip the card waits for.
+const catalogCache = new Map()
+const CATALOG_TTL_MS = 5 * 60 * 1000
+
+// resetCatalogCache forgets the held lists. The suite's fixtures answer for
+// one account with one catalog, and a held answer from the fixture before it
+// is not this test's. It hangs off testables rather than being exported: the
+// host runs every exported function as a hook.
+const resetCatalogCache = () => {
+  catalogCache.clear()
+  return true
+}
+testables.resetCatalogCache = resetCatalogCache
 
 // claimFreeModelsOnce is claimFreeModel with that guard around it. The
 // campaign is named by the vendor's own answer, so the record is asked about
@@ -1774,12 +1790,23 @@ export async function CodarPlugin(input) {
           // is one of OFFICIAL_HOSTS. The outbound request is the sidecar's Go
           // client with its own UA, not a Node fetch, so this request goes the
           // same way (request() prefers the native transport).
-          const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ...(options?.signal ? { signal: options.signal } : {}) })
-          // The key goes to catalogOf so the token is cut out of the raw
-          // strings, before their 120-character clean: a record whose id
-          // echoes the token is dropped there (an id that has to be renamed
-          // is not an id a request can ask for), and a name is cut and kept.
-          const list = catalogOf(body, token)
+          // The host calls this hook whenever it draws the provider list, and
+          // the vendor's catalog changes when it adds a model, not between two
+          // renders: one read per account per five minutes, with the answer
+          // kept for the renders that follow. A failed read never fills the
+          // cache, so the next call asks again.
+          const who = usernameOf(token) || "?"
+          const held = catalogCache.get(who)
+          let list = held && Date.now() - held.at < CATALOG_TTL_MS ? held.list : null
+          if (!list) {
+            const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ...(options?.signal ? { signal: options.signal } : {}) })
+            // The key goes to catalogOf so the token is cut out of the raw
+            // strings, before their 120-character clean: a record whose id
+            // echoes the token is dropped there (an id that has to be renamed
+            // is not an id a request can ask for), and a name is cut and kept.
+            list = catalogOf(body, token)
+            if (list) catalogCache.set(who, { at: Date.now(), list })
+          }
           if (!list) throw new Error("the vendor's catalog was not a list")
           // The vendor's catalog has the final say on its own models; entries
           // the user added to this provider themselves (ids not in the

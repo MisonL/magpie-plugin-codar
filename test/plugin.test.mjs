@@ -59,6 +59,9 @@ const auth = async () => ({ type: "api", key: TOKEN })
 // A key with no method matches any method; a key starting with "http" is
 // the whole URL (host included).
 async function withFetch(routes, fn) {
+  // The vendor's catalog is held per account for five minutes; a fixture's
+  // answer must not be the next fixture's answer.
+  testables.resetCatalogCache?.()
   const real = globalThis.fetch
   // Every test in this file runs with the native transport off (see the top),
   // so a developer with a built native/bin does not see these routes bypassed.
@@ -2987,6 +2990,34 @@ test("the models hook replaces the list with the vendor's, and falls back to it"
   )
   assert.deepEqual(Object.keys(fell), ["deepseek-v4.1-flash"], "the list it was given is kept")
   assert.equal(fell[Symbol.for("magpie.fellBack")], true, "and says the vendor was not reached")
+})
+
+test("the vendor's catalog is read once per account, not once per render", async () => {
+  // The host calls the models hook whenever it draws the provider list, and
+  // each call was a round trip to the vendor. A model is added to the catalog
+  // every few weeks; five minutes of staleness is cheaper than a picker that
+  // waits on the network every time it opens.
+  const p = await CodarPlugin()
+  const given = { id: "codar", models: { "mine": modelOf({ id: "mine" }) } }
+  let reads = 0
+  const body = { catalog: { data: [{ id: "new-model", display_name: "New", context_window: 2000, input_modalities: ["text"], output_modalities: ["text"], protocol: { type: "openai_chat_completions" } }] } }
+  const real = globalThis.fetch
+  testables.nativeFetch = null
+  globalThis.fetch = async (url) => {
+    reads++
+    return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
+  }
+  try {
+    const a = await p.provider.models(given, { auth: await auth() })
+    const b = await p.provider.models(given, { auth: await auth() })
+    assert.equal(reads, 1, `the catalog was read ${reads} times for two renders`)
+    // the vendor's entry arrives and the user's own survives, as on every other
+    // road through this hook
+    assert.deepEqual(Object.keys(a ?? {}).sort(), ["mine", "new-model"], "the first render did not use the vendor's answer")
+    assert.deepEqual(Object.keys(b ?? {}).sort(), ["mine", "new-model"], "the cached render answered differently")
+  } finally {
+    globalThis.fetch = real
+  }
 })
 
 test("the live list keeps models the user added, and follows the vendor for its own", async () => {
