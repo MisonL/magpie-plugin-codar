@@ -44,7 +44,13 @@ import { binaryFile } from "../native/binary-name.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, "..", "native")
-const out = process.env.CODAR_NATIVE_OUT ? resolve(process.env.CODAR_NATIVE_OUT) : join(root, "bin")
+// buildDir is where the builds live for every script that reads them — this
+// one's --check, native-packages' staging and tarball.mjs's install check —
+// and CODAR_NATIVE_OUT moves all of them at once. A check that validated one
+// directory while the publish copied another is how a stale build could have
+// reached a release line (found by the 2026-11-26 pre-release review).
+export const buildDir = (pkgRoot = join(root, "..")) => (process.env.CODAR_NATIVE_OUT ? resolve(pkgRoot, process.env.CODAR_NATIVE_OUT) : join(pkgRoot, "native", "bin"))
+const out = buildDir()
 
 const go = process.env.GO || "go"
 // The variable is named after the release line, not the patch: GO_1_24 names

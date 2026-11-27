@@ -5,6 +5,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import { execFileSync as execFile } from "node:child_process"
+import { createServer } from "node:net"
 import { homedir, tmpdir } from "node:os"
 import { join, sep } from "node:path"
 import { request as httpRequest } from "node:http"
@@ -457,6 +459,96 @@ test("a name the vendor echoed into the IP check reaches the page as text, not a
     assert.ok(!html.includes(hostile), `the account name went in as markup: ${html.slice(0, 400)}`)
     assert.ok(html.includes("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"), "the name is shown, escaped")
     assert.match(html, /value="13800138000" readonly/)
+  } finally {
+    sms.close()
+  }
+})
+
+test("the config read refuses a FIFO and a socket without waiting, and still reads a file", async () => {
+  // This hook runs in the one host process every plugin shares, so anything
+  // that can block the read blocks magpie. A FIFO is the shape that used to
+  // hang it; a socket answers open() with a platform errno instead of bytes
+  // (macOS reports -102), which is the same "not a regular file" answer.
+  const { readConfigText } = testables
+  const dir = mkdtempSync(join(tmpdir(), "codar-cfg-"))
+  const file = join(dir, "config.json")
+  writeFileSync(file, '{"provider":{"speedai":{"token":"x"}}}')
+  try {
+    assert.match(readConfigText(file), /"token":"x"/, "a regular file still reads")
+
+    const fifo = join(dir, "fifo")
+    execFile("mkfifo", [fifo])
+    const started = Date.now()
+    assert.throws(() => readConfigText(fifo), (e) => e.code === "EFTYPE", "a FIFO was not refused")
+    assert.ok(Date.now() - started < 2000, "the FIFO read waited instead of answering")
+
+    const sock = join(dir, "sock")
+    const server = createServer()
+    await new Promise((r, rej) => { server.once("error", rej); server.listen(sock, r) })
+    try {
+      assert.throws(() => readConfigText(sock), (e) => e.code === "EFTYPE", "a socket was not refused")
+    } finally {
+      await new Promise((r) => server.close(r))
+    }
+
+    assert.throws(() => readConfigText(join(dir, "nope")), (e) => e.code === "ENOENT", "a missing file is still missing")
+    assert.throws(() => readConfigText(dir), (e) => e.code === "EFTYPE", "a directory is still not a file")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a refusal in error.code or detail.code is a refusal, not a sign-in", async () => {
+  // A gateway that answers `{code:200, error:{code:401}, data:{token}}` is
+  // refusing the sign-in; reading only the envelope's own `code` handed the
+  // token to the caller and finished a login that never happened
+  // (2026-11-26 review). The same walk is what a QR status and a check-in read.
+  const { refusalWithin, wechatStatusOf, restrictedWithin } = testables
+  const refused = refusalWithin({ code: 200, error: { code: 401 }, data: { token: TOKEN, username: "user_1" } })
+  assert.ok(refused, "an error.code 401 beside the token was read as no refusal")
+  assert.equal(refusalWithin({ code: 200, detail: { code: 403 }, data: { token: TOKEN } })?.detail?.code, 403, "and so is detail.code")
+  assert.equal(refusalWithin({ code: 200, data: { token: TOKEN, username: "user_1" } }), null, "a healthy answer is still no refusal")
+
+  // the QR status reads the same fields for its 404
+  for (const body of [
+    { code: 200, error: { code: 404 }, data: { status: "SUCCESS", token: TOKEN } },
+    { code: 200, detail: { code: 404 }, data: { status: "SUCCESS", token: TOKEN } },
+  ]) {
+    assert.equal(wechatStatusOf(body).state, "expired", `404 beside SUCCESS was not read as expired: ${JSON.stringify(body)}`)
+  }
+
+  // and a restriction named in detail outranks the business word at the same node
+  assert.equal(restrictedWithin({ code: "already_claimed", detail: { code: "account_restricted" } }), true, "a restriction beside already_claimed was read as the day claimed")
+  assert.equal(restrictedWithin({ code: 200, data: { code: "already_claimed" } }), false, "a plain claim is not a restriction")
+
+  // a done "token" with no account name anywhere is not a done: every card
+  // read after it would fail for a name the token cannot supply
+  const nameless = "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ sub: "u", exp: 9999999999 })).toString("base64url") + ".sig"
+  assert.equal(wechatStatusOf({ code: 200, data: { status: "SUCCESS", token: nameless } }).state, "error", "a token with no account name finished the page")
+})
+
+test("the sign-in page refuses to be framed, re-based or navigated, and leaks no referrer", async () => {
+  // The page's origin carries a 128-bit path token. The four directives sent
+  // here depend on nothing the vendor's captcha loads — a policy over
+  // script-src/connect-src would need a live widget to check against (README) —
+  // and no-referrer keeps the token out of any request the page's script makes
+  // off this origin.
+  const { startSignIn } = await import("../lib/signinpage.mjs")
+  const sms = await startSignIn({
+    verify: { sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }), hint: "该账号当前网络需要短信安全验证", phone: "13800138000" },
+    copy: { title: "科搭短信安全验证", button: "完成验证" },
+  })
+  try {
+    const res = await fetch(sms.url)
+    const csp = res.headers.get("content-security-policy") ?? ""
+    for (const directive of ["frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'", "object-src 'none'"]) {
+      assert.ok(csp.includes(directive), `the page's CSP is missing ${directive}: ${csp}`)
+    }
+    assert.equal(csp.includes("script-src"), false, "a script-src was sent without checking it against the widget")
+    assert.equal(csp.includes("connect-src"), false, "a connect-src was sent without checking it against the widget")
+    assert.equal(res.headers.get("referrer-policy"), "no-referrer")
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff")
+    assert.equal(res.headers.get("cache-control"), "no-store")
   } finally {
     sms.close()
   }
@@ -1453,6 +1545,19 @@ test("the scan status reads the vendor's words as the page's own states", () => 
   assert.equal(wechatStatusOf({ data: { status: "scanned" } }).state, "scanned")
   assert.equal(wechatStatusOf({ data: { status: "expired" } }).state, "expired")
   assert.equal(wechatStatusOf({ code: 404, message: "二维码已过期" }).state, "expired", "a 404 is the vendor's other way of saying it")
+  // ...and a stale success body beside that 404 is not a sign-in: the code ran
+  // out, and finishing the page on the token it still carries signed in on a
+  // code the vendor had already closed.
+  assert.equal(
+    wechatStatusOf({ code: 404, data: { status: "SUCCESS", token: TOKEN } }).state,
+    "expired",
+    "an expired code is no sign-in, whatever body stands beside it",
+  )
+  assert.equal(
+    wechatStatusOf({ code: 200, data: { code: 404, status: "SUCCESS", token: TOKEN } }).state,
+    "expired",
+    "the same 404 under a data wrapper is the same expiry",
+  )
   assert.equal(wechatStatusOf({ data: { status: "required_bind_phone" } }).state, "error", "an unbound WeChat is a sign-in the vendor will not finish")
   assert.match(wechatStatusOf({ data: { status: "bind_phone_required" } }).message, /绑定手机号/)
   // the vendor's own list is BIND_PHONE / REQUIRE_PHONE_BINDING /
@@ -4719,11 +4824,11 @@ test("a claim sentence beside a failure word is not the day claimed", async () =
   // that this attempt failed settled the day at zero points. The two branches
   // now read the sentence the same way.
   const p = await CodarPlugin()
-  const read = (body) =>
+  const read = (body, status) =>
     withFetch(
       {
         "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
-        "/v1/daily-sign": { body },
+        "/v1/daily-sign": { body, ...(status ? { status } : {}) },
       },
       async () => p.auth.checkin(auth),
     )
@@ -4786,6 +4891,57 @@ test("a day's sentence two data levels in is still the day's sentence", async ()
     async () => p.auth.usage(auth),
   )
   assert.equal(refusedStatus.windows.find((w) => w.name === "每日签到"), undefined, "a wrapped refusal draws no claim row")
+})
+
+test("an expiry in the wrapper chain outranks the day's own already_claimed word", async () => {
+  // A gateway that answers `{code:401, data:{code:"already_claimed"}}` — the
+  // wrapper shapes this file's other readers already walk — says the sign-in
+  // is dead beside a day it read off a cached body. Read as the day's own
+  // word, the card settles "今天已领过" over an account that cannot claim or
+  // chat, and the re-login that fixes it is never asked for.
+  const p = await CodarPlugin()
+  const read = (body) =>
+    withFetch(
+      {
+        "/v1/gettoken": { body: { code: 200, token: 500, agent_token: 0 } },
+        "/v1/daily-sign": { body },
+      },
+      async () => p.auth.checkin(auth),
+    )
+  const outer = await read({ code: 401, data: { code: "already_claimed", retry_after: 3600 } })
+  assert.equal(outer.outcome, "failed", "an envelope 401 is no claim")
+  assert.match(outer.message, /重新登录/, "and the fix it names is the re-login")
+  const wrapped = await read({ code: 200, data: { code: 401, data: { code: "already_claimed", retry_after: 3600 } } })
+  assert.equal(wrapped.outcome, "failed", "the same 401 one wrapper in")
+  assert.match(wrapped.message, /重新登录/)
+  // the vendor's other spelling of a refusal carries the status under `error`
+  // or `detail`; it is the same death and the same re-login
+  const fields = await read({ code: 200, error: { code: 401 }, data: { code: "already_claimed", retry_after: 3600 } })
+  assert.equal(fields.outcome, "failed", "an error.code 401 is the sign-in's death too")
+  const detail = await read({ code: 200, detail: { code: 401 }, data: { code: "already_claimed", retry_after: 3600 } })
+  assert.equal(detail.outcome, "failed", "and so is detail.code")
+  // the wording path settles a day without any word code at all, so a 401
+  // beside a cached "already signed today" sentence has to be read before it
+  // too: an ordering that only guarded the already_claimed word answered this
+  // envelope with 「今天已领过」 (2026-11-26 review).
+  // the vendor's sentence can name the restriction while the status says 401:
+  // re-login cannot fix a restricted account, so the sentence wins
+  const sentence = await read({ code: 401, message: "account_restricted" })
+  assert.equal(sentence.outcome, "failed", "a restricted account is not a sign-in to redo")
+  assert.match(sentence.message, /受限/)
+  // and a gateway's 400 can carry the death in error.code
+  const gateway = await read({ code: 400, retry_after: 3600, error: { code: 401 } }, 400)
+  assert.equal(gateway.outcome, "failed", "a 400 carrying error.code 401 settled the day")
+  assert.match(gateway.message, /重新登录/)
+  const wording = await read({ code: 401, data: { code: 400, message: "Already signed today", retry_after: 3600 } })
+  assert.equal(wording.outcome, "failed", "a 401 beside the day's sentence is still a dead sign-in")
+  assert.match(wording.message, /重新登录/)
+  // and the death can sit in another field than the word code
+  const elsewhere = await read({ code: "already_claimed", error: { code: "token_expired" } })
+  assert.equal(elsewhere.outcome, "failed", "an error.code token_expired is the sign-in's death too")
+  // the day's own word is still the day's when nothing names the sign-in's death
+  const claimed = await read({ code: 200, data: { code: "already_claimed", retry_after: 3600 } })
+  assert.equal(claimed.outcome, "done", "a plain already_claimed is still the day claimed")
 })
 
 test("an already-claimed day is not turned into a failure by the success flag", async () => {
@@ -8046,6 +8202,33 @@ test("a token spelled in two-character groups around dots is cut where no key is
   assert.equal(scrubShapes("See U.S.A. and U.K. for details", ""), "See U.S.A. and U.K. for details")
 })
 
+test("a short credential's encoded forms are cut too, and only its own", () => {
+  // A six-digit SMS code or a nine-character password is under the length
+  // every encoded-run rule looks for, so a gateway that echoed it in base64 or
+  // hex left it readable (2026-11-26 review). The exact encodings of a KNOWN
+  // key are cut at any length — a run that spells this key cannot be anything
+  // else — while the sentence around it stays.
+  const code = "246802"
+  const b64 = Buffer.from(code, "utf8").toString("base64")
+  const hex = Buffer.from(code, "utf8").toString("hex")
+  for (const [label, said] of [
+    ["base64", `验证码 ${b64} 已失效`],
+    ["base64url without padding", `验证码 ${b64.replace(/=+$/, "")} 已失效`],
+    ["hex", `code ${hex} expired`],
+    ["HEX", `code ${hex.toUpperCase()} expired`],
+    ["plain", `code ${code} expired`],
+  ]) {
+    const cut = scrubShapes(said, code)
+    assert.ok(!cut.includes(code) && !cut.includes(b64) && !cut.includes(hex), `${label}: ${cut}`)
+    assert.ok(cut.includes("已失效") || cut.includes("expired"), `${label}: the sentence lost its words: ${cut}`)
+  }
+  const password = "AuditPa55"
+  const pb64 = Buffer.from(password, "utf8").toString("base64")
+  assert.ok(!scrubShapes(`password ${pb64} rejected`, password).includes(pb64), "a short password encoded in base64 survived")
+  // and the rest of the sentence is untouched: no key, no cut
+  assert.equal(scrubShapes("the release is 0.3.5, see U.S.A.", password), "the release is 0.3.5, see U.S.A.")
+})
+
 test("a credential folded with a mark the fold walk did not know is still cut", () => {
   // U+20DD (combining enclosing circle) is neither \s nor a control; the shape
   // pass allowed \s between segments only, so a token folded with it passed
@@ -8112,9 +8295,9 @@ test("a token split across two fields stops the generator instead of reaching th
 })
 
 test("a config that is not a regular file fails the sign-in and the generator alike", async () => {
-  // A directory where the config belongs: readFileSync would answer EISDIR,
-  // but a FIFO would block it for ever. statSync refuses a non-regular file
-  // before it is opened, and both readers say the same thing.
+  // A directory where the config belongs: one descriptor decides the shape and
+  // the bytes (fstat on the open descriptor, not a stat of the path), so a FIFO
+  // cannot block the read and both readers say the same thing.
   const { mkdirSync, mkdtempSync } = await import("node:fs")
   const root = mkdtempSync(join(tmpdir(), "codar-cfg-"))
   mkdirSync(join(root, "config.json"))

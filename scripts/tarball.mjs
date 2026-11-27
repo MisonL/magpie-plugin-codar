@@ -35,6 +35,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { platformPackages, stagePackages, checkPackages } from "./native-packages.mjs"
+import { buildDir } from "./build-native.mjs"
 
 // The checkout this script lives in, not the caller's directory: `npm pack`
 // packs the directory it runs in, and a release script is often run from
@@ -71,7 +72,14 @@ export const shellSafe = (args, throughShell) => {
 export const run = (cmd, args, { throughShell = shell, ...opts } = {}) => {
   shellSafe(args, throughShell)
   try {
-    return execFileSync(cmd, args.map((a) => quoteArg(a, throughShell)), { encoding: "utf8", shell: throughShell, ...opts })
+    // Through a shell the call is one command string: an argument array beside
+    // `shell: true` is deprecated in Node 24 (DEP0190) and reads as "join it
+    // for me", which cmd.exe then re-splits. The array is still quoted for the
+    // shell first, so a path with a space survives the join.
+    const line = [cmd, ...args.map((a) => quoteArg(a, throughShell))].join(" ")
+    return throughShell
+      ? execFileSync(line, { encoding: "utf8", shell: true, ...opts })
+      : execFileSync(cmd, args, { encoding: "utf8", ...opts })
   } catch (e) {
     // Through cmd.exe a missing program is not ENOENT: cmd prints "not
     // recognized" and exits 9009 (127 from a POSIX shell), and Node throws a
@@ -234,16 +242,22 @@ export const consumerInstall = async ({ dir, manager, main, platform, probe = {}
     // packages out of the developer's ~/.bun and ~/.npm caches — bun's held
     // 505 of them (282 MB) on 2026-11-25, from these runs alone.
     const said = await new Promise((resolve) => {
-      const child = spawn(manager, ["add", main], {
-        cwd: dir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          npm_config_registry: registry,
-          BUN_INSTALL_CACHE_DIR: join(dir, ".bun-cache"),
-          npm_config_cache: join(dir, ".npm-cache"),
-        },
-      })
+      // the same shell rule as run(): npm is npm.cmd on Windows, and the
+      // arguments go through cmd.exe quoted (a temp path may carry a space)
+      const argv = ["add", main]
+      if (shell) shellSafe(argv, true)
+      const env = {
+        ...process.env,
+        npm_config_registry: registry,
+        BUN_INSTALL_CACHE_DIR: join(dir, ".bun-cache"),
+        npm_config_cache: join(dir, ".npm-cache"),
+      }
+      // Through a shell the command is one string, quoted here: an argument
+      // array beside `shell: true` is deprecated in Node 24 (DEP0190) and
+      // reads as "join it for me", which cmd.exe then re-splits
+      const child = shell
+        ? spawn([manager, ...argv].map((a) => quoteArg(a, true)).join(" "), { cwd: dir, shell: true, stdio: ["ignore", "pipe", "pipe"], env })
+        : spawn(manager, argv, { cwd: dir, shell: false, stdio: ["ignore", "pipe", "pipe"], env })
       let out = ""
       child.stdout.on("data", (d) => (out += d))
       child.stderr.on("data", (d) => (out += d))
@@ -376,7 +390,7 @@ const main = async () => {
     // run of the suite there is nothing to stage (a checkout's builds are not
     // in the package) and nothing cheap to install twice, so it is skipped
     // there — the gate one level up has already done it.
-    const bin = join(pkgRoot, "native", "bin")
+    const bin = buildDir(pkgRoot)
     // The packed marker says the suite is running inside this check's own
     // tarball, where a checkout's builds are not and the gate one level up has
     // already done the install. It is not a licence to skip a check the caller
@@ -405,9 +419,13 @@ const main = async () => {
       // first: bun and npm each resolve optionalDependencies and the os/cpu
       // filter by their own rules, and the check exists to see that each of
       // them lands this machine's package and can start it.
+      // Through run(), not a bare execFileSync: npm is npm.cmd on Windows,
+      // and a bare call finds neither it nor (for bun) the shim a manager may
+      // install — the probe then reported a machine with npm as one without
+      // it, and dropped npm from the two managers this check exists to try.
       const managers = ["bun", "npm"].filter((cmd) => {
         try {
-          execFileSync(cmd, ["--version"], { stdio: "ignore" })
+          run(cmd, ["--version"], { stdio: "ignore", encoding: "utf8" })
           return true
         } catch {
           return false

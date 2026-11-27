@@ -226,6 +226,7 @@ export const main = async ({ argv = process.argv, env = process.env, out = OUT_P
     if (e?.code === "ENOENT") return fail(`cannot read ${shown} (${e?.code}): sign in once on this machine first`)
     if (e?.code === "EFBIG") return fail(`${shown} is larger than ${rules.MAX_CONFIG_BYTES / 1024 / 1024} MiB: this is not Codar's config; sign in once on this machine first`)
     if (e?.code === "EFTYPE") return fail(`${shown} is not a regular file: this is not Codar's config; sign in once on this machine first`)
+    if (e?.code === "EAGAIN") return fail(`${shown} changed while it was being read: run this again`)
     return fail(`cannot read ${shown} (${e?.code ?? e.message}): check the file permissions; this is not an out-of-date catalog`)
   }
   let token = ""

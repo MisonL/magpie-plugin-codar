@@ -141,6 +141,11 @@ const verifyPendingOf = (e, username) => {
   return {
     tempToken,
     username: typeof body.username === "string" && body.username.trim() ? body.username.trim() : username,
+    // the name the PERSON typed, kept apart from the vendor's echo: the page
+    // shows this one, so a gateway that echoes something else into the
+    // refusal's `username` (a password, a sentence) can never be printed —
+    // and the verification call still sends the name the vendor asked for
+    shown: typeof username === "string" ? username : "",
     phone: typeof body.phone === "string" ? body.phone.trim() : "",
     at: Date.now(),
   }
@@ -368,9 +373,17 @@ export async function CodarPlugin(input) {
             // is abandoned with it.
             const smsSide = (send, verify) => ({
               sendCode: (phone, captcha, signal) => send(phone, captcha, signal),
-              verifyCode: (phone, code, pageSignal) => verify(phone, code, pageSignal).catch((e) => {
-                throw new Error(scrub(scrub(whyOf(e), code), pending?.tempToken ?? "") || (pending ? "安全验证失败" : "登录失败"))
-              }),
+              verifyCode: (phone, code, pageSignal) => {
+                // The handover is good for ten minutes; the page is a browser
+                // tab and can outlive that. A temp token past its window is not
+                // sent again — the person is asked to start over instead of
+                // being shown the vendor's refusal for a token only this module
+                // knows the age of.
+                if (pending && Date.now() - pending.at > PENDING_VERIFY_MS) return Promise.reject(new Error("安全验证已超过十分钟，请回到 magpie 重新登录"))
+                return verify(phone, code, pageSignal).catch((e) => {
+                  throw new Error(scrub(scrub(whyOf(e), code), pending?.tempToken ?? "") || (pending ? "安全验证失败" : "登录失败"))
+                })
+              },
             })
             const signIn = smsSide(
               (phone, captcha, signal) =>
@@ -396,8 +409,28 @@ export async function CodarPlugin(input) {
                   ),
                   // the account being verified is named: the person may have
                   // several, and this page completes whichever one the password
-                  // step left behind
-                  hint: `账号 ${pending.username} 当前网络需要短信安全验证：请在下方完成人机验证并填写收到的验证码。`,
+                  // step left behind. The name came from the vendor's refusal,
+                  // so it goes through the same scrub the card's sentences do
+                  // (a gateway that echoes the password into `username` would
+                  // otherwise show it on this page) and is cut to a name's
+                  // length before it is put in the sentence.
+                  hint: (() => {
+                    // The name came from the vendor's refusal, so it is scrubbed
+                    // of the handover's token and cut to a name's length; and it
+                    // is shown only when it still has a name's shape. A refusal
+                    // that echoed something else into `username` — a password,
+                    // a sentence — is not put in front of the person at all;
+                    // the sentence then names no account rather than the wrong
+                    // thing.
+                    const said = scrubShapes(typeof pending.shown === "string" ? pending.shown : "", pending.tempToken)
+                    // shape first, cut after: a 300-character value is not a
+                    // name the vendor keeps, and cutting it to 64 would have
+                    // shown its first 64 characters as if they were one
+                    const named = said.length <= 64 && /^[\p{L}\p{N}_.@-]+$/u.test(said)
+                    return named
+                      ? `账号 ${said} 当前网络需要短信安全验证：请在下方完成人机验证并填写收到的验证码。`
+                      : "当前账号的网络需要短信安全验证：请在下方完成人机验证并填写收到的验证码。"
+                  })(),
                   // the vendor's own number, when it showed a full one, so the
                   // person can tell which phone the code goes to; the page
                   // still asks for the number itself when it is masked
@@ -903,6 +936,33 @@ export async function CodarPlugin(input) {
           before = null
         }
 
+        // An expiry anywhere in the chain outranks everything below: a 401
+        // beside a cached "already signed today" (wording or word code) is a
+        // dead sign-in, and the card that says 「今天已领过」 hides the
+        // re-login that fixes it. It is read before the deep wording and the
+        // day's own word, not merely before this attempt's claim: the 400
+        // wording path settles the day without a word code at all, so an
+        // ordering that only guarded `already_claimed` still answered a 401
+        // envelope with a cached sentence. The read is shared with the error
+        // branch below, where a gateway's 400 can carry the same 401 in
+        // `error.code` (2026-11-26 review). A body with no 401/403 or expiry
+        // word is untouched, plain `{code:200, data:{code:"already_claimed"}}`
+        // included.
+        const expiryInChain = (root) => {
+          const expiryWord = /^(?:invalid_token|token_expired|token_invalid|unauthorized)$/i
+          for (let node = root, i = 0; i < 9 && node && typeof node === "object" && !Array.isArray(node); i++, node = node.data) {
+            // every field the refusal walk reads, per node — a body whose
+            // `code` is a word ("already_claimed") can still carry the death
+            // in `error.code` or `detail.code`
+            for (const c of [node?.code, node?.error?.code, node?.detail?.code]) {
+              const num = codeOf(c)
+              if (num === 401 || num === 403) return true
+              const word = typeof c === "string" ? c.trim() : ""
+              if (word && !Number.isFinite(Number(word)) && expiryWord.test(word)) return true
+            }
+          }
+          return false
+        }
         let r
         try {
           r = await request(`${ACCOUNT}${SIGN_PATH}`, {
@@ -953,6 +1013,7 @@ export async function CodarPlugin(input) {
             // read as an ordinary failure it hid the fix (an API key or
             // support, not a re-login).
             if (gateWithin(body)) return { outcome: "failed", message: CLIENT_GATED }
+            if (expiryInChain(body)) return { outcome: "failed", message: "登录已过期，请重新登录" }
             const bc = codeOf(body.code)
             // The same success-first rule as the 2xx path below: an error body
             // whose success word comes first is this attempt's claim with the
@@ -1063,7 +1124,23 @@ export async function CodarPlugin(input) {
         // client at all. The restriction's own word outranks it, as in the
         // balance reads.
         if (restrictedWithin(r)) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
+        // the same word in the vendor's sentence, which is where a rewritten
+        // body keeps it: `{code:401, message:"account_restricted"}` is a
+        // refused account, and reading the 401 first sent the user to a
+        // re-login that cannot fix it (2026-11-26 review)
+        if (restricted({ message: saidBy(r) })) return { outcome: "failed", message: "账号 API 访问受限（account_restricted），请联系科搭支持" }
         if (gateWithin(r)) return { outcome: "failed", message: CLIENT_GATED }
+        // An expiry anywhere in the chain outranks everything below: a 401
+        // beside a cached "already signed today" (wording or word code) is a
+        // dead sign-in, and the card that says 「今天已领过」 hides the
+        // re-login that fixes it. It is read before the deep wording and the
+        // day's own word, not merely before this attempt's claim: the 400
+        // wording path settles the day without a word code at all, so an
+        // ordering that only guarded `already_claimed` still answered a 401
+        // envelope with a cached sentence (2026-11-26 review). A body with no
+        // 401/403 or expiry word is untouched, plain
+        // `{code:200, data:{code:"already_claimed"}}` included.
+        if (expiryInChain(r)) return { outcome: "failed", message: "登录已过期，请重新登录" }
         // The vendor wraps a refusal in `data` on every other reader (points,
         // the status row, activities, the catalog): {code:200, data:{code:500}}
         // or {code:200, data:{success:false}} is HTTP yes, business no. The
@@ -1528,7 +1605,9 @@ export async function CodarPlugin(input) {
             // left() budget function two scopes up, and the next caller of
             // opts() in here would get a TypeError instead of a timeout
             const leftSaid = numOf(a.remaining_quota)
-            const quotaLeft = Number.isFinite(leftSaid) ? leftSaid : null
+            // a negative remaining is the vendor's "no number" sentinel, not a
+            // debt: drawn literally it read 「还剩 -1」 and 「已用 501 / 500」
+            const quotaLeft = Number.isFinite(leftSaid) && leftSaid >= 0 ? leftSaid : null
 
             // used is computed only when both numbers are there and agree:
             // when the remaining exceeds the total, the two numbers describe

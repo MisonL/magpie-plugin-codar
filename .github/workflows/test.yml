@@ -86,6 +86,12 @@ jobs:
         with:
           node-version: "24"
       - run: node --test
+      # The suite skips every test that starts a proxy on Windows (there is no
+      # native/bin here), so the win32 half of the start path — the tcp ready,
+      # its `127.0.0.1:<port>` check, the pid comparison against the child —
+      # would never run anywhere. This drives it with a fixture proxy that
+      # binds the way the Windows Go build does.
+      - run: node scripts/check-proxy-start.mjs
       # npm and tar are .cmd shims here, and the tarball carries CRLF paths:
       # this job runs the gate's Windows branches. It has no builds to stage,
       # so the install check is a skip here (the gate says so); the packed

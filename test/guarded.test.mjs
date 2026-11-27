@@ -280,6 +280,23 @@ test("a 307 keeps the method and the body", async () => {
   ])
 })
 
+test("a 3xx Go does not follow is the answer here too", async () => {
+  // net/http's redirectBehavior follows 301, 302, 303, 307 and 308 only; a
+  // 300 or a 304 is handed back as the answer. Reading every 3xx as a hop
+  // followed two the proxy never would — the same drift MAX_HOPS closes.
+  const seen = []
+  const transport = async (url) => {
+    seen.push(String(url))
+    return new Response(null, { status: seen.length === 1 ? 300 : 304, headers: { location: "/next" } })
+  }
+  const three = await guardedFetch(`${vendor}/start`, {}, { transport })
+  assert.equal(three.status, 300, "a 300 is returned, not followed")
+  assert.deepEqual(seen, [`${vendor}/start`])
+  const notModified = await guardedFetch(`${vendor}/start`, {}, { transport })
+  assert.equal(notModified.status, 304, "a 304 is returned, not followed")
+  assert.deepEqual(seen, [`${vendor}/start`, `${vendor}/start`], "no second request either")
+})
+
 test("a Location that names a user in its authority is not a hop", () => {
   // The origin ignores userinfo: "https://evil.example@vendor" is the vendor
   // to the URL parser, and following it would hand whatever the client puts

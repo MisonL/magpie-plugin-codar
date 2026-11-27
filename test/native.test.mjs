@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { binaryPath, chatFetch, closeProxy, hosts, officialURL, proxyFetch, sendVia } from "../lib/native.mjs"
 import { binaryFile } from "../native/binary-name.mjs"
-import { binaryName as builtName, buildTargets, inspectTarget, missingTargets, newestSourceMtime, toolchainFor } from "../scripts/build-native.mjs"
+import { binaryName as builtName, buildDir, buildTargets, inspectTarget, missingTargets, newestSourceMtime, toolchainFor } from "../scripts/build-native.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -165,7 +165,7 @@ const server = createServer((socket) => {
     socket.end("HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\n{}")
   })
 })
-server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address, pid: String(process.pid) })))
 `
 
 test("a byte body is snapshotted at the call, though the proxy starts first", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
@@ -976,6 +976,31 @@ test("a release refuses a package without every platform's build", { timeout: 60
   }
 })
 
+// the strict check, the staging step and the packed gate must read one
+// directory, or a release can validate bytes it never publishes
+test("every script that reads the builds resolves the same directory", () => {
+  const pkg = join(here, "..")
+  assert.equal(buildDir(pkg), join(pkg, "native", "bin"), "without the override the builds are native/bin")
+  const before = process.env.CODAR_NATIVE_OUT
+  const cwd = process.cwd()
+  try {
+    // run from somewhere that is not the package: a `resolve()` against the
+    // caller's cwd answered /tmp/out when this test ran from /tmp, so the
+    // assertion below only bit outside the package root
+    process.chdir(tmpdir())
+    process.env.CODAR_NATIVE_OUT = "out"
+    // a relative override belongs to the package, not to whatever directory
+    // the command was run from: tarball.mjs may be called from anywhere
+    assert.equal(buildDir(pkg), join(pkg, "out"), "a relative override is not resolved against the caller's cwd")
+    process.env.CODAR_NATIVE_OUT = join(tmpdir(), "codar-native-out")
+    assert.equal(buildDir(pkg), join(tmpdir(), "codar-native-out"), "an absolute override is taken as given")
+  } finally {
+    process.chdir(cwd)
+    if (before === undefined) delete process.env.CODAR_NATIVE_OUT
+    else process.env.CODAR_NATIVE_OUT = before
+  }
+})
+
 // the packed gate names the platform package a resolved build came from
 test("the gate names the platform package from either separator", async () => {
   // The probe reads the path the way the machine writes it. On Windows that is
@@ -1037,7 +1062,7 @@ const server = createServer((socket) => {
     socket.end("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body)
   })
 })
-server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address, pid: String(process.pid) })))
 `
 
 // Windows is left out: npm's `.cmd` shims launch through a shell whose setup
@@ -1235,12 +1260,15 @@ const server = createServer((socket) => {
     socket.end("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body)
   })
 })
-server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address, pid: String(process.pid) })))
 `
 
-// fakeProxyDeafTwice publishes a ready file naming a socket nobody listens on
-// for its first two starts, and answers like fakeProxy from the third: a proxy
-// that died and a replacement that did not come up, then one that would.
+// fakeProxyDeafTwice publishes a ready naming the socket this start asked for
+// without listening on it, for its first two starts, and answers like
+// fakeProxy from the third: a proxy that died and a replacement that did not
+// come up, then one that would. The address must be the requested one — a start
+// accepts only that path now — so what the fixture models is a socket nothing
+// is listening on, not a socket the plugin never asked for.
 const fakeProxyDeafTwice = `#!/usr/bin/env node
 import { createServer } from "node:net"
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs"
@@ -1255,7 +1283,7 @@ const transport = arg("-listen")
 const address = arg("-address")
 const ready = arg("-ready")
 if (n < 2) {
-  writeFileSync(ready, JSON.stringify({ transport, address: join(dirname(ready), "deaf-" + n + ".sock") }))
+  writeFileSync(ready, JSON.stringify({ transport, address, pid: String(process.pid) }))
   setTimeout(() => {}, 60000)
 } else {
   if (transport === "unix") rmSync(address, { force: true })
@@ -1269,7 +1297,7 @@ if (n < 2) {
       socket.end("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body)
     })
   })
-  server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address })))
+  server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport, address, pid: String(process.pid) })))
 }
 `
 
@@ -1345,6 +1373,89 @@ test("a dead proxy whose replacement also refuses is retried after a pause, not 
     const second = await proxyFetch("https://api.claw.speedai.com/v1/codar/models")
     assert.equal(second.status, 200, "the request after the pause did not reach a working proxy")
     assert.equal(starts().length, 3, "the transport stayed latched off instead of trying again")
+  })
+})
+
+test("staging refuses an empty build directory before it writes anything", { timeout: 60_000 }, async () => {
+  // The five platform packages cannot be overwritten once published, so a
+  // release that stages (or publishes) stale or missing builds is not
+  // recoverable at the same version. The gate runs before staging, and its
+  // sentence has to name the fix.
+  const empty = mkdtempSync(join(tmpdir(), "codar-nobuild-"))
+  try {
+    const run = (args) =>
+      spawnSync(process.execPath, [join(here, "..", "scripts", "native-packages.mjs"), ...args], {
+        cwd: join(here, ".."),
+        encoding: "utf8",
+        env: { ...process.env, CODAR_NATIVE_OUT: empty },
+      })
+    for (const args of [[], ["--check"]]) {
+      const out = run(args)
+      assert.equal(out.status, 1, `${args.join(" ") || "staging"} passed with no builds: ${out.stdout}${out.stderr}`)
+      assert.match(out.stderr, /no build/, `the refusal did not name the builds: ${out.stderr}`)
+      assert.match(out.stderr, /native:all/, "the refusal did not name the fix")
+    }
+    assert.deepEqual(readdirSync(empty), [], "staging wrote something before the gate refused")
+  } finally {
+    rmSync(empty, { recursive: true, force: true })
+  }
+})
+
+test("a ready that is a link, a directory or oversized is no ready at all", { skip: process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1" }, async () => {
+  // The ready decides where the account's Authorization is dialled, so its
+  // shape is checked on the descriptor and not by path: a link is another
+  // file (a same-user process could point it anywhere), a directory is not a
+  // document, and a ready is a few hundred bytes — a "ready" of megabytes is
+  // something else being read into the host process.
+  const { readyFrom } = await import("../lib/native.mjs")
+  const root = mkdtempSync(join(tmpdir(), "codar-ready-shape-"))
+  try {
+    const real = join(root, "real.json")
+    const dir = join(root, "codar-plugin-shape1")
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    writeFileSync(real, JSON.stringify({ transport: "unix", address: join(dir, "proxy.sock"), pid: "1" }))
+    symlinkSync(real, join(dir, "ready.json"))
+    assert.equal(readyFrom(dir), null, "a symlinked ready was read")
+
+    const dir2 = join(root, "codar-plugin-shape2")
+    mkdirSync(join(dir2, "ready.json"), { recursive: true, mode: 0o700 })
+    assert.equal(readyFrom(dir2), null, "a ready that is a directory was read")
+
+    const dir3 = join(root, "codar-plugin-shape3")
+    mkdirSync(dir3, { recursive: true, mode: 0o700 })
+    writeFileSync(join(dir3, "ready.json"), "x".repeat(4096 + 1))
+    assert.equal(readyFrom(dir3), null, "an oversized ready was read")
+
+    const dir4 = join(root, "codar-plugin-shape4")
+    mkdirSync(dir4, { recursive: true, mode: 0o700 })
+    writeFileSync(join(dir4, "ready.json"), JSON.stringify({ transport: "unix", address: join(dir4, "proxy.sock"), pid: "1" }))
+    const ok = readyFrom(dir4)
+    assert.equal(ok?.pid, "1", "a well-formed ready was refused")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a ready naming another pid is not this start's proxy", { skip: process.platform === "win32" || process.env.CODAR_PLUGIN_DISABLE_NATIVE === "1", timeout: 60_000 }, async () => {
+  // The pid is what ties the ready to THIS spawn. A process that watches the
+  // private directory appear can write a perfectly shaped ready before the
+  // proxy does; without the pid comparison the plugin would dial whatever
+  // socket it names and hand it the account's Authorization.
+  const wrongPid = `#!/usr/bin/env node
+import { createServer } from "node:net"
+import { rmSync, writeFileSync } from "node:fs"
+const argv = process.argv.slice(2)
+const arg = (n) => argv[argv.indexOf(n) + 1]
+const address = arg("-address")
+const ready = arg("-ready")
+rmSync(address, { force: true })
+const server = createServer((socket) => { socket.on("error", () => {}) })
+server.listen(address, () => writeFileSync(ready, JSON.stringify({ transport: "unix", address, pid: "1" })))
+`
+  await withProxyEnv(wrongPid, async () => {
+    const got = await proxyFetch("https://api.claw.speedai.com/v1/codar/models").catch((e) => e)
+    assert.equal(got?.name, "NativeUnavailable", `a ready from another pid started the transport: ${got}`)
+    assert.match(got.message, /did not start/, `the refusal said: ${got.message}`)
   })
 })
 
@@ -1818,6 +1929,37 @@ test("the start's own fresh directory is never the sweep's victim, whatever its 
     assert.deepEqual(await sweepStaleDirs({ root, minAgeMs: 30000 }), [dir], "unnamed, the same directory is a dead shell")
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("the ready a start reads must name this start's own socket", { ...NO_UNIX, timeout: 30_000 }, async () => {
+  // startProxy reads the ready the proxy wrote. A same-user process can plant
+  // one inside the private directory before the proxy gets there, and sendVia
+  // would then write the account's Authorization to whatever socket it named.
+  // The read now takes the descriptor's own bytes (no link, a regular file,
+  // bounded) and accepts only a listener this start could have made.
+  const { readyAddressOk } = await import("../lib/native.mjs")
+  const dir = mkdtempSync(join(tmpdir(), "codar-ready-"))
+  const wanted = join(dir, "proxy.sock")
+  try {
+    assert.equal(readyAddressOk({ address: wanted }, wanted), true, "the socket this start asked for was refused")
+    assert.equal(readyAddressOk({ address: join(dir, "another.sock") }, wanted), false, "a socket this start did not ask for was accepted")
+    assert.equal(readyAddressOk({ address: join(tmpdir(), "elsewhere.sock") }, wanted), false, "a socket outside the private directory was accepted")
+    assert.equal(readyAddressOk({ address: "" }, wanted), false, "an empty address was accepted")
+    assert.equal(readyAddressOk({}, wanted), false, "a ready with no address was accepted")
+    assert.equal(readyAddressOk({ address: 42 }, wanted), false, "a non-string address was accepted")
+    // a link is not read, whatever it names: the sweep's own opening rule
+    const real = join(dir, "real.json")
+    writeFileSync(real, JSON.stringify({ address: join(dir, "proxy.sock") }))
+    try {
+      symlinkSync(real, join(dir, "ready.json"))
+      const { proxyDead } = await import("../lib/native.mjs")
+      assert.equal(proxyDead(dir), false, "a ready.json that is a link was read")
+    } catch (e) {
+      if (e?.code !== "EPERM" && e?.code !== "EACCES") throw e
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 

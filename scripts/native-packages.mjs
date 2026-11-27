@@ -30,7 +30,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { binaryFile } from "../native/binary-name.mjs"
-import { buildTargets } from "./build-native.mjs"
+import { buildDir, buildTargets, checkTargets, newestSourceMtime } from "./build-native.mjs"
 
 // npm spells a platform with the Node platform name and an architecture of
 // x64/arm64 — never Go's amd64. npm refuses a cpu it does not recognize
@@ -161,7 +161,7 @@ export function stageFromTree({ out = staged } = {}) {
   const manifest = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8"))
   const problems = mainPackageProblems(manifest)
   if (problems.length) throw new Error(`package.json: ${problems.join("; ")}`)
-  return stagePackages({ bin: join(pkgRoot, "native", "bin"), out, version: manifest.version })
+  return stagePackages({ bin: buildDir(pkgRoot), out, version: manifest.version })
 }
 
 // The command:
@@ -189,12 +189,31 @@ function main(argv) {
   if (problems.length) {
     for (const p of problems) console.error(`package.json: ${p}`)
   }
+  // The builds are gated for --check too: it is the command CONTRIBUTING says
+  // to run before tagging, and a staged set of five packages built from stale
+  // sources read as "ready" (2026-11-26 review). Refusing here is the same
+  // answer `npm publish`'s own strict check gives one step later, just before
+  // anything irreversible.
+  const builds = checkTargets(buildDir(pkgRoot), newestSourceMtime())
+  const brokenBuilds = builds.filter((r) => r.state !== "present")
   if (args.has("--check")) {
+    for (const r of brokenBuilds) console.error(`native-packages: ${r.name} ${r.reason ?? "no build"}`)
+    if (brokenBuilds.length) console.error("native-packages: run `npm run native:all` first")
     const rows = checkPackages({ dir: staged, version: manifest.version })
     for (const r of rows) console.log(r.state === "present" ? `present ${r.name}@${manifest.version}` : `broken ${r.name}: ${r.reason}`)
-    return problems.length || rows.some((r) => r.state !== "present") ? 1 : 0
+    return problems.length || brokenBuilds.length || rows.some((r) => r.state !== "present") ? 1 : 0
   }
   if (problems.length) return 1
+  // The builds are gated before anything is staged: --publish is the one step
+  // whose result cannot be replaced or withdrawn (npm refuses to overwrite a
+  // version), and it used to check only that a file of the right name was big
+  // enough — a build for the wrong machine, or one older than the source it
+  // names, would have been staged and published five times over before
+  // `npm publish`'s own strict check refused the main package.
+  if (brokenBuilds.length) {
+    console.error(`native-packages: ${brokenBuilds.map((r) => `${r.name} ${r.reason ?? "no build"}`).join("; ")}; run \`npm run native:all\` first`)
+    return 1
+  }
   const wrote = stageFromTree()
   for (const p of wrote) console.log(`staged ${p.name}@${manifest.version} -> ${p.dir}`)
   if (!args.has("--publish")) return 0
@@ -215,7 +234,15 @@ function main(argv) {
   for (const p of wrote) {
     // --access public: a scoped name defaults to private, and these are
     // unscoped, but the flag is what npm documents for a first publish.
-    const out = spawnSync("npm", ["publish", "--access", "public"], { cwd: p.dir, stdio: "inherit" })
+    // npm is npm.cmd on Windows, and a bare spawn does not look for .cmd
+    // extensions at all: the publish loop would fail on its first package with
+    // no name in the message. The shell path passes the command as one string,
+    // for the same reason the tarball gate does.
+    const argv = ["publish", "--access", "public"]
+    const shell = process.platform === "win32"
+    const out = shell
+      ? spawnSync(["npm", ...argv].map((a) => (String(a).includes(" ") ? `"${a}"` : a)).join(" "), { cwd: p.dir, stdio: "inherit", shell: true })
+      : spawnSync("npm", argv, { cwd: p.dir, stdio: "inherit" })
     if (out.status !== 0) {
       console.error(`native-packages: publishing ${p.name} failed (exit ${out.status}); the packages before it are published, and this version cannot be completed — bump the version for the rest`)
       return 1
