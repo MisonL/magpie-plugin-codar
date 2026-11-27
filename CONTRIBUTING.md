@@ -168,6 +168,7 @@ node scripts/build-native.mjs --check --strict      # the five builds are real â
 node scripts/native-packages.mjs                    # stage the five from native/bin at this version
 node scripts/native-packages.mjs --check            # the five stage at this version, and the manifest reaches them
 node scripts/build-native.mjs --buildinfo           # each build's own record says it is this repo's proxy
+node scripts/check-packed-install.mjs               # the packed pair installs with npm and the proxy runs (Windows CI does this)
 node scripts/tarball.mjs --require-bun --require-builds  # every gate first: the packed suite, the install check, Bun
 node scripts/native-packages.mjs --publish          # the five platform packages, first
 npm publish                                         # prepublishOnly re-runs the same gates: --strict builds and the fingerprint, --buildinfo, the packed suite and install check (--require-bun --require-builds), the staged set (--check)

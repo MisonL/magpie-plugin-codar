@@ -66,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A proxy start generated its tcp token in argv only when `-token` was empty, and nothing ever passed one — a flag whose only effect was to put a credential where another process of the same user can read it on Linux (`/proc/pid/cmdline`). The flag is gone; the token is always generated.
 - The usage and check-in hooks now take the host's `signal` and pass it into every read: a card magpie has given up on stops instead of reading for its own eight seconds.
 
+- The install path was checked nowhere on Windows: the suite's packed-install test is skipped there (npm is a `.cmd` shim, and that check's own local registry cannot be reached through it). `scripts/check-packed-install.mjs` installs the two packed tarballs with npm into a scratch project, opens the installed plugin's own `binaryPath()`, and runs the proxy's `-version`; the Windows CI job runs it against the native job's artifact, kept out of `native/bin` so the gate's registry-based check still skips as before.
+
 ## [0.3.4] - 2026-11-21
 
 ### Fixed

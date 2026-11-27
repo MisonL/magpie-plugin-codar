@@ -95,6 +95,20 @@ jobs:
       # would never run anywhere. This drives it with a fixture proxy that
       # binds the way the Windows Go build does.
       - run: node scripts/check-proxy-start.mjs
+      # The suite's packed-install test is skipped on Windows (npm is a .cmd
+      # shim and that check's own local registry cannot be reached through it),
+      # so npm's tarball install of the two packages — optionalDependencies,
+      # the tarball's file list, binaryPath inside node_modules — was checked
+      # nowhere on this platform. The builds come from the native job's own
+      # artifact, kept out of native/bin so the gate below still skips its
+      # registry-based install check.
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: native-bin
+          path: native/bin-win
+      - run: node scripts/check-packed-install.mjs
+        env:
+          CODAR_NATIVE_OUT: native/bin-win
       # npm and tar are .cmd shims here, and the tarball carries CRLF paths:
       # this job runs the gate's Windows branches. It has no builds to stage,
       # so the install check is a skip here (the gate says so); the packed
