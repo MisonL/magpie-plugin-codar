@@ -919,7 +919,7 @@ export async function CodarPlugin(input) {
           const hold = safeTime(Date.now() + (secs || 30 * 60) * 1000)
           return withFreeModels({
             outcome: "done",
-            message: `今天已领过${wait ? `，${wait}后可再领` : ""}`,
+            message: `今天已领${wait ? `，${wait}后可再领` : ""}`,
             // hold is always non-zero; the condition is kept to be explicit:
             // "no until" is unacceptable on this path, and if it ever
             // happens it is omitted rather than reported as 0 and drawn as 1970.
@@ -971,7 +971,7 @@ export async function CodarPlugin(input) {
 
         // An expiry anywhere in the chain outranks everything below: a 401
         // beside a cached "already signed today" (wording or word code) is a
-        // dead sign-in, and the card that says 「今天已领过」 hides the
+        // dead sign-in, and the card that says 「今天已领」 hides the
         // re-login that fixes it. It is read before the deep wording and the
         // day's own word, not merely before this attempt's claim: the 400
         // wording path settles the day without a word code at all, so an
@@ -1177,7 +1177,7 @@ export async function CodarPlugin(input) {
         if (gateWithin(r)) return { outcome: "failed", message: CLIENT_GATED }
         // An expiry anywhere in the chain outranks everything below: a 401
         // beside a cached "already signed today" (wording or word code) is a
-        // dead sign-in, and the card that says 「今天已领过」 hides the
+        // dead sign-in, and the card that says 「今天已领」 hides the
         // re-login that fixes it. It is read before the deep wording and the
         // day's own word, not merely before this attempt's claim: the 400
         // wording path settles the day without a word code at all, so an
@@ -1398,11 +1398,17 @@ export async function CodarPlugin(input) {
         // window beside the success: the README promises "the answer reports
         // the claim ... and carries until", and without it magpie fell back to
         // its own 30-minute cadence until the next answer said otherwise.
+        // An omitted credit is not left silent beside the host's own "+0": the
+        // message says the number could not be read, so the claim still reads
+        // as a claim (magpie 0.1.4824 prints "%s check-in: %s +%g").
+        const readIt = credit != null
+        const ownWords = signMessage(r, token)
+        const claimWord = ownWords || "签到成功"
         return withFreeModels({
           outcome: "claimed",
-          ...(credit != null ? { credit } : {}),
+          ...(readIt ? { credit } : {}),
           ...(earlySecs ? { until: safeTime(Date.now() + earlySecs * 1000) } : {}),
-          message: signMessage(r, token) || "签到成功",
+          message: readIt ? claimWord : `${claimWord}（点数变动未读到）`,
         })
       },
 

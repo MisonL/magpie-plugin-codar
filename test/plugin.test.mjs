@@ -312,7 +312,7 @@ test("a deep no-code already-claimed sentence is not overridden by an outer succ
     async () => p.auth.checkin(auth),
   )
   assert.equal(u.outcome, "done", `the day's own statement wins: ${JSON.stringify(u)}`)
-  assert.match(u.message, /已领过/)
+  assert.match(u.message, /今天已领/)
   assert.ok(u.until > until - 60_000, "the deep wait is what the card shows")
 })
 
@@ -1003,7 +1003,7 @@ test("a daily-sign answer wrapped twice reads the day's own statement, as the fl
     async () => p.auth.checkin(auth),
   )
   assert.equal(u.outcome, "done", `the wrapped day's statement is the same statement: ${JSON.stringify(u)}`)
-  assert.match(u.message, /已领过/)
+  assert.match(u.message, /今天已领/)
   assert.ok(u.until > until - 60_000, "with the wait the vendor stated")
 })
 
@@ -2610,7 +2610,7 @@ test("a wait the daily window cannot produce gets the trust floor, not a time ha
     async () => p.auth.checkin(auth),
   )
   assert.equal(inf.outcome, "done")
-  assert.match(inf.message, /今天已领过/, "no \"Infinity 天\" on the card")
+  assert.match(inf.message, /今天已领/, "no \"Infinity 天\" on the card")
   assert.doesNotMatch(inf.message, /Infinity/)
   assert.ok(Number.isFinite(inf.until), "and a usable until")
 })
@@ -4077,6 +4077,24 @@ test("a claim whose point reads fail still claims, with no made-up credit", asyn
   assert.equal(n, 2, "both point reads were tried")
   assert.equal(r.outcome, "claimed")
   assert.equal(r.credit, undefined, "an unreadable read states no credit, not 0")
+  // magpie prints "%s check-in: %s +%g" from whatever it was handed, and a
+  // missing credit arrives as 0: the message has to say the number is unknown,
+  // or the claim reads as "+0" gained.
+  assert.match(r.message, /点数变动未读到/)
+  // with both reads readable there is no caveat
+  let m = 0
+  const readable = await withFetch(
+    {
+      "/v1/gettoken": () => {
+        m += 1
+        return new Response(JSON.stringify(m === 1 ? { code: 200, token: 500, agent_token: 3978 } : { code: 200, token: 500, agent_token: 4000 }), { status: 200 })
+      },
+      "/v1/daily-sign": { body: { code: 200, message: "Success" } },
+    },
+    async () => p.auth.checkin(auth),
+  )
+  assert.equal(readable.credit, 22, "a readable delta was not reported")
+  assert.equal(/点数变动未读到/.test(readable.message), false, "a readable claim carried the caveat")
 })
 
 test("a reward that lands on the agent points is reported, and a fall is not a reward", async () => {
@@ -4458,7 +4476,7 @@ test("a check-in wait no number can say is left out, not said as Infinity", asyn
   )
   assert.equal(r.outcome, "done")
   assert.doesNotMatch(r.message, /Infinity|NaN/)
-  assert.equal(r.message, "今天已领过", "the wait is left out, the claim is still said")
+  assert.equal(r.message, "今天已领", "the wait is left out, the claim is still said")
 })
 
 test("an activity whose numbers are not finite says no share, not Infinity", async () => {
@@ -4755,7 +4773,7 @@ test("a wait the vendor spelled as a boolean or an array is not a wait", async (
     async () => p.auth.checkin(auth),
   )
   assert.equal(r.outcome, "done")
-  assert.equal(r.message, "今天已领过", "no hour the vendor never stated")
+  assert.equal(r.message, "今天已领", "no hour the vendor never stated")
   assert.ok(r.until <= Date.now() + 31 * 60 * 1000, "the trust floor, not a time it never said")
 })
 
@@ -4932,7 +4950,7 @@ test("an expiry in the wrapper chain outranks the day's own already_claimed word
   // A gateway that answers `{code:401, data:{code:"already_claimed"}}` — the
   // wrapper shapes this file's other readers already walk — says the sign-in
   // is dead beside a day it read off a cached body. Read as the day's own
-  // word, the card settles "今天已领过" over an account that cannot claim or
+  // word, the card settles "今天已领" over an account that cannot claim or
   // chat, and the re-login that fixes it is never asked for.
   const p = await CodarPlugin()
   const read = (body) =>
@@ -4958,7 +4976,7 @@ test("an expiry in the wrapper chain outranks the day's own already_claimed word
   // the wording path settles a day without any word code at all, so a 401
   // beside a cached "already signed today" sentence has to be read before it
   // too: an ordering that only guarded the already_claimed word answered this
-  // envelope with 「今天已领过」 (2026-11-26 review).
+  // envelope with 「今天已领」 (2026-11-26 review).
   // the vendor's sentence can name the restriction while the status says 401:
   // re-login cannot fix a restricted account, so the sentence wins
   const sentence = await read({ code: 401, message: "account_restricted" })
@@ -5876,7 +5894,7 @@ test("a wording the plugin has never seen is still the day already claimed", asy
   // been settled, with a credit of 0.
   const twice = await read({ code: 200, data: { message: "24小时内仅可领取一次", retry_after: 3600 } })
   assert.equal(twice.outcome, "done", "a success code beside the already-claimed words is that day, not a second claim")
-  assert.equal(twice.message, "今天已领过，1 小时后可再领")
+  assert.equal(twice.message, "今天已领，1 小时后可再领")
 })
 
 test("an activity's numbers are read the way every other vendor number is", async () => {
@@ -7295,7 +7313,7 @@ test("a 200 that names no claim is not settled by a wait alone", async () => {
   assert.equal(bare.outcome, "failed", "no code and no words is not a claim, whatever the wait")
   const paired = await read({ code: 400, data: { retry_after: 3600 } })
   assert.equal(paired.outcome, "done", "a 400 beside the wait still is the day's")
-  assert.match(paired.message, /今天已领过/)
+  assert.match(paired.message, /今天已领/)
 })
 
 test("account_restricted is read from the body before the status says anything", async () => {
@@ -7957,7 +7975,7 @@ test("an already_claimed word in the wrapper is the day's statement, not a claim
   })
   const wrapped = await withFetch(answers({ code: 200, data: { code: "already_claimed", retry_after: 3600 } }), async () => p.auth.checkin(auth))
   assert.equal(wrapped.outcome, "done", `the word is the day's statement: ${JSON.stringify(wrapped)}`)
-  assert.match(wrapped.message, /已领过/)
+  assert.match(wrapped.message, /今天已领/)
   assert.ok(wrapped.until > Date.now(), "with the wait the answer stated")
   const deep = await withFetch(answers({ code: 200, data: { data: { code: "already_claimed", retry_after: 3600 } } }), async () => p.auth.checkin(auth))
   assert.equal(deep.outcome, "done", "and at any depth")

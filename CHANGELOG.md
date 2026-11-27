@@ -84,6 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The models hook read the vendor's catalog on every call, and the host calls it whenever it draws the provider list: every settings open and every model picker waited on a round trip, up to the 8-second bound when the vendor was slow. The list is now held per account for five minutes (a model is added to that catalog every few weeks), a failed read never fills the hold, and `testables.resetCatalogCache()` clears it — hanging off `testables` rather than being exported, because the host runs every exported function as a hook.
 
+- Three polish items from the review round: the check-in result and the card's own row both say 「今天已领」 (they said 「今天已领过」 and 「今天已领」 in the same window); a claim whose point reads both failed says so in its message («点数变动未读到») instead of letting magpie draw the missing number as "+0"; and `magpie#7953` asks the host to pass `{ signal }` to `auth.checkin` as it already does to `auth.usage`, which is the one cancellation the plugin cannot see for itself.
+
 ## [0.3.4] - 2026-11-21
 
 ### Fixed
