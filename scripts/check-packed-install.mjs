@@ -34,7 +34,17 @@ const { packageName } = await import("../native/binary-name.mjs")
 const { packedPackage } = await import("./tarball.mjs")
 const platform = packageName(process.platform, process.arch)
 const platformDir = join(pkgRoot, "native", "packages", platform)
-if (!existsSync(platformDir)) fail(2, `no package directory for ${platform}`)
+// native/packages is generated, not checked in: a fresh clone (and CI) has
+// none. Staging writes them from the same builds this check packs.
+if (!existsSync(join(platformDir, "package.json"))) {
+  const { stageFromTree } = await import("./native-packages.mjs")
+  try {
+    stageFromTree()
+  } catch (e) {
+    fail(2, `the platform packages could not be staged from ${bin}: ${e.message}`)
+  }
+  if (!existsSync(join(platformDir, "package.json"))) fail(2, `no package directory for ${platform} after staging`)
+}
 
 const work = mkdtempSync(join(tmpdir(), "codar-packed-install-"))
 try {
