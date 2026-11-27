@@ -81,6 +81,9 @@ jobs:
   # the plugin reads a file under the user's home directory on every platform
   # (the read-from-this-machine sign-in), and ~ is where the bugs live
   windows:
+    # the installed-proxy check below needs the win32 build the native job
+    # makes; nothing else in this job depends on it
+    needs: native
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
