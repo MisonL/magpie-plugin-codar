@@ -153,6 +153,10 @@ jobs:
       # platform sidecar's
       - run: node scripts/build-native.mjs --all
       - run: node scripts/build-native.mjs --check --strict
+      # each file's own build record, read where the build is made rather than
+      # two jobs later; the tarball job reads it again for the artifact it
+      # downloads
+      - run: node scripts/build-native.mjs --buildinfo
       # the tarball job packs these, so its gate checks a package that carries
       # the builds this job just verified
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
