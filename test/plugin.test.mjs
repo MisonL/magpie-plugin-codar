@@ -955,6 +955,97 @@ test("a password sign-in the IP check stopped is finished through verify_ip, not
   }
 })
 
+test("a cancelled callback closes the page even when the authorize signal is live", async () => {
+  // The host passes the callback its OWN signal (callback(undefined,
+  // { signal })) and passes a different one to authorize. The plugin waited on
+  // the authorize one, so a callback the host gave up on left the listener and
+  // the vendor's poll running for the page's whole TTL (2026-11-27 review).
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const authCtl = new AbortController()
+  const opened = await sms.authorize({}, { signal: authCtl.signal })
+  assert.equal(authCtl.signal.aborted, false)
+  const callCtl = new AbortController()
+  const pending = opened.callback(undefined, { signal: callCtl.signal })
+  callCtl.abort()
+  const answered = await pending
+  assert.equal(answered.type, "failed", `a cancelled callback answered ${JSON.stringify(answered)}`)
+  // the page is closed: its own URL no longer answers at all
+  await assert.rejects(() => fetch(opened.url), "the listener outlived the callback's cancellation")
+  authCtl.abort()
+})
+
+test("a QR answer that refused is not a scene the page can draw", async () => {
+  // The vendor can say yes with a 200 and refuse in the body (a root business
+  // code). The page drew from `scene`/`qr_url` that a refusal does not carry
+  // and then polled a scene that never existed (2026-11-27 review).
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const ctl = new AbortController()
+  const opened = await sms.authorize({}, { signal: ctl.signal })
+  const real = globalThis.fetch
+  testables.nativeFetch = null
+  globalThis.fetch = async (url, init) => {
+    const u = String(url instanceof Request ? url.url : url)
+    if (u.startsWith("http://127.0.0.1")) return real(url, init)
+    if (new URL(u).pathname === "/v1/wechat/login/qrcode") {
+      return new Response(JSON.stringify({ code: 503, message: "服务暂时不可用" }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 })
+  }
+  try {
+    const got = await fetch(`${opened.url}qr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+    assert.notEqual(got.status, 200, "a refused QR answer was handed to the page as a scene")
+    const said = await got.json()
+    assert.match(String(said.error ?? ""), /服务暂时不可用/, "the vendor's own sentence is what the page shows")
+  } finally {
+    globalThis.fetch = real
+    ctl.abort()
+  }
+})
+
+test("a code the vendor refused in the body is not a code it sent", async () => {
+  // The vendor answers a refusal with 200 too: `{"success":false}` or a
+  // business code, beside the same message. Read as "sent", the page started
+  // its countdown over a code that never went out, and the person had no way
+  // to try again inside the same minute (2026-11-27 review).
+  const captcha = { lot_number: "l", captcha_output: "o", pass_token: "p", gen_time: "1" }
+  for (const body of [
+    { code: 200, success: false, message: "发送过于频繁，请稍后再试" },
+    { code: 200, data: { code: 400, message: "手机号格式不正确" } },
+  ]) {
+    const p = await CodarPlugin()
+    const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+    const ctl = new AbortController()
+    const opened = await sms.authorize({}, { signal: ctl.signal })
+    // the page's own URL is loopback: only the vendor calls are stubbed, and
+    // they are stubbed after the page is open so the page's requests still go
+    // to its own listener
+    const real = globalThis.fetch
+    testables.nativeFetch = null
+    globalThis.fetch = async (url, init) => {
+      const u = String(url instanceof Request ? url.url : url)
+      if (u.startsWith("http://127.0.0.1")) return real(url, init)
+      if (new URL(u).pathname === "/v1/verification-code") return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
+      return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 })
+    }
+    try {
+      const sent = await fetch(`${opened.url}send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: "13800138000", captcha }),
+      })
+      assert.equal(sent.status, 429, `a refused send answered ${sent.status}: ${JSON.stringify(body)}`)
+      const shown = await sent.json()
+      assert.match(String(shown.error ?? ""), /请稍后再试|格式不正确/, "the vendor's own sentence reaches the page")
+      assert.equal(String(shown.error ?? "").includes("13800138000"), false, "the number the person typed is not echoed back")
+    } finally {
+      globalThis.fetch = real
+      ctl.abort()
+    }
+  }
+})
+
 test("an IP-check handover is used once, expires, and is cleared by another sign-in", async () => {
   // The temp token a refused password sign-in leaves for the SMS page is a
   // credential, and it is taken (not peeked): one handover completes at most
@@ -1287,6 +1378,45 @@ test("a refusal that lands after its rival's handover was taken does not resurre
     assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "an older refusal does not refill a taken slot")
   } finally {
     ctl.abort()
+  }
+})
+
+test("a handover made in one host account slot is not another slot's to take", async () => {
+  // Two magpie accounts share this one plugin instance, and the host saves
+  // whatever the sign-in returns under the account whose callback asked: with
+  // one module-level handover, A's OAuth page took B's IP-check handover and
+  // the host stored B's token under A (2026-11-27 review, on 0.1.4824 and
+  // 0.1.4940). The host names the slot in the second argument; a handover is
+  // only ever taken by a page in the slot that made it.
+  const temp = mkToken({ username: "user_slotB", exp: Math.floor(Date.now() / 1000) + 600 })
+  const p = await CodarPlugin()
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  await withFetch(
+    { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_slotB", phone: "13800138000", token: temp } } },
+    async () => {
+      const refused = await password.authorize({ username: "user_slotB", password: "pw" }, { account: "slot-B" })
+      assert.equal(refused.type, "failed")
+    },
+  )
+  // A's page, a different slot: it must open on the ordinary tabs
+  const ctlA = new AbortController()
+  const pageA = await sms.authorize({}, { signal: ctlA.signal, account: "slot-A" })
+  try {
+    const html = await (await fetch(pageA.url)).text()
+    assert.match(html, /扫码登录/, "the other slot's page did not open on the ordinary tabs")
+    assert.equal(/user_slotB/.test(html), false, "another slot's account was named on this page")
+  } finally {
+    ctlA.abort()
+  }
+  // B's own page still has the handover: a refusal from another slot does not
+  // spend it
+  const ctlB = new AbortController()
+  const pageB = await sms.authorize({}, { signal: ctlB.signal, account: "slot-B" })
+  try {
+    assert.match(await (await fetch(pageB.url)).text(), /user_slotB/, "the slot that made the handover could not take it")
+  } finally {
+    ctlB.abort()
   }
 })
 
@@ -1800,8 +1930,12 @@ test("the page's last screen is built from the card's own pieces, not a second d
   const page = await startSignIn({ verify: { sendCode: async () => {}, verifyCode: async () => null, phone: "13800138000" } })
   try {
     const html = await (await fetch(page.url)).text()
-    assert.match(html, /<div class="end" id="done" hidden>/, "the success screen is the card's last panel")
-    assert.match(html, /<div class="end" id="bad" hidden>/, "and so is the failure screen")
+    // tabindex "-1" is the end screen's own focus target: the element the
+    // person was typing in is hidden when the page ends, and a screen reader
+    // left on BODY announces nothing (2026-11-27 review).
+    assert.match(html, /<div class="end" id="done"[^>]*hidden>/, "the success screen is the card's last panel")
+    assert.match(html, /<div class="end" id="bad"[^>]*hidden>/, "and so is the failure screen")
+    assert.match(html, /<div class="end" id="done" tabindex="-1"/, "the end screen can take focus")
     assert.match(html, /<div class="mark ok">/, "the mark is the card's own brand box, in green")
     assert.match(html, /<div class="mark bad">/, "... and in red")
     assert.match(html, /<h2>登录成功<\/h2>/)
@@ -3048,6 +3182,43 @@ test("the models hook replaces the list with the vendor's, and falls back to it"
   )
   assert.deepEqual(Object.keys(fell), ["deepseek-v4.1-flash"], "the list it was given is kept")
   assert.equal(fell[Symbol.for("magpie.fellBack")], true, "and says the vendor was not reached")
+})
+
+test("a replacement token for the same account does not reuse the old catalog", async () => {
+  // The cache was keyed on the account name, so a token the vendor had already
+  // stopped accepting kept answering the model list for five minutes and the
+  // availability check that failing read performs never ran (2026-11-27
+  // review). The key is the credential's generation.
+  const p = await CodarPlugin()
+  const given = { id: "codar", models: {} }
+  const one = mkToken({ username: "user_c", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const two = mkToken({ username: "user_c", exp: Math.floor(Date.now() / 1000) + 7200 })
+  let reads = 0
+  let only = one
+  const real = globalThis.fetch
+  testables.nativeFetch = null
+  globalThis.fetch = async (url, init) => {
+    reads++
+    const sent = String(new Headers(init?.headers).get("authorization") ?? "")
+    if (!sent.includes(only)) return new Response(JSON.stringify({ detail: "invalid token" }), { status: 401 })
+    void url
+    return new Response(
+      JSON.stringify({ data: [{ id: "model-for-" + (only === one ? "one" : "two"), display_name: "M", context_window: 2000, input_modalities: ["text"], output_modalities: ["text"], protocol: { type: "openai_chat_completions" } }] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  try {
+    const authOne = async () => ({ type: "oauth", access: one, refresh: one, expires: expiresAt(one) })
+    const authTwo = async () => ({ type: "oauth", access: two, refresh: two, expires: expiresAt(two) })
+    const first = await p.provider.models(given, { auth: await authOne() })
+    assert.ok("model-for-one" in first, "the first token's catalog was not read")
+    only = two
+    const second = await p.provider.models(given, { auth: await authTwo() })
+    assert.ok("model-for-two" in second, "a replacement token reused the old catalog and skipped its own read")
+    assert.equal(reads, 2, "the replacement credential was read once")
+  } finally {
+    globalThis.fetch = real
+  }
 })
 
 test("the vendor's catalog is read once per account, not once per render", async () => {

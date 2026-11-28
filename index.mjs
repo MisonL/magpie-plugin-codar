@@ -112,13 +112,37 @@ let signFlows = 0
 // refusal returning late found the slot empty, passed the standing-handover
 // comparison, and refilled it with the account the person had left behind.
 let takenFlow = 0
+// The password attempt whose refusal made the handover now standing. A
+// handover is only ever taken by a page started AFTER that attempt: one
+// opened before it belongs to a person who was signing in as somebody else,
+// and taking it would verify the wrong account. With two magpie accounts on
+// one machine — A's OAuth page open while B's password attempt is refused —
+// the old code gave A B's handover, and the host saved B's token under A
+// (2026-11-27 review, both 0.1.4824 and 0.1.4940). An OAuth page is what
+// usually sends a person to the password form, so the strict "after" rule
+// still admits the ordinary path: page, refusal, try again.
+let handedByFlow = 0
 
-// takePendingVerify answers the handover once, if it is still good. An entry
-// past its window is dropped rather than used — the vendor would refuse its
-// token anyway, and the page would be verifying an account the person no
-// longer has in front of them.
-const takePendingVerify = () => {
+// slotOf is the host's account slot as a comparable string: the value it
+// gives authorize/callback, empty when a host gives none.
+const slotOf = (account) => (account == null ? "" : String(account))
+
+// takePendingVerify answers the handover once, if it is still good. A
+// handover made IN another host account slot is not this page's to take at
+// all: two magpie accounts (A and B) share this one plugin instance, and the
+// host saves whatever the page returns under the account whose callback
+// asked — so A's page taking B's handover saved B's token under A (verified on
+// 0.1.4824 and 0.1.4940, 2026-11-27). `who` is the host's account slot, an
+// opaque string; the two calls that make and take a handover come from the
+// same sign-in flow and therefore the same slot, and an empty or absent
+// value (a host that passes none, a test) compares equal to itself.
+const takePendingVerify = (myFlow = 0, who = "") => {
   const got = pendingVerify
+  if (got && String(got.who ?? "") !== String(who ?? "")) return null
+  // Asked for by the flow that wrote it (a retry from the same attempt) or by
+  // one started after it; anything older leaves it standing for the flow that
+  // owns it.
+  if (got && myFlow >= 1 && myFlow <= (got.flow ?? 0) && myFlow !== handedByFlow) return null
   pendingVerify = null
   if (got) takenFlow = Math.max(takenFlow, got.flow ?? 0)
   if (!got || !(Date.now() - got.at <= PENDING_VERIFY_MS)) return null
@@ -392,11 +416,12 @@ export async function CodarPlugin(input) {
           type: "oauth",
           label: "科搭OAuth登录",
           instructions: "在打开的页面里选择扫码登录或手机号登录，完成后回到 magpie",
-          async authorize(_inputs, { signal } = {}) {
+          async authorize(_inputs, { signal, account } = {}) {
             if (signal?.aborted) return { type: "failed", error: "登录已取消" }
             const startedAt = signIns
             const myFlow = ++signFlows
-            const pending = takePendingVerify()
+            const who = slotOf(account)
+            const pending = takePendingVerify(myFlow, who)
             // Both vendor calls of a side are wrapped here: a refusal that
             // quotes what was sent must not print it on the page. The SMS code
             // goes out as the password field, and the verification call's
@@ -404,8 +429,29 @@ export async function CodarPlugin(input) {
             // is used, so a vendor echo of either is cut, and no other number.
             // Both take the page's own signal: a call the closed page started
             // is abandoned with it.
+            // A 200 carrying a refusal is still a refusal: `success:false`,
+            // or a business code that is not a success, in the body or under
+            // data. Taken as "sent", the page started its countdown over a code
+            // that was never sent, and the person had no way to try again in
+            // the same minute (2026-11-27 review).
+            const sentOk = (body) => {
+              const said = unwrapped(body)
+              const node = said && typeof said === "object" ? said : body
+              if (saidNo(node?.success) || saidNo(body?.success)) return false
+              const code = codeOf(node?.code) ?? codeOf(body?.code)
+              return code == null || code === 0 || code === 200
+            }
             const smsSide = (send, verify) => ({
-              sendCode: (phone, captcha, signal) => send(phone, captcha, signal),
+              sendCode: (phone, captcha, signal) => send(phone, captcha, signal).then((body) => {
+                if (sentOk(body)) return body
+                const why = saidBy(unwrapped(body) ?? body) || "发送失败，请稍后重试"
+                const e = new Error(scrubLine(String(why), phone))
+                // the page's own 429 is what it shows for a refused send; a
+                // refusal here left the vendor's cooldown untouched, so the
+                // page keeps its button usable after the countdown below
+                e.reply = 429
+                throw e
+              }),
               verifyCode: (phone, code, pageSignal) => {
                 // The handover is good for ten minutes; the page is a browser
                 // tab and can outlive that. A temp token past its window is not
@@ -485,7 +531,21 @@ export async function CodarPlugin(input) {
                   // the vendor's own helper posts (web index-*.js: ft's default
                   // method is POST), and its route answers a GET with "Method
                   // Not Allowed"
-                  qrcode: async (signal) => wechatQrOf(await request(`${ACCOUNT}${WECHAT_QR_PATH}`, { method: "POST", signal })),
+                  // A 200 is not a scene: the vendor states a refusal in the
+                  // body too (a root code that is not a success), and the page
+                  // used to draw a QR from `scene`/`qr_url` that a refusal did
+                  // not carry, then poll a scene that never existed
+                  // (2026-11-27 review).
+                  qrcode: async (signal) => {
+                    const body = await request(`${ACCOUNT}${WECHAT_QR_PATH}`, { method: "POST", businessCodes: true, signal })
+                    const scene = wechatQrOf(body)
+                    if (!scene?.scene) {
+                      const why = saidBy(unwrapped(body) ?? body) || "二维码获取失败"
+                      const e = new Error(cut(scrubShapes(String(why), ""), 200))
+                      throw e
+                    }
+                    return scene
+                  },
                   // the vendor's status endpoint is a long poll: it holds the
                   // request until the code's state changes, and measured 15
                   // seconds before answering "pending". The plugin's usual
@@ -549,14 +609,25 @@ export async function CodarPlugin(input) {
             }
             const onAbort = () => page.close()
             signal?.addEventListener?.("abort", onAbort, { once: true })
+            // the callback's own signal (see callback below) closes the page
+            // the same way the authorize's does
+            const closeOnAbort = () => page.close()
             return {
               url: page.url,
               instructions: verify
                 ? "在打开的页面里完成人机验证并填写短信验证码，以通过安全验证"
                 : "在打开的页面里扫码或使用手机号登录，完成后回到 magpie",
-              async callback() {
+              async callback(_result, { signal: callSignal } = {}) {
+                // The host passes the callback its own signal, and a page left
+                // open when the host gives up is a listener and a vendor poll
+                // that keep running (2026-11-27 review). Either signal ends
+                // the page: the callback's own, and the authorize's, which a
+                // cancelled sign-in aborts.
+                const own = callSignal ?? signal
+                if (own?.aborted) page.close()
+                else own?.addEventListener?.("abort", closeOnAbort, { once: true })
                 try {
-                  const got = await page.wait(signal)
+                  const got = await page.wait(own)
                   // a state the vendor will not finish arrives as the page's
                   // own answer, not as a cancellation, and not after the
                   // listener's whole TTL
@@ -565,6 +636,7 @@ export async function CodarPlugin(input) {
                   return signInResult(got.token)
                 } finally {
                   signal?.removeEventListener?.("abort", onAbort)
+                  own?.removeEventListener?.("abort", closeOnAbort)
                   page.close()
                 }
               },
@@ -597,7 +669,7 @@ export async function CodarPlugin(input) {
             },
             { key: "password", type: "password", message: "科搭密码", validate: (v) => (String(v ?? "") ? null : "请填写科搭密码") },
           ],
-          async authorize(inputs = {}) {
+          async authorize(inputs = {}, { account } = {}) {
             const username = String(inputs.username ?? "").trim()
             const password = String(inputs.password ?? "")
             if (!username || !password) return { type: "failed", error: "请填写科搭账号和密码" }
@@ -626,7 +698,10 @@ export async function CodarPlugin(input) {
               // A handover a later-started attempt wrote is not this one's to
               // replace: that refusal belongs to the flow the person started
               // after this one, and it may well have returned first.
-              if (pending && myFlow > takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= myFlow)) pendingVerify = { ...pending, flow: myFlow }
+              if (pending && myFlow > takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= myFlow)) {
+                pendingVerify = { ...pending, flow: myFlow, who: slotOf(account) }
+                handedByFlow = myFlow
+              }
               return { type: "failed", error: scrubLine(scrubLine(signInFailure(e), username), password) }
             }
           },
@@ -1845,8 +1920,13 @@ export async function CodarPlugin(input) {
           // be told from another, and two accounts sharing "?" would share a
           // catalog the vendor may one day address per account (2026-11-27
           // review).
-          const who = usernameOf(token)
-          const held = who ? catalogCache.get(who) : null
+          // The key is the credential's generation, not the account name: a
+          // replacement token for the same account may no longer be accepted
+          // by the vendor, and a five-minute hold keyed on the name alone
+          // skipped that check entirely (2026-11-27 review). pasted tokens and
+          // short keys are already cut from what reaches this point.
+          const who = `${usernameOf(token) ?? ""}\u0000${token}`
+          const held = usernameOf(token) ? catalogCache.get(who) : null
           let list = held && Date.now() - held.at < CATALOG_TTL_MS ? held.list : null
           if (!list) {
             const body = await request(`${API}${CATALOG_PATH}`, { method: "GET", token, fetchImpl, ...(options?.signal ? { signal: options.signal } : {}) })
