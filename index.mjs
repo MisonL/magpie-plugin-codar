@@ -29,7 +29,7 @@
 
 import { CATALOG } from "./lib/catalog.mjs"
 import { guardedFetch } from "./lib/guarded.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, verifyIp, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, restrictedWord, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, testables, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, CLIENT_GATED, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, claimFreeModel, cleanText, chatFetchOf, clientGated, codeOf, wechatQrOf, wechatStatusOf, WECHAT_QR_PATH, WECHAT_STATUS_PATH, configPath, cut, cutKey, decodedCarriesKey, echoesIn, echoesKey, errorCodeOf, expired, expiresAt, gateWithin, restrictedWord, headerWaitOf, humanSecs, login, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, pointsOf, protocolOf, readAnswer, refusalWithin, refusedCode, refreshToken, request, restricted, restrictedWithin, runningActivities, safeTime, saidBy, saidNo, scrub, scrubLine, scrubShapes, splitAcross, splitFields, secsOf, shownPath, signMessage, signStateOf, signedOut, testables, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./lib/internal.mjs"
 
 // signInResult is a token handed to the host in the shape whose expiry it
 // renews: a result that carries `refresh` is kept as an oauth sign-in
@@ -37,24 +37,10 @@ import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_B
 // states no exp keeps 0, which the host reads as "no renewal due". Without
 // this the sign-in is kept as a bare api key and nothing renews it.
 //
-// A finished sign-in bumps signIns so an older attempt, still in flight, sees
-// it was superseded and drops its handover. A renewal must NOT bump it: the
-// host renews the stored sign-in on its own (leadOf), and a renewal that
-// lands while a password POST is in flight is not a newer sign-in — counting
-// it made that attempt throw away a handover it had a right to write, so the
-// next OAuth page opened on the tabs instead of the security check. renewResult
-// is the same shape without the bump.
+// The host keeps the sign-in this returns. renewResult is the same shape
+// without the completion bump: a renewal is not a sign-in anybody started.
 const signedInToken = (token) => ({ type: "success", refresh: token, access: token, expires: expiresAt(token) || 0 })
-const signInResult = (token) => {
-  signIns += 1
-  // A COMPLETED sign-in is the newest word on who the person is. An older
-  // attempt whose IP-check refusal landed while this one was in flight (the
-  // guard above could not see a completion that had not happened yet) may
-  // have just written its handover — it dies here, or the next page would
-  // open the other account's security check.
-  pendingVerify = null
-  return signedInToken(token)
-}
+const signInResult = (token) => signedInToken(token)
 const renewResult = signedInToken
 
 // signInFailure says why a password sign-in did not finish, in the user's
@@ -67,7 +53,14 @@ const signInFailure = (e) => {
   const body = e?.body
   const status = String(body?.status ?? unwrapped(body)?.status ?? "").toLowerCase()
   if (Number(body?.code) === 201 || status === "ip_verify_required") {
-    return "该账号当前需要短信安全验证，请重新发起「科搭OAuth登录」：页面会直接打开安全验证这一步"
+    // The vendor stops this account until a person passes its SMS check, and
+    // that check needs the temp token from THIS refusal — a credential this
+    // module used to keep for the next OAuth page. The host does not tell a
+    // plugin which account slot is asking, so that handover could be spent by
+    // another account's page and saved under the wrong one (magpie 0.1.4824
+    // and 0.1.4940; 2026-11-27 review). It is gone: the check is done in
+    // Codar's own app, and the person signs in again with the password.
+    return "该账号当前需要短信安全验证：请在科搭 App 中完成验证后，重新用「科搭账号密码登录」登录"
   }
   const said = saidBy(body).trim()
   if (said) return said
@@ -79,109 +72,6 @@ const signInFailure = (e) => {
 // words — the body's own wrapper chain, which may hold the gate one level
 // deeper than saidBy reads.
 const gatedError = (e) => clientGated(e?.code, e?.message) || gateWithin(e?.body)
-
-// verifyPending remembers a sign-in the vendor's IP check stopped, so the
-// sign-in page can finish that check instead of starting a fresh login: the temp
-// token the refusal handed over (the only credential /v1/user/verify_ip takes),
-// the account name, and the phone number the vendor showed with it. It lives
-// in this module and nowhere else — never saved, never printed.
-//
-// It is good for PENDING_VERIFY_MS and no longer: a temp token the vendor
-// handed out for one check must not be picked up later by a sign-in for
-// another account or another day. Every other sign-in path clears it, and it
-// is taken (not peeked) so one handover completes at most one sign-in.
-const PENDING_VERIFY_MS = 10 * 60 * 1000
-let pendingVerify = null
-// signIns counts completed sign-ins. A password attempt that was refused with
-// the IP check writes the handover only if no sign-in finished while it was in
-// flight: a newer sign-in (another account, a pasted token) supersedes the
-// older attempt, and the SMS page must not be pointed at the older account.
-let signIns = 0
-
-// signFlows numbers sign-in ATTEMPTS as they start (a password try, an
-// OAuth page). A handover carries the number of the attempt that made it,
-// and a refusal may replace a standing one only when its own attempt
-// started no earlier: two attempts refused by the IP check can come back
-// in the opposite order from the one they started in, and the later
-// refusal — the flow the person is actually in — has to own the handover.
-// signIns above counts COMPLETED sign-ins; neither alone covers both
-// orders, the completion clear and the write order.
-let signFlows = 0
-// takenFlow is the newest attempt whose handover the page TOOK. A slot
-// emptied by a take is not open again to every writer: an older attempt's
-// refusal returning late found the slot empty, passed the standing-handover
-// comparison, and refilled it with the account the person had left behind.
-let takenFlow = 0
-// The password attempt whose refusal made the handover now standing. A
-// handover is only ever taken by a page started AFTER that attempt: one
-// opened before it belongs to a person who was signing in as somebody else,
-// and taking it would verify the wrong account. With two magpie accounts on
-// one machine — A's OAuth page open while B's password attempt is refused —
-// the old code gave A B's handover, and the host saved B's token under A
-// (2026-11-27 review, both 0.1.4824 and 0.1.4940). An OAuth page is what
-// usually sends a person to the password form, so the strict "after" rule
-// still admits the ordinary path: page, refusal, try again.
-let handedByFlow = 0
-
-// slotOf is the host's account slot as a comparable string: the value it
-// gives authorize/callback, empty when a host gives none.
-//
-// Measured 2026-11-28: magpie 0.1.4824 and 0.1.4940 both call
-// `m.authorize(inputs, { signal })` — the slot is computed inside the host
-// (`signInKey(provider, account)`) and never handed to the plugin. With no
-// slot to compare, the flow-order rule below is the only guard, and it cannot
-// stop a page opened AFTER another account's refusal: that page is newer than
-// the refusal and would take it. Closing that needs the host to pass the slot
-// (magpie#7953 is the same shape of request for the check-in's signal).
-const slotOf = (account) => (account == null ? "" : String(account))
-
-// takePendingVerify answers the handover once, if it is still good. A
-// handover made IN another host account slot is not this page's to take at
-// all: two magpie accounts (A and B) share this one plugin instance, and the
-// host saves whatever the page returns under the account whose callback
-// asked — so A's page taking B's handover saved B's token under A (verified on
-// 0.1.4824 and 0.1.4940, 2026-11-27). `who` is the host's account slot, an
-// opaque string; the two calls that make and take a handover come from the
-// same sign-in flow and therefore the same slot, and an empty or absent
-// value (a host that passes none, a test) compares equal to itself.
-const takePendingVerify = (myFlow = 0, who = "") => {
-  const got = pendingVerify
-  if (got && String(got.who ?? "") !== String(who ?? "")) return null
-  // Asked for by the flow that wrote it (a retry from the same attempt) or by
-  // one started after it; anything older leaves it standing for the flow that
-  // owns it.
-  if (got && myFlow >= 1 && myFlow <= (got.flow ?? 0) && myFlow !== handedByFlow) return null
-  pendingVerify = null
-  if (got) takenFlow = Math.max(takenFlow, got.flow ?? 0)
-  if (!got || !(Date.now() - got.at <= PENDING_VERIFY_MS)) return null
-  return got
-}
-
-// verifyPendingOf reads a refused login's answer for that handover. The
-// vendor's refusal is {code:201, status:"ip_verify_required", token,
-// username, phone} (measured shape in the web app's own flow); a body that
-// says the same thing another way still has to name a temp token to be usable,
-// because it is the only credential the verification call has.
-const verifyPendingOf = (e, username) => {
-  const body = unwrapped(e?.body)
-  if (!body || typeof body !== "object") return null
-  const status = String(body.status ?? "").toLowerCase()
-  const wants = Number(body.code) === 201 || status === "ip_verify_required"
-  if (!wants) return null
-  const tempToken = typeof body.token === "string" ? body.token.trim() : typeof body.tempToken === "string" ? body.tempToken.trim() : ""
-  if (!tempToken) return null
-  return {
-    tempToken,
-    username: typeof body.username === "string" && body.username.trim() ? body.username.trim() : username,
-    // the name the PERSON typed, kept apart from the vendor's echo: the page
-    // shows this one, so a gateway that echoes something else into the
-    // refusal's `username` (a password, a sentence) can never be printed —
-    // and the verification call still sends the name the vendor asked for
-    shown: typeof username === "string" ? username : "",
-    phone: typeof body.phone === "string" ? body.phone.trim() : "",
-    at: Date.now(),
-  }
-}
 
 // chatTransport is the fetch the host is handed for chat. magpie runs a
 // loader's fetch in place of its own (host.js: `typeof o.fetch === "function"
@@ -382,10 +272,6 @@ export async function CodarPlugin(input) {
             },
           ],
           async authorize(inputs = {}) {
-            // A sign-in in its own right, as the page is: whatever an
-            // IP-checked password attempt left behind is not this attempt's,
-            // and a later page must not finish it for the other account.
-            pendingVerify = null
             const typed = typeof inputs.token === "string" ? inputs.token.trim() : ""
             if (!typed) {
               const got = appToken()
@@ -416,20 +302,16 @@ export async function CodarPlugin(input) {
           // call is made here, and the page never sees the token. The listener
           // answers for ten minutes at most.
           //
-          // When a password sign-in was stopped by the vendor's IP check
-          // (verifyPendingOf), the page opens as that check instead of the
-          // tabs: the code is asked for with the vendor's own type
-          // ("ip_verify", carrying the account name) and posted to
-          // /v1/user/verify_ip, as the vendor's web app does in that state.
+          // A password sign-in the vendor's IP check stopped is finished in
+          // Codar's own app, not here: the check needs a temp token from that
+          // refusal, and the host does not tell a plugin which account slot
+          // is asking, so a page could take it and be saved under another
+          // account (2026-11-27 review).
           type: "oauth",
           label: "科搭OAuth登录",
           instructions: "在打开的页面里选择扫码登录或手机号登录，完成后回到 magpie",
-          async authorize(_inputs, { signal, account } = {}) {
+          async authorize(_inputs, { signal } = {}) {
             if (signal?.aborted) return { type: "failed", error: "登录已取消" }
-            const startedAt = signIns
-            const myFlow = ++signFlows
-            const who = slotOf(account)
-            const pending = takePendingVerify(myFlow, who)
             // Both vendor calls of a side are wrapped here: a refusal that
             // quotes what was sent must not print it on the page. The SMS code
             // goes out as the password field, and the verification call's
@@ -460,23 +342,14 @@ export async function CodarPlugin(input) {
                 e.reply = 429
                 throw e
               }),
-              verifyCode: (phone, code, pageSignal) => {
-                // The handover is good for ten minutes; the page is a browser
-                // tab and can outlive that. A temp token past its window is not
-                // sent again — the person is asked to start over instead of
-                // being shown the vendor's refusal for a token only this module
-                // knows the age of.
-                if (pending && Date.now() - pending.at > PENDING_VERIFY_MS) return Promise.reject(new Error("安全验证已超过十分钟，请回到 magpie 重新登录"))
-                return verify(phone, code, pageSignal).catch((e) => {
-                  // Both secrets cut on the whole sentence, then cut once: a
-                  // scrub() per secret truncates at 400 code points each time,
-                  // and a sentence cut before the second secret was looked for
-                  // could lose the run that spelled it (2026-11-27 review).
-                  let said = scrubLine(whyOf(e), code)
-                  if (pending?.tempToken) said = scrubLine(said, pending.tempToken)
-                  throw new Error(cut(said, 400) || (pending ? "安全验证失败" : "登录失败"))
-                })
-              },
+              verifyCode: (phone, code, pageSignal) =>
+                verify(phone, code, pageSignal).catch((e) => {
+                  // The code is what the page knows and what a refusal may
+                  // quote back; the card's own cutting runs on the whole
+                  // sentence, once.
+                  const said = scrubLine(whyOf(e), code)
+                  throw new Error(cut(said, 400) || "登录失败")
+                }),
             })
             const signIn = smsSide(
               (phone, captcha, signal) =>
@@ -488,54 +361,10 @@ export async function CodarPlugin(input) {
                 }),
               (phone, code, signal) => login(phone, code, { signal }),
             )
-            const verify = pending
-              ? {
-                  ...smsSide(
-                    (phone, captcha, signal) =>
-                      request(`${ACCOUNT}/v1/verification-code`, {
-                        method: "POST",
-                        body: { phone, name: pending.username, type: "ip_verify", ...captcha },
-                        businessCodes: true,
-                        signal,
-                      }),
-                    (phone, code, signal) => verifyIp({ username: pending.username, phone, code, tempToken: pending.tempToken }, { signal }),
-                  ),
-                  // the account being verified is named: the person may have
-                  // several, and this page completes whichever one the password
-                  // step left behind. The name came from the vendor's refusal,
-                  // so it goes through the same scrub the card's sentences do
-                  // (a gateway that echoes the password into `username` would
-                  // otherwise show it on this page) and is cut to a name's
-                  // length before it is put in the sentence.
-                  hint: (() => {
-                    // The name came from the vendor's refusal, so it is scrubbed
-                    // of the handover's token and cut to a name's length; and it
-                    // is shown only when it still has a name's shape. A refusal
-                    // that echoed something else into `username` — a password,
-                    // a sentence — is not put in front of the person at all;
-                    // the sentence then names no account rather than the wrong
-                    // thing.
-                    const said = scrubShapes(typeof pending.shown === "string" ? pending.shown : "", pending.tempToken)
-                    // shape first, cut after: a 300-character value is not a
-                    // name the vendor keeps, and cutting it to 64 would have
-                    // shown its first 64 characters as if they were one
-                    const named = said.length <= 64 && /^[\p{L}\p{N}_.@-]+$/u.test(said)
-                    return named
-                      ? `账号 ${said} 当前网络需要短信安全验证：请在下方完成人机验证并填写收到的验证码。`
-                      : "当前账号的网络需要短信安全验证：请在下方完成人机验证并填写收到的验证码。"
-                  })(),
-                  // the vendor's own number, when it showed a full one, so the
-                  // person can tell which phone the code goes to; the page
-                  // still asks for the number itself when it is masked
-                  phone: /^1[3-9]\d{9}$/.test(pending.phone) ? pending.phone : "",
-                }
-              : undefined
             // Neither side carries a credential until it answers one: the code
             // request and the QR one are anonymous, as the vendor's web client
-            // makes them. An IP-check page has no QR tab at all.
-            const qr = verify
-              ? undefined
-              : {
+            // makes them.
+            const qr = {
                   // the vendor's own helper posts (web index-*.js: ft's default
                   // method is POST), and its route answers a GET with "Method
                   // Not Allowed"
@@ -570,7 +399,7 @@ export async function CodarPlugin(input) {
                       throw e
                     }
                   },
-                }
+            }
             let page
             try {
               // Loaded here, not at module load: the catalog generator's
@@ -579,40 +408,28 @@ export async function CodarPlugin(input) {
               // fail to load. Only this method needs a page at all.
               const { startSignIn } = await import("./lib/signinpage.mjs")
               page = await startSignIn({
-                ...(verify ?? signIn),
-                ...(qr ?? {}),
-                verify,
-                copy: verify ? { title: "科搭短信安全验证", button: "完成验证" } : {},
+                ...signIn,
+                ...qr,
                 // What this page already knows is cut out of a vendor sentence
                 // before it is shown: a refusal that quotes the number sent or
                 // the code typed back is not a refusal the page may show in
                 // full, and the temp token a handover carries is not for the
                 // page either.
                 clean: (said, body) => {
-                  const known = [body?.phone, body?.code, pending?.tempToken, pending?.username]
+                  const known = [body?.phone, body?.code]
                   let out = String(said ?? "")
                   for (const v of known) if (typeof v === "string" && v) out = scrubLine(out, v)
                   return cut(out, 400)
                 },
               })
             } catch (e) {
-              // The page never opened, so the handover was not spent: put it
-              // back for the next attempt (it keeps its own timestamp, so it
-              // still expires on its original schedule) — unless a newer
-              // sign-in finished while this one was setting up, in which case
-              // the handover belongs to a flow the person has left.
-              if (pending && signIns === startedAt && (pending.flow ?? 0) >= takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
               return { type: "failed", error: `无法打开登录页：${whyOf(e)}` }
             }
             // A sign-in cancelled while the page was being set up must not
             // leave a listener running for its whole TTL: addEventListener on
-            // an already-aborted signal never fires, so the check is here. The
-            // page never reached the host and no code was asked for, so the
-            // handover was not spent: it goes back, as it does when the page
-            // fails to open at all.
+            // an already-aborted signal never fires, so the check is here.
             if (signal?.aborted) {
               page.close()
-              if (pending && signIns === startedAt && (pending.flow ?? 0) >= takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= (pending.flow ?? 0))) pendingVerify = pending
               return { type: "failed", error: "登录已取消" }
             }
             const onAbort = () => page.close()
@@ -622,9 +439,7 @@ export async function CodarPlugin(input) {
             const closeOnAbort = () => page.close()
             return {
               url: page.url,
-              instructions: verify
-                ? "在打开的页面里完成人机验证并填写短信验证码，以通过安全验证"
-                : "在打开的页面里扫码或使用手机号登录，完成后回到 magpie",
+              instructions: "在打开的页面里扫码或使用手机号登录，完成后回到 magpie",
               async callback(_result, { signal: callSignal } = {}) {
                 // The host passes the callback its own signal, and a page left
                 // open when the host gives up is a listener and a vendor poll
@@ -677,39 +492,20 @@ export async function CodarPlugin(input) {
             },
             { key: "password", type: "password", message: "科搭密码", validate: (v) => (String(v ?? "") ? null : "请填写科搭密码") },
           ],
-          async authorize(inputs = {}, { account } = {}) {
+          async authorize(inputs = {}) {
             const username = String(inputs.username ?? "").trim()
             const password = String(inputs.password ?? "")
             if (!username || !password) return { type: "failed", error: "请填写科搭账号和密码" }
-            // A new attempt is a new flow: whatever an earlier one left behind
-            // is not this sign-in's to finish, and must not be offered to the
-            // SMS page as if it were.
-            pendingVerify = null
-            const startedAt = signIns
-            const myFlow = ++signFlows
             try {
               const got = await login(username, password)
               return signInResult(got.token)
             } catch (e) {
               // The card shows this line: neither the account nor the password
-              // goes into it, whatever the vendor quoted back.
-              // A refusal that names the IP check is also remembered, with the
-              // temp token it handed over: the SMS method completes that check
-              // through the vendor's own /v1/user/verify_ip instead of asking
-              // for the password a second time. The token is a credential, so
-              // it is held in this module and nowhere else — not in the host's
-              // saved account, not in a message.
-              // A sign-in that finished while this one was in flight is the
-              // newer flow: its account, not this one, is who the person is
-              // signing in as, and this refusal's handover is already stale.
-              const pending = signIns === startedAt ? verifyPendingOf(e, username) : null
-              // A handover a later-started attempt wrote is not this one's to
-              // replace: that refusal belongs to the flow the person started
-              // after this one, and it may well have returned first.
-              if (pending && myFlow > takenFlow && (pendingVerify === null || (pendingVerify.flow ?? 0) <= myFlow)) {
-                pendingVerify = { ...pending, flow: myFlow, who: slotOf(account) }
-                handedByFlow = myFlow
-              }
+              // goes into it, whatever the vendor quoted back. An IP-check
+              // refusal points the person at Codar's own app (signInFailure):
+              // the temp token it carries is not kept anywhere, because the
+              // host does not say which account slot is asking and a handover
+              // could be spent by another account's page.
               return { type: "failed", error: scrubLine(scrubLine(signInFailure(e), username), password) }
             }
           },

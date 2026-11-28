@@ -12,7 +12,6 @@ const {
   codeOf,
   errorCodeOf,
   login,
-  verifyIp,
   refreshToken,
   wechatStatusOf,
 } = testables
@@ -72,8 +71,7 @@ const refreshRoute = (body, status = 200) => ({ "POST /v1/token/refresh": { body
 test("password and IP verification refuse a token without a username claim", async () => {
   for (const entry of [
     ["password", () => login("alice", "pw"), loginRoute({ code: 200, token: SUB_ONLY, username: "alice" })],
-    ["verify_ip", () => verifyIp({ username: "alice", phone: "13800138000", code: "123456", tempToken: NAMED }), { "POST /v1/user/verify_ip": { body: { code: 200, token: SUB_ONLY, username: "alice" } } }],
-  ]) {
+      ]) {
     const [name, call, routes] = entry
     await withFetch(routes, async () => {
       await assert.rejects(call(), (e) => /账号名/.test(e.message), `${name}: a sub-only token is not a sign-in`)
@@ -173,58 +171,38 @@ test("the expiry words are classified the same way at every depth", async () => 
 // --- 3. password IP risk is read before success, and only handed over when
 // the same answer actually carries a temp token and an account name.
 
-test("an HTTP 200 ip_verify_required answer is a handover, never a finished login", async () => {
+test("an HTTP 200 ip_verify_required answer is a refusal, never a finished login", async () => {
+  // The vendor stops this sign-in until a person passes its SMS check, and the
+  // temp token it hands over is for /v1/user/verify_ip alone. Saved as a
+  // finished sign-in it fails every request. The check is finished in Codar's
+  // own app now: the plugin keeps no handover, because the host does not say
+  // which account slot is asking (2026-11-27 review).
   const fresh = mkToken({ username: "alice", exp: future() + 10 })
   const temp = mkToken({ username: "alice", exp: future() })
   const p = await CodarPlugin()
   const password = p.auth.methods.find((m) => m.label === "科搭账号密码登录")
-  const sms = p.auth.methods.find((m) => m.label === "科搭OAuth登录")
   await withFetch(loginRoute({ code: 200, status: "ip_verify_required", token: temp, username: "alice", phone: "13800138000" }), async () => {
     const out = await password.authorize({ username: "alice", password: "pw" })
     assert.equal(out.type, "failed", "the temp token is not handed to the host")
     assert.match(out.error, /短信安全验证/)
-    assert.match(out.error, /科搭OAuth登录/, "the fix names the page that can complete it")
+    assert.match(out.error, /科搭 App/, "the fix names where the check is finished")
+    assert.equal(out.error.includes("科搭OAuth登录"), false, "no page promises to open the check")
+    assert.equal(JSON.stringify(out).includes(temp), false, "the temp token is not in what the card shows")
   })
-  // verifyPendingOf (in index.mjs) still reads `body` off the thrown error:
-  // the page opens on the SMS step with the name and number from this answer.
-  // The page stays open through the SMS flow below; closing it is the last
-  // thing the test does, or its own /send would reach a closed listener.
+  // nothing is kept for a later page: the sign-in page is always the tabs
   const ctl = new AbortController()
+  const sms = p.auth.methods.find((m) => m.label === "科搭OAuth登录")
   const opened = await sms.authorize({}, { signal: ctl.signal })
   try {
     const html = await (await fetch(opened.url)).text()
-    assert.match(html, /科搭短信安全验证/, "the handover reached the page")
-    assert.match(html, /value="13800138000" readonly/, "with the vendor's number")
-    await withFetch(
-      {
-        "POST /v1/verification-code": { body: { code: 200 } },
-        "POST /v1/user/verify_ip": { body: { code: 200, token: fresh, username: "alice" } },
-      },
-      async (calls) => {
-        const sent = await fetch(`${opened.url}send`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ phone: "13800138000", captcha: { lot_number: "l", captcha_output: "o", pass_token: "p", gen_time: "1" } }),
-        })
-        assert.equal(sent.status, 200)
-        const verified = await fetch(`${opened.url}verify`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ phone: "13800138000", code: "123456" }),
-        })
-        assert.equal(verified.status, 200)
-        const got = await opened.callback()
-        assert.equal(got.refresh, fresh, "the finished sign-in is the account token, not the temp one")
-        const verifyCall = calls.find((c) => c.url.includes("/v1/user/verify_ip"))
-        assert.equal(verifyCall.headers.get("authorization"), `Bearer ${temp}`, "the temp token was spent on verify_ip")
-      },
-    )
+    assert.equal(/科搭短信安全验证/.test(html), false, "a handover survived into another sign-in's page")
+    assert.match(html, /扫码登录/, "the page is the ordinary two tabs")
   } finally {
     ctl.abort()
   }
 })
 
-test("a wrapped 201 ip check is a handover only with a temp token and a name", async () => {
+test("a wrapped 201 ip check is a refusal, and leaves nothing for another page", async () => {
   const temp = mkToken({ username: "alice", exp: future() })
   const good = { code: 200, data: { code: 201, status: "ip_verify_required", username: "alice", phone: "13800138000", token: temp } }
   const p = await CodarPlugin()
@@ -235,10 +213,14 @@ test("a wrapped 201 ip check is a handover only with a temp token and a name", a
     assert.equal(out.type, "failed")
     assert.match(out.error, /短信安全验证/)
   })
+  // nothing is kept for a later page (the handover is gone: the host does not
+  // name the account slot, so the check is finished in Codar's own app)
   const ctl = new AbortController()
   const opened = await sms.authorize({}, { signal: ctl.signal })
   try {
-    assert.match(await (await fetch(opened.url)).text(), /科搭短信安全验证/, "the wrapped 201 hands over to the SMS page")
+    const html = await (await fetch(opened.url)).text()
+    assert.equal(/科搭短信安全验证/.test(html), false, "the wrapped 201 left a handover for another page")
+    assert.match(html, /扫码登录/, "the wrapped 201 is a refusal, and the page is the ordinary tabs")
   } finally {
     ctl.abort()
   }

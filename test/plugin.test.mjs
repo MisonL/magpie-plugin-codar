@@ -151,6 +151,39 @@ test("a password sign-in hands over a renew-able token and never the password", 
   assert.ok(!JSON.stringify([r.access, r.refresh, r.key ?? "", r.metadata ?? {}]).includes("s3cret-pass"), "the password is kept nowhere")
 })
 
+test("an IP-check refusal leaves no state for a later sign-in to pick up", async () => {
+  // The handover is gone: the host passes only { signal } to authorize (both
+  // 0.1.4824 and 0.1.4940), so a page cannot prove which account slot it
+  // belongs to, and the temp token could be spent by another account's page
+  // and saved under it (2026-11-27 review). Two refusals in a row, and a page
+  // opened after them, must see the ordinary tabs — twice, with nothing
+  // carried between.
+  const temp = mkToken({ username: "user_state", exp: Math.floor(Date.now() / 1000) + 600 })
+  const p = await CodarPlugin()
+  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
+  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
+  for (let i = 0; i < 2; i++) {
+    await withFetch(
+      { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", message: "当前账号需要安全验证", username: "user_state", phone: "13800138000", token: temp } } },
+      async () => {
+        const out = await password.authorize({ username: "user_state", password: "pw" })
+        assert.equal(out.type, "failed")
+        assert.match(out.error, /科搭 App/)
+      },
+    )
+    const ctl = new AbortController()
+    const page = await sms.authorize({}, { signal: ctl.signal })
+    try {
+      const html = await (await fetch(page.url)).text()
+      assert.equal(/科搭短信安全验证/.test(html), false, `refusal ${i + 1} left a handover behind`)
+      assert.match(html, /扫码登录/, "the page is the ordinary two tabs")
+      assert.match(html, /手机号登录/)
+    } finally {
+      ctl.abort()
+    }
+  }
+})
+
 test("a password sign-in that wants an SMS check names the way that works", async () => {
   const p = await CodarPlugin()
   const wantsSms = await withFetch(
@@ -159,7 +192,13 @@ test("a password sign-in that wants an SMS check names the way that works", asyn
   )
   assert.equal(wantsSms.type, "failed")
   assert.match(wantsSms.error, /短信安全验证/)
-  assert.match(wantsSms.error, /科搭OAuth登录/, "it names the sign-in that works")
+  // The IP check is finished in Codar's own app now: the temp token the
+  // refusal carried is not kept, because the host does not say which account
+  // slot is asking and a handover could be saved under another account
+  // (2026-11-27 review; magpie 0.1.4824 and 0.1.4940 pass only { signal }).
+  assert.match(wantsSms.error, /科搭 App/, "it says where the check is finished")
+  assert.match(wantsSms.error, /科搭账号密码登录/, "and that the password sign-in is the one to retry")
+  assert.equal(/科搭OAuth登录/.test(wantsSms.error), false, "it no longer promises the OAuth page will open the check")
   assert.ok(!wantsSms.error.includes("s3cret-pass"), "the password never appears in what the card shows")
 
   // the vendor's own sentence for a wrong account or password
@@ -484,51 +523,6 @@ test("the SMS page sends a code only with a solved captcha, then trades the code
   }
 })
 
-test("the page can carry the IP-check step, with the vendor's phone filled in", async () => {
-  // The same listener serves the vendor's second half of a sign-in its IP
-  // check stopped: the title and the button are the check's, and a number the
-  // vendor already showed is filled in and locked so the person types only
-  // the code.
-  const { startSignIn } = await import("../lib/signinpage.mjs")
-  const sms = await startSignIn({
-    verify: { sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }), hint: "该账号当前网络需要短信安全验证", phone: "13800138000" },
-    copy: { title: "科搭短信安全验证", button: "完成验证" },
-  })
-  try {
-    const html = await (await fetch(sms.url)).text()
-    assert.match(html, /<title>科搭短信安全验证<\/title>/)
-    assert.match(html, /完成验证/)
-    assert.match(html, /value="13800138000" readonly/, "a number the vendor showed is not typed again")
-  } finally {
-    sms.close()
-  }
-})
-
-test("a name the vendor echoed into the IP check reaches the page as text, not as markup", async () => {
-  // The IP-check page's hint names the account, and that name can come from
-  // the vendor's refusal body. The page is served from 127.0.0.1 with this
-  // sign-in's path token and no CSP, so a name pasted in as HTML would run as
-  // markup on the origin every POST names. It is interpolated as text.
-  const { startSignIn } = await import("../lib/signinpage.mjs")
-  const hostile = '<img src=x onerror="alert(1)">'
-  const sms = await startSignIn({
-    verify: { sendCode: async () => {}, verifyCode: async () => ({ token: TOKEN, username: "user_1" }), hint: `账号 ${hostile} 当前网络需要短信安全验证`, phone: "13800138000" },
-    copy: { title: "科搭短信安全验证", button: "完成验证" },
-  })
-  try {
-    const html = await (await fetch(sms.url)).text()
-    assert.ok(!html.includes(hostile), `the account name went in as markup: ${html.slice(0, 400)}`)
-    assert.ok(html.includes("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"), "the name is shown, escaped")
-    assert.match(html, /value="13800138000" readonly/)
-  } finally {
-    sms.close()
-  }
-})
-
-// Windows has neither: `mkfifo` is not there, and a socket is not a path the
-// config could sit at (its AF_UNIX support is recent and not a file the app
-// would name). The branch this pins — O_NONBLOCK answering instead of waiting —
-// is POSIX-only by construction, so the test is too.
 test("the config read refuses a FIFO and a socket without waiting, and still reads a file", { skip: process.platform === "win32" }, async () => {
   // This hook runs in the one host process every plugin shares, so anything
   // that can block the read blocks magpie. A FIFO is the shape that used to
@@ -890,71 +884,6 @@ test("a gate under `data`, or spelled in another case, is still the gate", async
   }
 })
 
-test("a password sign-in the IP check stopped is finished through verify_ip, not a second password", async () => {
-  // The vendor answers a refused password sign-in with {code:201,
-  // status:"ip_verify_required", token, username, phone}: the token is a temp
-  // one, good for /v1/user/verify_ip alone. The SMS page then asks for the
-  // code with type "ip_verify" and posts the three fields the endpoint takes,
-  // as the vendor's own web app does in that state.
-  const temp = mkToken({ username: "user_3", exp: Math.floor(Date.now() / 1000) + 600 })
-  const fresh = mkToken({ username: "user_3", exp: Math.floor(Date.now() / 1000) + 604800 })
-  const p = await CodarPlugin()
-  await withFetch(
-    { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", message: "当前账号需要安全验证", username: "user_3", phone: "13800138000", token: temp } } },
-    async () => {
-      const out = await p.auth.methods.find((x) => x.label === "科搭账号密码登录").authorize({ username: "user_3", password: "s3cret-pass" })
-      assert.equal(out.type, "failed")
-      assert.match(out.error, /短信安全验证/)
-      assert.ok(!JSON.stringify(out).includes(temp), "the temp token is not in what the card shows")
-    },
-  )
-
-  const smsMethod = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  // The page's own URL is opened while the vendor is still stubbed: opening a
-  // page itself makes no vendor call, and the stub answers a loopback request
-  // with a 404 it should never get here.
-  const opened = await withFetch({ "POST /v1/login": { body: { code: 200, token: fresh } } }, async () => smsMethod.authorize({}, {}))
-  assert.match(opened.url, /^http:\/\/127\.0\.0\.1:\d+\/s\/[0-9a-f]{32}\/$/)
-  const html = await (await fetch(opened.url)).text()
-  assert.match(html, /科搭短信安全验证/, "the page says what it is verifying")
-  assert.ok(!html.includes("手机号登录") && !html.includes("扫码登录"), "the security-check page carries no sign-in tabs")
-  assert.match(html, /value="13800138000" readonly/, "and carries the number the vendor showed")
-
-  const calls = []
-  const realFetch = globalThis.fetch
-  // The page's own URLs go to the page: only the vendor's hosts are stubbed,
-  // or the test would answer its own POSTs and the page would never see them.
-  globalThis.fetch = async (url, init) => {
-    const u = String(url)
-    if (u.startsWith("http://127.0.0.1:")) return realFetch(u, init)
-    calls.push({ url: u, body: init?.body ? JSON.parse(init.body) : null, auth: new Headers(init?.headers).get("authorization") })
-    if (u.includes("/v1/verification-code")) return new Response(JSON.stringify({ code: 200 }), { status: 200 })
-    return new Response(JSON.stringify({ code: 200, data: { token: fresh, username: "user_3" } }), { status: 200 })
-  }
-  try {
-    const sent = await fetch(`${opened.url}send`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone: "13800138000", captcha: { lot_number: "l", captcha_output: "o", pass_token: "p", gen_time: "1" } }),
-    })
-    assert.equal(sent.status, 200)
-    const verify = await fetch(`${opened.url}verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ phone: "13800138000", code: "123456" }) })
-    assert.equal(verify.status, 200)
-    const answered = await opened.callback()
-    assert.equal(answered.type, "success")
-    assert.equal(answered.refresh, fresh, "the account's own token comes back, in the shape the host renews")
-
-    const codeCall = calls.find((c) => c.url.includes("/v1/verification-code"))
-    assert.equal(codeCall.body.type, "ip_verify", "the vendor's own code type for this step")
-    assert.equal(codeCall.body.name, "user_3", "carried with the account's own name")
-    const verifyCall = calls.find((c) => c.url.includes("/v1/user/verify_ip"))
-    assert.deepEqual(verifyCall.body, { username: "user_3", phone: "13800138000", code: "123456" })
-    assert.equal(verifyCall.auth, `Bearer ${temp}`, "the temp token is the only credential that call has")
-  } finally {
-    globalThis.fetch = realFetch
-  }
-})
-
 test("a cancelled callback closes the page even when the authorize signal is live", async () => {
   // The host passes the callback its OWN signal (callback(undefined,
   // { signal })) and passes a different one to authorize. The plugin waited on
@@ -1044,63 +973,6 @@ test("a code the vendor refused in the body is not a code it sent", async () => 
       ctl.abort()
     }
   }
-})
-
-test("an IP-check handover is used once, expires, and is cleared by another sign-in", async () => {
-  // The temp token a refused password sign-in leaves for the SMS page is a
-  // credential, and it is taken (not peeked): one handover completes at most
-  // one sign-in. Left in place, it would be picked up by a later SMS sign-in —
-  // possibly for another account — or finish a check the person had already
-  // walked away from.
-  const temp = mkToken({ username: "user_9", exp: Math.floor(Date.now() / 1000) + 600 })
-  const fresh = mkToken({ username: "user_9", exp: Math.floor(Date.now() / 1000) + 604800 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  const refused = { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", message: "需要安全验证", username: "user_9", phone: "13800138000", token: temp } } }
-
-  // first refusal leaves a handover; the page shows it
-  await withFetch(refused, async () => {
-    const out = await password.authorize({ username: "user_9", password: "pw" })
-    assert.equal(out.type, "failed")
-  })
-  // A page is opened for each check and closed through its signal: the
-  // listener would otherwise answer for its own ten minutes.
-  const titleOf = async (inputs = {}) => {
-    const ctl = new AbortController()
-    const out = await sms.authorize(inputs, { signal: ctl.signal })
-    try {
-      return await (await fetch(out.url)).text()
-    } finally {
-      ctl.abort()
-    }
-  }
-  assert.match(await titleOf(), /科搭短信安全验证/, "the handover reached the page")
-
-  // second attempt in the same process: the handover is spent, so the page is
-  // the ordinary sign-in again — one handover, one sign-in
-  assert.match(await titleOf(), /登录科搭 Codar/, "a spent handover is not offered again")
-
-  // a fresh handover, then a password attempt for another account: the new
-  // attempt is a new flow, and must not be finished with the old temp token
-  await withFetch(refused, async () => {
-    await password.authorize({ username: "user_9", password: "pw" })
-  })
-  await withFetch({ "POST /v1/login": { body: { code: 400, message: "用户名或密码错误" } } }, async () => {
-    await password.authorize({ username: "user_other", password: "pw" })
-  })
-  assert.match(await titleOf(), /登录科搭 Codar/, "another account's attempt cleared the handover")
-
-  // a token sign-in is a sign-in too: the handover it did not make must not
-  // outlive it, or the next SMS page would finish the other account's check
-  await withFetch(refused, async () => {
-    await password.authorize({ username: "user_9", password: "pw" })
-  })
-  const tokenMethod = p.auth.methods.find((x) => x.label === "科搭令牌（留空读本机）")
-  const other = mkToken({ username: "user_other", exp: Math.floor(Date.now() / 1000) + 86400 })
-  const signed = await tokenMethod.authorize({ token: other })
-  assert.equal(signed.type, "success", "the pasted token signed in")
-  assert.match(await titleOf(), /登录科搭 Codar/, "a token sign-in cleared the handover")
 })
 
 test("a refusal is the deepest wrapper's answer, and a balance it hides is no balance", async () => {
@@ -1199,332 +1071,6 @@ test("a vendor sentence that quotes a credential is cut before the page shows it
   const p = await CodarPlugin()
   const page = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
   assert.equal(typeof page.authorize, "function")
-})
-
-test("a password attempt superseded by a newer sign-in does not leave its handover", async () => {
-  // Attempt A is still in flight; a token sign-in for another account finishes
-  // first; A comes back refused with the IP check. The handover A writes would
-  // point the next OAuth page at A's account, which is no longer the one being
-  // signed in.
-  const temp = mkToken({ username: "user_a", exp: Math.floor(Date.now() / 1000) + 600 })
-  const other = mkToken({ username: "user_other", exp: Math.floor(Date.now() / 1000) + 86400 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  const tokenMethod = p.auth.methods.find((x) => x.label === "科搭令牌（留空读本机）")
-  const refused = { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_a", phone: "13800138000", token: temp } } }
-  await withFetch(refused, async () => {
-    // A is in flight while the other account's token sign-in finishes: the
-    // order this pins is the one the race allows, not a real delay.
-    const a = password.authorize({ username: "user_a", password: "pw" })
-    await tokenMethod.authorize({ token: other })
-    const out = await a
-    assert.equal(out.type, "failed")
-  })
-  const ctl = new AbortController()
-  const page = await sms.authorize({}, { signal: ctl.signal })
-  try {
-    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "the stale attempt's handover is not offered")
-  } finally {
-    ctl.abort()
-  }
-})
-
-test("of two refused password attempts the later refusal owns the handover", async () => {
-  // A is started first and its IP-check refusal comes back last. The guard
-  // counts COMPLETED sign-ins only, so both refusals pass it and the older
-  // one wrote over the newer: the next 「科搭OAuth登录」 opened A's security
-  // check while the person had just been refused for B. A handover is now
-  // stamped with its attempt's order: a refusal rewrites one only when it
-  // belongs to an attempt that started no earlier than the write did.
-  const tempA = mkToken({ username: "user_pA", exp: Math.floor(Date.now() / 1000) + 600 })
-  const tempB = mkToken({ username: "user_pB", exp: Math.floor(Date.now() / 1000) + 600 })
-  let releaseA
-  const aHeld = new Promise((r) => (releaseA = r))
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  const refusal = (who, temp) => ({ code: 201, status: "ip_verify_required", username: who, phone: "13800138000", token: temp })
-  await withFetch(
-    {
-      "POST /v1/login": (url, init) => {
-        const who = JSON.parse(init.body).username
-        if (who === "user_pA") {
-          // A is held until B's refusal has been written
-          return aHeld.then(() => new Response(JSON.stringify(refusal(who, tempA)), { status: 200, headers: { "Content-Type": "application/json" } }))
-        }
-        return Promise.resolve(new Response(JSON.stringify(refusal(who, tempB)), { status: 200, headers: { "Content-Type": "application/json" } }))
-      },
-    },
-    async () => {
-      const a = password.authorize({ username: "user_pA", password: "pwA" })
-      await new Promise((r) => setTimeout(r, 20))
-      const b = password.authorize({ username: "user_pB", password: "pwB" })
-      await b
-      releaseA()
-      await a
-    },
-  )
-  const ctl = new AbortController()
-  const page = await sms.authorize({}, { signal: ctl.signal })
-  try {
-    const html = await (await fetch(page.url)).text()
-    assert.match(html, /user_pB/, "the page continues the newer attempt's account")
-    assert.ok(!/user_pA/.test(html), "the older refusal did not rewrite the newer handover")
-  } finally {
-    ctl.abort()
-  }
-})
-
-test("a handover that lands while a newer password attempt is in flight dies with it", async () => {
-  // Attempt A (account user_m1) is refused with the IP check; the refusal
-  // arrives while attempt B (user_m2) is still open. B started after A, so
-  // A's guard (signIns unchanged until someone COMPLETES) lets the handover
-  // be written — and then B completes. A completed sign-in is the newest
-  // word on who the person is: the handover must not survive it, or the
-  // next 「科搭OAuth登录」 opens as user_m1's security check.
-  const tempA = mkToken({ username: "user_m1", exp: Math.floor(Date.now() / 1000) + 600 })
-  const okB = mkToken({ username: "user_m2", exp: Math.floor(Date.now() / 1000) + 86400 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  // the macrotask hop guarantees A's refusal has run through authorize's
-  // catch (all microtasks) before B's login answer is delivered
-  let settle
-  const afterA = new Promise((r) => (settle = r))
-  let first = true
-  await withFetch(
-    {
-      "POST /v1/login": (url, init) => {
-        const who = JSON.parse(init.body).username
-        if (who === "user_m1") {
-          setTimeout(settle, 0)
-          return new Response(JSON.stringify({ code: 201, status: "ip_verify_required", username: "user_m1", phone: "13800138000", token: tempA }), { status: 200, headers: { "Content-Type": "application/json" } })
-        }
-        return afterA.then(() => {
-          if (first) {
-            first = false
-            return new Response(JSON.stringify({ code: 200, token: okB, username: "user_m2" }), { status: 200, headers: { "Content-Type": "application/json" } })
-          }
-          return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 })
-        })
-      },
-    },
-    async () => {
-      const a = password.authorize({ username: "user_m1", password: "pw1" })
-      const b = password.authorize({ username: "user_m2", password: "pw2" })
-      const outA = await a
-      const outB = await b
-      assert.equal(outA.type, "failed")
-      assert.equal(outB.type, "success", "B completed the sign-in")
-    },
-  )
-  const ctl = new AbortController()
-  const page = await sms.authorize({}, { signal: ctl.signal })
-  try {
-    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "B's completion took A's handover with it")
-  } finally {
-    ctl.abort()
-  }
-})
-
-test("a refusal that lands after its rival's handover was taken does not resurrect", async () => {
-  // A (started first) hangs; B (started second) is refused and writes; the
-  // OAuth page TAKES B's handover — the slot is empty now — and only then A's
-  // refusal returns. The flow comparison guards a STANDING handover; an
-  // empty slot let A write, and the next page opened A's security check
-  // after the person had already been shown B's. The slot remembers the
-  // newest attempt whose handover was taken, and a refusal below that line
-  // writes nothing.
-  const tempA = mkToken({ username: "user_tA", exp: Math.floor(Date.now() / 1000) + 600 })
-  const tempB = mkToken({ username: "user_tB", exp: Math.floor(Date.now() / 1000) + 600 })
-  let releaseA
-  const aHeld = new Promise((r) => (releaseA = r))
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  const refusal = (who, temp) => new Response(JSON.stringify({ code: 201, status: "ip_verify_required", username: who, phone: "13800138000", token: temp }), { status: 200, headers: { "Content-Type": "application/json" } })
-  let ctl1
-  let first
-  await withFetch(
-    {
-      "POST /v1/login": (url, init) => {
-        const who = JSON.parse(init.body).username
-        if (who === "user_tA") return aHeld.then(() => refusal(who, tempA))
-        return Promise.resolve(refusal(who, tempB))
-      },
-    },
-    async () => {
-      const a = password.authorize({ username: "user_tA", password: "pwA" })
-      await new Promise((r) => setTimeout(r, 20))
-      await password.authorize({ username: "user_tB", password: "pwB" })
-      // the page TAKES B's handover; it stays open until fetched below,
-      // after the stub leaves the global fetch
-      ctl1 = new AbortController()
-      first = await sms.authorize({}, { signal: ctl1.signal })
-      releaseA()
-      await a
-    },
-  )
-  try {
-    assert.match(await (await fetch(first.url)).text(), /user_tB/, "B's handover reached the page")
-  } finally {
-    ctl1.abort()
-  }
-  // only now does A's slow refusal land, into the emptied slot
-  const ctl = new AbortController()
-  const page = await sms.authorize({}, { signal: ctl.signal })
-  try {
-    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "an older refusal does not refill a taken slot")
-  } finally {
-    ctl.abort()
-  }
-})
-
-test("a handover made in one host account slot is not another slot's to take", async () => {
-  // Two magpie accounts share this one plugin instance, and the host saves
-  // whatever the sign-in returns under the account whose callback asked: with
-  // one module-level handover, A's OAuth page took B's IP-check handover and
-  // the host stored B's token under A (2026-11-27 review, on 0.1.4824 and
-  // 0.1.4940). The host names the slot in the second argument; a handover is
-  // only ever taken by a page in the slot that made it.
-  const temp = mkToken({ username: "user_slotB", exp: Math.floor(Date.now() / 1000) + 600 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  await withFetch(
-    { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_slotB", phone: "13800138000", token: temp } } },
-    async () => {
-      const refused = await password.authorize({ username: "user_slotB", password: "pw" }, { account: "slot-B" })
-      assert.equal(refused.type, "failed")
-    },
-  )
-  // A's page, a different slot: it must open on the ordinary tabs
-  const ctlA = new AbortController()
-  const pageA = await sms.authorize({}, { signal: ctlA.signal, account: "slot-A" })
-  try {
-    const html = await (await fetch(pageA.url)).text()
-    assert.match(html, /扫码登录/, "the other slot's page did not open on the ordinary tabs")
-    assert.equal(/user_slotB/.test(html), false, "another slot's account was named on this page")
-  } finally {
-    ctlA.abort()
-  }
-  // B's own page still has the handover: a refusal from another slot does not
-  // spend it
-  const ctlB = new AbortController()
-  const pageB = await sms.authorize({}, { signal: ctlB.signal, account: "slot-B" })
-  try {
-    assert.match(await (await fetch(pageB.url)).text(), /user_slotB/, "the slot that made the handover could not take it")
-  } finally {
-    ctlB.abort()
-  }
-})
-
-test("a renewal landing while a password POST is in flight keeps its handover", async () => {
-  // The host renews a stored sign-in on its own lead; when that renewal
-  // finishes between the password attempt's start and its login answer, it
-  // is not a newer sign-in. Counting it (signInResult bumped signIns on every
-  // success, renewals included) made the guard at authorize's refusal think
-  // the attempt was superseded, so the IP-check handover was never written
-  // and the next OAuth page opened on the tabs instead of the security check.
-  const temp = mkToken({ username: "user_r", exp: Math.floor(Date.now() / 1000) + 600 })
-  const renewed = mkToken({ username: "user_r", exp: Math.floor(Date.now() / 1000) + 604800 })
-  const live = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: expiresAt(TOKEN) }
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  // the login route renews first and then waits: the renewal is finished, in
-  // module time, while this attempt's POST is still open
-  let renewals = 0
-  let afterRenewal
-  const renewalDone = new Promise((r) => (afterRenewal = r))
-  let release
-  const refusalHeld = new Promise((r) => (release = r))
-  await withFetch(
-    {
-      "POST /v1/login": async () => {
-        await p.auth.refresh(live)
-        renewals += 1
-        afterRenewal()
-        await refusalHeld
-        return new Response(JSON.stringify({ code: 201, status: "ip_verify_required", username: "user_r", phone: "13800138000", token: temp }), { status: 200, headers: { "Content-Type": "application/json" } })
-      },
-      "POST /v1/token/refresh": { body: { code: 200, token: renewed } },
-    },
-    async () => {
-      const a = password.authorize({ username: "user_r", password: "pw" })
-      await renewalDone
-      assert.equal(renewals, 1, "the renewal completed while the login POST was open")
-      release()
-      const out = await a
-      assert.equal(out.type, "failed")
-      assert.match(out.error, /短信安全验证/)
-    },
-  )
-  const ctl = new AbortController()
-  const page = await sms.authorize({}, { signal: ctl.signal })
-  try {
-    assert.match(await (await fetch(page.url)).text(), /科搭短信安全验证/, "the renewal did not steal the handover")
-  } finally {
-    ctl.abort()
-  }
-})
-
-test("a sign-in cancelled before its page opens keeps the handover", async () => {
-  // The handover is taken at authorize's start, and the listener comes up a
-  // moment later. An abort in that window closed the page before its URL ever
-  // reached the host: nobody saw it and no code was asked for, so the temp
-  // token was not spent. Kept, the next OAuth attempt can still finish the
-  // check instead of asking for the password again.
-  const temp = mkToken({ username: "user_12", exp: Math.floor(Date.now() / 1000) + 600 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  await withFetch({ "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_12", phone: "13800138000", token: temp } } }, async () => {
-    await password.authorize({ username: "user_12", password: "pw" })
-  })
-  const ctl = new AbortController()
-  // The abort lands after authorize has run as far as its first await, which
-  // is past takePendingVerify: the setup window, not the pre-start check.
-  const attempt = sms.authorize({}, { signal: ctl.signal })
-  ctl.abort()
-  assert.equal((await attempt).type, "failed", "a cancelled attempt answers failed")
-  const next = new AbortController()
-  const page = await sms.authorize({}, { signal: next.signal })
-  try {
-    assert.match(await (await fetch(page.url)).text(), /科搭短信安全验证/, "the unspent handover is offered to the next attempt")
-  } finally {
-    next.abort()
-  }
-})
-
-test("a handover restored by a cancel does not outlive a newer sign-in", async () => {
-  // The unspent-handover restore must not become the stale-handover write it
-  // was fixed for in the password path: if a newer sign-in finished while the
-  // page was coming up, the old temp token belongs to a flow the person has
-  // already left.
-  const temp = mkToken({ username: "user_13", exp: Math.floor(Date.now() / 1000) + 600 })
-  const other = mkToken({ username: "user_other", exp: Math.floor(Date.now() / 1000) + 86400 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  const tokenMethod = p.auth.methods.find((x) => x.label === "科搭令牌（留空读本机）")
-  await withFetch({ "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_13", phone: "13800138000", token: temp } } }, async () => {
-    await password.authorize({ username: "user_13", password: "pw" })
-  })
-  const ctl = new AbortController()
-  const attempt = sms.authorize({}, { signal: ctl.signal })
-  const signed = await tokenMethod.authorize({ token: other })
-  assert.equal(signed.type, "success", "the newer sign-in finished while the page came up")
-  ctl.abort()
-  assert.equal((await attempt).type, "failed", "the cancelled attempt answers failed")
-  const next = new AbortController()
-  const page = await sms.authorize({}, { signal: next.signal })
-  try {
-    assert.match(await (await fetch(page.url)).text(), /登录科搭 Codar/, "the older account's handover is not offered after a newer sign-in")
-  } finally {
-    next.abort()
-  }
 })
 
 test("a handover past its window is dropped, not finished", async (t) => {
@@ -2162,66 +1708,6 @@ test("cancelling the page stops the vendor call it had in flight", async () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error("the vendor call outlived the page")), 2000).unref()),
     ])
     assert.equal(vendorSignal.aborted, true, "closing the page aborts the vendor call it started")
-  } finally {
-    ctl.abort()
-    await opened.callback?.().catch?.(() => {})
-    globalThis.fetch = realFetch
-  }
-})
-
-test("cancelling the security-check page stops the verify call it had in flight", async () => {
-  // The IP-check step's own vendor call is abandoned with the page, as the
-  // SMS sign-in and the QR poll are: index.mjs once carried the page's signal
-  // inside verifyIp's fields object, where the function never reads it, so a
-  // cancelled page still ran /v1/user/verify_ip to its own timeout.
-  const temp = mkToken({ username: "user_v", exp: Math.floor(Date.now() / 1000) + 600 })
-  const p = await CodarPlugin()
-  await withFetch(
-    { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_v", phone: "13800138000", token: temp } } },
-    async () => {
-      const out = await p.auth.methods.find((x) => x.label === "科搭账号密码登录").authorize({ username: "user_v", password: "pw" })
-      assert.equal(out.type, "failed")
-    },
-  )
-  const realFetch = globalThis.fetch
-  const json = (body) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } })
-  const ctl = new AbortController()
-  let vendorSignal = null
-  let verifyPost = null
-  globalThis.fetch = (u, init) => {
-    const s = String(u instanceof Request ? u.url : u)
-    if (s.startsWith("http://127.0.0.1")) return realFetch(u, init)
-    if (s.includes("/v1/verification-code")) return Promise.resolve(json({ code: 200 }))
-    if (s.includes("/v1/user/verify_ip")) {
-      vendorSignal = init?.signal
-      return new Promise((_, reject) => {
-        init?.signal?.addEventListener?.("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })))
-      })
-    }
-    return Promise.resolve(json({ code: 200 }))
-  }
-  const opened = await p.auth.methods.find((x) => x.label === "科搭OAuth登录").authorize({}, { signal: ctl.signal })
-  try {
-    const sent = await realFetch(`${opened.url}send`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone: "13800138000", captcha: { lot_number: "l", captcha_output: "o", pass_token: "p", gen_time: "1" } }),
-    })
-    assert.equal(sent.status, 200)
-    verifyPost = realFetch(`${opened.url}verify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone: "13800138000", code: "123456" }),
-    }).catch(() => {})
-    for (let i = 0; i < 200 && !vendorSignal; i++) await new Promise((r) => setTimeout(r, 5))
-    assert.ok(vendorSignal, "the vendor call started")
-    assert.equal(vendorSignal.aborted, false, "and is running")
-    ctl.abort()
-    await Promise.race([
-      verifyPost,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("the verify call outlived the page")), 2000).unref()),
-    ])
-    assert.equal(vendorSignal.aborted, true, "closing the page aborts the verify call it started")
   } finally {
     ctl.abort()
     await opened.callback?.().catch?.(() => {})
