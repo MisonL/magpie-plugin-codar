@@ -125,6 +125,14 @@ let handedByFlow = 0
 
 // slotOf is the host's account slot as a comparable string: the value it
 // gives authorize/callback, empty when a host gives none.
+//
+// Measured 2026-11-28: magpie 0.1.4824 and 0.1.4940 both call
+// `m.authorize(inputs, { signal })` — the slot is computed inside the host
+// (`signInKey(provider, account)`) and never handed to the plugin. With no
+// slot to compare, the flow-order rule below is the only guard, and it cannot
+// stop a page opened AFTER another account's refusal: that page is newer than
+// the refusal and would take it. Closing that needs the host to pass the slot
+// (magpie#7953 is the same shape of request for the check-in's signal).
 const slotOf = (account) => (account == null ? "" : String(account))
 
 // takePendingVerify answers the handover once, if it is still good. A
