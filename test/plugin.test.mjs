@@ -1030,10 +1030,10 @@ test("a daily-sign answer wrapped twice reads the day's own statement, as the fl
 
 test("a wrapped refusal is a refusal, and a token the plugin cannot keep is not saved", async () => {
   // `{"code":200,"data":{"code":201,"status":"ip_verify_required","token":…}}`
-  // passed the top-level business gate, and its temp token — good for
-  // /v1/user/verify_ip alone — was returned as a finished sign-in. A token
-  // with a newline, or one whose own exp has passed, was saved the same way
-  // and then failed every request.
+  // passed the top-level business gate, and its temp token was returned as a
+  // finished sign-in: a credential good for one vendor call, saved as the
+  // account. A token with a newline, or one whose own exp has passed, was
+  // saved the same way and then failed every request.
   const { login } = testables
   const wrapped = { "POST /v1/login": { body: { code: 200, data: { code: 201, status: "ip_verify_required", token: "TEMP" } } } }
   await withFetch(wrapped, async () => {
@@ -1071,33 +1071,6 @@ test("a vendor sentence that quotes a credential is cut before the page shows it
   const p = await CodarPlugin()
   const page = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
   assert.equal(typeof page.authorize, "function")
-})
-
-test("a handover past its window is dropped, not finished", async (t) => {
-  // The temp token lives ten minutes. Past that the vendor would refuse it
-  // anyway, and the page would be verifying an account the person no longer
-  // has in front of them, so the handover is dropped without being offered.
-  const temp = mkToken({ username: "user_11", exp: Math.floor(Date.now() / 1000) + 600 })
-  const p = await CodarPlugin()
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const password = p.auth.methods.find((x) => x.label === "科搭账号密码登录")
-  t.mock.timers.enable({ apis: ["Date"], now: Date.now() })
-  try {
-    await withFetch(
-      { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_11", token: temp } } },
-      async () => password.authorize({ username: "user_11", password: "pw" }),
-    )
-    t.mock.timers.tick(10 * 60 * 1000 + 1000)
-    const ctl = new AbortController()
-    const opened = await sms.authorize({}, { signal: ctl.signal })
-    try {
-      assert.match(await (await fetch(opened.url)).text(), /登录科搭 Codar/, "an expired handover is not offered")
-    } finally {
-      ctl.abort()
-    }
-  } finally {
-    t.mock.timers.reset()
-  }
 })
 
 test("a request that carries no credential sends no Authorization at all", async () => {
@@ -1166,51 +1139,10 @@ test("a QR status the vendor answers with 404 is an expired code, not a broken p
   }
 })
 
-test("a verification refusal the vendor echoes the temp token into never reaches the page", async () => {
-  // /v1/user/verify_ip is the one vendor call whose bearer is the temp token,
-  // and its refusal is shown in the page's status line. A vendor that quotes
-  // the token back would put a credential in a browser, so the call site cuts
-  // it before the page server ever sees the sentence.
-  const temp = mkToken({ username: "user_echo", exp: Math.floor(Date.now() / 1000) + 600 })
-  const fresh = mkToken({ username: "user_echo", exp: Math.floor(Date.now() / 1000) + 604800 })
-  const p = await CodarPlugin()
-  await withFetch(
-    { "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_echo", phone: "13800138000", token: temp } } },
-    async () => p.auth.methods.find((x) => x.label === "科搭账号密码登录").authorize({ username: "user_echo", password: "pw" }),
-  )
-  const sms = p.auth.methods.find((x) => x.label === "科搭OAuth登录")
-  const ctl = new AbortController()
-  const opened = await sms.authorize({}, { signal: ctl.signal })
-  const real = globalThis.fetch
-  globalThis.fetch = async (url, init) => {
-    const u = String(url)
-    if (u.startsWith("http://127.0.0.1:")) return real(u, init)
-    if (u.includes("/v1/verification-code")) return new Response(JSON.stringify({ code: 200 }), { status: 200 })
-    // the refusal quotes the bearer it was given
-    return new Response(JSON.stringify({ code: 400, message: `invalid token ${temp}` }), { status: 200 })
-  }
-  try {
-    const answered = await (await real(`${opened.url}verify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone: "13800138000", code: "123456" }),
-    })).json()
-    assert.ok(answered.error, "the page is told the verification failed")
-    assert.ok(!answered.error.includes(temp), `the temp token reached the page: ${answered.error}`)
-    assert.match(answered.error, /验证失败|安全验证|token|invalid/i, "and the sentence is still a sentence")
-  } finally {
-    globalThis.fetch = real
-    ctl.abort()
-  }
-})
-
 test("a plain SMS sign-in still asks for a login code and calls login", async () => {
-  // Nothing pending: the page is the sign-in it always was, and the code is
-  // asked for with type "login" — the two steps must not be confused, or a
-  // person with no IP check on them would be sent to verify_ip. The handover
-  // is module state shared by every plugin in this process, so it is cleared
-  // here rather than trusted to the test before this one: a failure there
-  // must not decide what this page is.
+  // The page is the sign-in it always is, and the code is asked for with type
+  // "login" — never the vendor's "ip_verify", which belongs to a check this
+  // plugin no longer runs (the person finishes it in Codar's own app).
   const p = await CodarPlugin()
   await withFetch({ "POST /v1/login": { body: { code: 400, message: "用户名或密码错误" } } }, async () => {
     await p.auth.methods.find((x) => x.label === "科搭账号密码登录").authorize({ username: "user_reset", password: "pw" })
