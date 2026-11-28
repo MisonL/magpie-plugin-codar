@@ -42,7 +42,15 @@ const TOKEN = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ username: "us
 // proved nothing about them (2026-11-28 review). A machine without one skips
 // them and still runs the source-level checks below; `CODAR_UI_TESTS=0` turns
 // them off on purpose.
+//
+// Bun's runner is left out: driving Chrome through its WebSocket and child
+// processes timed out at five seconds on both CI Macs and CI Linux while the
+// same file passed under node (2026-11-28), and the packed-suite run is left
+// out too — what it proves is that the tarball installs and starts, not how a
+// browser paints.
 const CHROME =
+  typeof Bun === "undefined" &&
+  !process.env.CODAR_TARBALL_GATE &&
   process.env.CODAR_UI_TESTS !== "0" &&
   (process.env.MAGPIE_CHROME ||
   [
