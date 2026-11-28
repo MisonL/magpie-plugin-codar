@@ -1495,6 +1495,49 @@ test("a build is checked against the source it was made from, and a foreign one 
   }
 })
 
+test("a plain --check refuses an unusable build too, not only --strict", { timeout: 120_000 }, async () => {
+  // `--check` printed five missing targets and exited 0: the documented gate
+  // spelling is `--check --strict`, and a release step that dropped the flag
+  // waved the release through (2026-11-27 review). The two spellings answer
+  // the same, with the flag naming the wording only.
+  const empty = mkdtempSync(join(tmpdir(), "codar-check-nobuild-"))
+  try {
+    const run = (args) =>
+      spawnSync(process.execPath, [join(here, "..", "scripts", "build-native.mjs"), ...args], {
+        cwd: join(here, ".."),
+        encoding: "utf8",
+        env: { ...process.env, CODAR_NATIVE_OUT: empty },
+      })
+    for (const args of [["--check"], ["--check", "--strict"]]) {
+      const out = run(args)
+      assert.equal(out.status, 1, `${args.join(" ")} passed with no builds: ${out.stdout}${out.stderr}`)
+      assert.match(out.stdout, /missing /, "the report still says what is missing")
+    }
+  } finally {
+    rmSync(empty, { recursive: true, force: true })
+  }
+})
+
+test("every files spelling npm packs the builds from is refused", async () => {
+  // npm reads a bare directory, a "/**" glob and a "./" prefix as the same
+  // members, and only the exact "native/bin" string used to be refused
+  // (2026-11-27 review).
+  const { mainPackageProblems } = await import("../scripts/native-packages.mjs")
+  const { buildTargets } = await import("../scripts/build-native.mjs")
+  const { packageName } = await import("../native/binary-name.mjs")
+  const base = {
+    version: "0.3.5",
+    optionalDependencies: Object.fromEntries(buildTargets.map((t) => [packageName(t.os, t.arch), "0.3.5"])),
+  }
+  for (const files of [["native/bin"], ["./native/bin"], ["native/bin/**"], ["native/**"], ["native"]]) {
+    const said = mainPackageProblems({ ...base, files }).join(" ")
+    assert.match(said, /files names native\/bin/, `${JSON.stringify(files)} slipped past the manifest check`)
+  }
+  for (const files of [["lib"], ["native/other"], ["scripts/**"]]) {
+    assert.deepEqual(mainPackageProblems({ ...base, files }), [], `${JSON.stringify(files)} was read as shipping the builds`)
+  }
+})
+
 test("a fingerprint appended to another build is not this tree's build", { timeout: 120_000 }, async () => {
   // The marker inside a binary is a string the linker wrote, and a string can
   // be appended to any file: the review of 2026-11-27 appended this tree's
@@ -1810,8 +1853,11 @@ setTimeout(() => {}, 60000)
       stdio: "ignore",
       env: { ...process.env, PROXY_BIN: localBuild, HOME_DIR: home },
     })
-    const until = async (fn) => {
-      for (let i = 0; i < 250 && !fn(); i++) await new Promise((r) => setTimeout(r, 20))
+    // Twelve seconds per wait, not five: a full suite runs several proxies at
+    // once, and a busy machine made the spawn alone outlast the old bound —
+    // the test failed only in the whole-suite run (2026-11-28).
+    const until = async (fn, tries = 600) => {
+      for (let i = 0; i < tries && !fn(); i++) await new Promise((r) => setTimeout(r, 20))
       return fn()
     }
     try {
@@ -2028,7 +2074,7 @@ test("a release ships each build as its own package, and the main package names 
       assert.equal(manifest.version, version, "a package's version is the release's")
       assert.deepEqual(manifest.os, [t.os], "npm matches os against process.platform")
       assert.deepEqual(manifest.cpu, [t.arch === "amd64" ? "x64" : t.arch], "npm matches cpu against process.arch")
-      assert.deepEqual(manifest.files, ["bin"], "only the build ships")
+      assert.deepEqual(manifest.files, ["bin", "LICENSE"], "the build and the licence travel together")
       assert.equal(manifest.license, "MIT")
       const file = join(dir, "bin", binaryFile(t.os, t.arch))
       assert.deepEqual(readFileSync(file), readFileSync(join(bin, binaryFile(t.os, t.arch))), "the build was not copied")

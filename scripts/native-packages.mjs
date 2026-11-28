@@ -99,6 +99,13 @@ export function stagePackages({ bin, out, version, targets = buildTargets }) {
     mkdirSync(join(dir, "bin"), { recursive: true })
     copyFileSync(source, dest)
     chmodSync(dest, 0o755)
+    // The package states MIT and its tarball used to carry no text of it: a
+    // platform package is what npm actually installs, so the license has to
+    // travel with it (2026-11-27 review).
+    const license = join(bin, "..", "..", "LICENSE")
+    if (existsSync(license)) {
+      copyFileSync(license, join(dir, "LICENSE"))
+    }
     const manifest = {
       name: p.name,
       version,
@@ -106,7 +113,7 @@ export function stagePackages({ bin, out, version, targets = buildTargets }) {
       license: "MIT",
       os: [p.os],
       cpu: [p.cpu],
-      files: ["bin"],
+      files: ["bin", "LICENSE"],
     }
     writeFileSync(join(dir, "package.json"), JSON.stringify(manifest, null, 2) + "\n")
     staged.push({ ...p, dir })
@@ -124,6 +131,10 @@ export function checkPackages({ dir, version, targets = buildTargets, bin = null
     const where = join(dir, p.name)
     const manifest = readManifest(join(where, "package.json"))
     if (!manifest) return { name: p.name, state: "broken", reason: "no package.json" }
+    // a package that states MIT without the text is not what it says it is
+    if (existsSync(join(dir, "..", "..", "LICENSE")) && !existsSync(join(where, "LICENSE"))) {
+      return { name: p.name, state: "broken", reason: "no LICENSE beside the build" }
+    }
     if (manifest.name !== p.name) return { name: p.name, state: "broken", reason: `its manifest names ${manifest.name}` }
     if (manifest.version !== version) return { name: p.name, state: "broken", reason: `version ${manifest.version}, the release is ${version}` }
     if (JSON.stringify(manifest.os) !== JSON.stringify([p.os]) || JSON.stringify(manifest.cpu) !== JSON.stringify([p.cpu])) {
@@ -155,6 +166,19 @@ export function checkPackages({ dir, version, targets = buildTargets, bin = null
   })
 }
 
+// packsBuilds says a `files` entry puts native/bin in the main package. npm
+// reads these as globs over the tree (a trailing "/**" and a bare directory both
+// include everything under it), and "./native/bin" is the same path spelled the
+// way people write it.
+const packsBuilds = (entry) => {
+  const said = String(entry ?? "")
+    .replace(/^\.\//, "")
+    .replace(/\/+$/, "")
+    .replace(/\/\*\*?$/, "")
+    .replace(/\/\*\*\/.*$/, "")
+  return said === "native" || said === "native/bin"
+}
+
 // mainPackageProblems lists what a main-package manifest gets wrong about the
 // platform packages, in words: every package named, each at exactly the
 // release's version (a range lets the two drift apart, and a package at
@@ -173,7 +197,11 @@ export function mainPackageProblems(manifest, targets = buildTargets) {
     problems.push("a platform package is bundled into the main package")
   }
   const files = manifest.files ?? []
-  if (files.some((f) => String(f) === "native/bin")) {
+  // Every spelling npm packs the same directory from: "./native/bin",
+  // "native/bin/**", "native", "native/**" all put the builds in the main
+  // package, and only the bare exact string used to be refused
+  // (2026-11-27 review).
+  if (files.some((f) => packsBuilds(f))) {
     problems.push("files names native/bin: the builds are the platform packages' now, and five shipped twice is the size this replaced")
   }
   return problems
@@ -290,7 +318,7 @@ function main(argv) {
       // it met while writing, and the packument lags the write by a moment.
       // Asking again is what tells "it is there, the client was wrong" (carry
       // on with the next package) from "nothing landed" (stop, bump).
-      if (landed(p.name, manifest.version)) {
+      if (landed(p.name, manifest.version, { expect: packIntegrity(p.dir) })) {
         console.log(`published ${p.name}@${manifest.version} (the client exited ${out.status}, the registry has it)`)
         continue
       }
@@ -301,14 +329,54 @@ function main(argv) {
   return 0
 }
 
+// packIntegrity is the sha512 integrity of the tarball npm would upload from a
+// staged package, read from `npm pack --dry-run --json` (it hashes the file it
+// would write, and writes nothing). An answer this cannot read is "" — the
+// publish fallback then checks the version alone, as before, rather than
+// refusing a release over a tool that did not speak.
+export const packIntegrity = (dir) => {
+  const argv = ["pack", "--dry-run", "--json"]
+  const shell = process.platform === "win32"
+  const out = shell
+    ? spawnSync(["npm", ...argv].join(" "), { cwd: dir, encoding: "utf8", shell: true })
+    : spawnSync("npm", argv, { cwd: dir, encoding: "utf8" })
+  if (out.status !== 0) return ""
+  try {
+    const said = JSON.parse(String(out.stdout ?? "").trim())
+    // npm 9 answers an array of entries; npm 10+ answers an object keyed by
+    // package name (measured with npm 12.2.3 on 2026-11-28)
+    const one = Array.isArray(said) ? said[0] : said?.integrity ? said : Object.values(said ?? {})[0]
+    return typeof one?.integrity === "string" ? one.integrity : ""
+  } catch {
+    return ""
+  }
+}
+
 // landed asks whether a version is really in the registry after a publish
 // said it failed. A registry answers a moment behind the write, so the answer
 // is asked for a few times with a pause between; an unreachable registry is
 // no evidence either way and does not count as a pass.
-export const landed = (name, version, { tookFn = took, attempts = 4, pauseMs = 1500 } = {}) => {
+export const landed = (name, version, { tookFn = took, attempts = 4, pauseMs = 1500, expect = "" } = {}) => {
+  landed.why = ""
   for (let i = 0; i < attempts; i++) {
     try {
-      if (tookFn([{ name }], version).length) return true
+      const found = tookFn([{ name }], version)
+      if (found.length) {
+        if (!expect) return true
+        // The version is there — but "there" is a name, and the tarball under
+        // it is what a person installs: a registry that answered with another
+        // digest published something else under this version, which npm
+        // cannot take back (2026-11-27 review).
+        const got = found.integrity?.[name] ?? ""
+        if (got && got === expect) return true
+        if (got && got !== expect) {
+          landed.why = `the registry has ${got.slice(0, 24)}… under ${version}, not this build's ${String(expect).slice(0, 24)}…`
+          return false
+        }
+        // a registry that states no integrity cannot be compared: the version
+        // is there, which is all this can say
+        return true
+      }
     } catch {
       // keep asking: a preflight that cannot reach the registry proves nothing
     }
@@ -322,7 +390,7 @@ export const landed = (name, version, { tookFn = took, attempts = 4, pauseMs = 1
 // npm is npm.cmd on Windows, where spawnSync finds it only through a shell,
 // and the version the registry was asked about came back wrong that way. A
 // packument is the registry's own answer, the same one `npm view` reads.
-export function took(wrote, version, { registry = process.env.npm_config_registry || "https://registry.npmjs.org" } = {}) {
+export function took(wrote, version, { registry = process.env.npm_config_registry || "https://registry.npmjs.org", integrities = null } = {}) {
   const taken = []
   const base = registry.replace(/\/$/, "")
   for (const p of wrote) {
@@ -343,7 +411,10 @@ export function took(wrote, version, { registry = process.env.npm_config_registr
     if (!doc) throw new Error(`${p.name}: the registry at ${base} did not answer with a version list; nothing was published`)
     if (doc.error && doc.error !== 404) throw new Error(`${p.name}: the registry answered ${doc.error}`)
     // versions is an array of the published versions, as the child printed it.
-    if (Array.isArray(doc?.versions) && doc.versions.includes(version)) taken.push(p.name)
+    if (Array.isArray(doc?.versions) && doc.versions.includes(version)) {
+      taken.push(p.name)
+      if (integrities && typeof doc?.integrity?.[version] === "string" && doc.integrity[version]) integrities[p.name] = doc.integrity[version]
+    }
   }
   return taken
 }
@@ -375,7 +446,12 @@ const get = (u, hops) => new Promise((resolve, reject) => {
 get(url, 0).then(({ status, body }) => {
   if (status !== 200) return console.log(JSON.stringify({ error: status }))
   const doc = JSON.parse((body ?? Buffer.alloc(0)).toString("utf8"))
-  console.log(JSON.stringify({ versions: Object.keys(doc.versions || {}) }))
+  const versions = Object.keys(doc.versions || {})
+  // what the registry says each version's tarball IS, so a caller can compare
+  // it with the bytes it meant to upload rather than with the version string
+  const integrity = {}
+  for (const v of versions) integrity[v] = String(doc.versions[v]?.dist?.integrity ?? "")
+  console.log(JSON.stringify({ versions, integrity }))
 }).catch((e) => console.log(JSON.stringify({ error: String(e && e.message || e) })))
 `
 

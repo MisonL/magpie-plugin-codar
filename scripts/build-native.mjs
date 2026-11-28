@@ -487,9 +487,15 @@ function build(argv) {
       console.log(r.state === "present" ? `present ${r.name}` : r.state === "missing" ? `missing ${r.name}` : `broken ${r.name}: ${r.reason}`)
     }
     const bad = rows.filter((r) => r.state !== "present")
-    if (bad.length && args.has("--strict")) {
+    if (bad.length) {
       const missing = bad.filter((r) => r.state === "missing").length
-      console.error(`build-native: ${bad.length} target(s) unusable (${missing} missing); run node scripts/build-native.mjs --all`)
+      // --strict used to be the only refusing spelling: `--check` alone printed
+      // five missing targets and exited 0, so a release step that dropped the
+      // flag waved the release through (2026-11-27 review). The flag still
+      // selects the wording, not the answer.
+      console.error(
+        `build-native: ${bad.length} target(s) unusable (${missing} missing)${args.has("--strict") ? "" : " — this is --check, and it is a refusal too; --strict is accepted for compatibility"}; run node scripts/build-native.mjs --all`,
+      )
       return 1
     }
     return 0
