@@ -896,8 +896,15 @@ test("a cancelled callback closes the page even when the authorize signal is liv
   assert.equal(authCtl.signal.aborted, false)
   const callCtl = new AbortController()
   const pending = opened.callback(undefined, { signal: callCtl.signal })
+  const began = Date.now()
   callCtl.abort()
-  const answered = await pending
+  // bounded: a cancel that only settles when the page's TTL runs out answers
+  // "failed" too, and that is the bug this test is about
+  const answered = await Promise.race([
+    pending,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("the callback did not answer within 5 s of its cancellation")), 5000)),
+  ])
+  assert.ok(Date.now() - began < 5000, "a cancelled callback answers now, not at the TTL")
   assert.equal(answered.type, "failed", `a cancelled callback answered ${JSON.stringify(answered)}`)
   // the page is closed: its own URL no longer answers at all
   await assert.rejects(() => fetch(opened.url), "the listener outlived the callback's cancellation")
@@ -926,7 +933,10 @@ test("a QR answer that refused is not a scene the page can draw", async () => {
     const got = await fetch(`${opened.url}qr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
     assert.notEqual(got.status, 200, "a refused QR answer was handed to the page as a scene")
     const said = await got.json()
-    assert.match(String(said.error ?? ""), /服务暂时不可用/, "the vendor's own sentence is what the page shows")
+    // the refusal reached the page as the vendor's own sentence, not through
+    // the "answered yes, carried no code" fallback: the fallback prefixes its
+    // text, so a run that dropped businessCodes would not match this
+    assert.match(String(said.error ?? ""), /^服务暂时不可用/, `the refusal's own sentence: ${JSON.stringify(said)}`)
   } finally {
     globalThis.fetch = real
     ctl.abort()
@@ -1037,7 +1047,13 @@ test("a wrapped refusal is a refusal, and a token the plugin cannot keep is not 
   const { login } = testables
   const wrapped = { "POST /v1/login": { body: { code: 200, data: { code: 201, status: "ip_verify_required", token: "TEMP" } } } }
   await withFetch(wrapped, async () => {
-    await assert.rejects(login("user_1", "pw"), (e) => String(e.message).length > 0, "the wrapped IP check is not a sign-in")
+    // the classification, not merely "it threw": an empty `{}` refusal also
+    // has a message once ApiError names it (2026-11-28 review)
+    await assert.rejects(
+      login("user_1", "pw"),
+      (e) => String(e.code) === "201" && e.body?.status === "ip_verify_required" && !("token" in (e.body ?? {})) && !String(e.message).includes("TEMP"),
+      "the wrapped IP check is not a sign-in",
+    )
   })
   const newline = { "POST /v1/login": { body: { code: 200, data: { token: "abc\ndef" } } } }
   await withFetch(newline, async () => {
@@ -2609,8 +2625,12 @@ test("a replacement token for the same account does not reuse the old catalog", 
   // review). The key is the credential's generation.
   const p = await CodarPlugin()
   const given = { id: "codar", models: {} }
-  const one = mkToken({ username: "user_c", exp: Math.floor(Date.now() / 1000) + 3600 })
-  const two = mkToken({ username: "user_c", exp: Math.floor(Date.now() / 1000) + 7200 })
+  // the same account AND the same exp: a key built from the name and the
+  // expiry alone passed this test before, because the two fixtures differed in
+  // both (2026-11-28 review). Only the credential's own bytes differ here.
+  const exp = Math.floor(Date.now() / 1000) + 3600
+  const one = mkToken({ username: "user_c", exp, n: 1 })
+  const two = mkToken({ username: "user_c", exp, n: 2 })
   let reads = 0
   let only = one
   const real = globalThis.fetch
@@ -9588,7 +9608,10 @@ test("every road out of the models hook hands back only records without id-named
   const outs = [
     await p.provider.models(table, {}),
     await p.provider.models(table, { auth: { type: "api", key: mkToken({ username: "u", exp: Math.floor(Date.now() / 1000) - 60 }) } }),
-    await withFetch({ "/v1/codar/models": { body: { code: 500 } } }, async () => p.provider.models(table, { auth: async () => auth() })),
+    // `auth` is what the host hands the hook (a credential, not a function):
+    // a function in its place short-circuited the read, so this third road
+    // used to stay on the fallback list without ever asking the vendor
+    await withFetch({ "/v1/codar/models": { body: { code: 500 } } }, async () => p.provider.models(table, { auth: await auth() })),
   ]
   for (const out of outs) {
     assert.equal(Object.hasOwn(out, "__proto__"), false, "no id-named key")

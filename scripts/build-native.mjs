@@ -160,10 +160,12 @@ const archOf = (head, goos) => {
 // be read with the file alone — no Go, no execution, no platform of its own.
 export const SOURCE_MARKER = "codar-proxy-source:"
 
-// sourceHash is a fingerprint of exactly what goes into the proxy: every .go
-// file under native/cmd that is compiled in (_test.go is not), plus go.mod and
-// go.sum, in walking order, path and bytes both. Two trees with the same hash
-// produce the same binary; a build made from anything else does not carry it.
+// sourceHash is a fingerprint of the program's own sources: every .go file
+// under native/cmd that is compiled in (_test.go is not), in walking order,
+// path and bytes both. Two trees with the same hash produce the same binary; a
+// build made from anything else does not carry it. go.mod is deliberately not
+// one of them (the build loop rewrites it per target); what toolchain and CPU
+// baseline the build actually used is `--buildinfo`'s question.
 export const sourceHash = (root = join(here, "..")) => {
   const h = createHash("sha256")
   const files = []

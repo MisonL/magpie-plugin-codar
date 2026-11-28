@@ -1529,12 +1529,24 @@ test("every files spelling npm packs the builds from is refused", async () => {
     version: "0.3.5",
     optionalDependencies: Object.fromEntries(buildTargets.map((t) => [packageName(t.os, t.arch), "0.3.5"])),
   }
-  for (const files of [["native/bin"], ["./native/bin"], ["native/bin/**"], ["native/**"], ["native"]]) {
+  for (const files of [
+    ["native/bin"], ["./native/bin"], ["native/bin/**"], ["native/**"], ["native"],
+    // npm packs any path under native/ that holds a build; the staging tree
+    // and a relocated bin directory are what a release actually has
+    // (2026-11-28 review)
+    ["native/packages"], ["native/bin-win"], ["native/bin/*.exe"],
+  ]) {
     const said = mainPackageProblems({ ...base, files }).join(" ")
     assert.match(said, /files names native\/bin/, `${JSON.stringify(files)} slipped past the manifest check`)
   }
   for (const files of [["lib"], ["native/other"], ["scripts/**"]]) {
     assert.deepEqual(mainPackageProblems({ ...base, files }), [], `${JSON.stringify(files)} was read as shipping the builds`)
+  }
+  // npm also accepts an object of names in bundleDependencies
+  const named = packageName(buildTargets[0].os, buildTargets[0].arch)
+  for (const field of ["bundleDependencies", "bundledDependencies"]) {
+    const said = mainPackageProblems({ ...base, [field]: { [named]: true } }).join(" ")
+    assert.match(said, /bundled into the main package/, `a ${field} object hid a platform package`)
   }
 })
 

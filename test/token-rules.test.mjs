@@ -148,10 +148,21 @@ test("an account restriction is never marked as an expired sign-in", async () =>
     { code: 200, data: { code: "account_restricted", message: "账号受限" } },
   ]) {
     await withFetch(refreshRoute(body), async () => {
-      await assert.rejects(refreshToken(NAMED), (e) => e.signIn !== "expired", `${JSON.stringify(body)}: restriction is not expiry`)
+      // the refusal is named, not merely "not expired": a `no_token` or a
+      // transport error would also pass a bare `signIn !== "expired"` check
+      // (2026-11-28 review)
+      await assert.rejects(
+        refreshToken(NAMED),
+        (e) => e.signIn === undefined && /^(?:403|account_restricted)$/.test(String(e.code)) && /受限/.test(String(e.message)),
+        `${JSON.stringify(body)}: restriction is not expiry`,
+      )
     })
     await withFetch(refreshRoute(body, 403), async () => {
-      await assert.rejects(refreshToken(NAMED), (e) => e.signIn !== "expired", `${JSON.stringify(body)}: HTTP 403 restriction`)
+      await assert.rejects(
+        refreshToken(NAMED),
+        (e) => e.signIn === undefined && /^(?:403|account_restricted)$/.test(String(e.code)),
+        `${JSON.stringify(body)}: HTTP 403 restriction`,
+      )
     })
   }
 })

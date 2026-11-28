@@ -88,6 +88,10 @@ jobs:
       # (2026-11-27 review).
       - run: node scripts/build-native.mjs --check --strict
       - run: node scripts/build-native.mjs --buildinfo
+      # The pins are part of the gate, not only of the Windows install path:
+      # a range or a missing platform package is refused here rather than at
+      # prepublishOnly, so a green CI means the metadata can ship.
+      - run: node scripts/native-packages.mjs --check
       - run: node scripts/tarball.mjs --require-bun
 
   # the plugin reads a file under the user's home directory on every platform

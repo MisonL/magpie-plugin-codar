@@ -37,12 +37,13 @@ const TOKEN = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ username: "us
 // tests that need one are skipped rather than failed: the suite runs on a CI
 // image that may not carry a browser, and a source-level check is still run
 // below for exactly that case.
-// ...and it only runs when asked: a browser the suite does not require cannot
-// hold the default run to a machine's load. `CODAR_UI_TESTS=1 node --test
-// test/signinpage-ui.test.mjs` drives the page for real; the default run keeps
-// the source-level checks below, which need nothing but Node.
+// A browser that is there is used: the point of these tests is the page as a
+// person runs it, and leaving them off by default meant the default suite
+// proved nothing about them (2026-11-28 review). A machine without one skips
+// them and still runs the source-level checks below; `CODAR_UI_TESTS=0` turns
+// them off on purpose.
 const CHROME =
-  (process.env.CODAR_UI_TESTS === "1" || process.env.MAGPIE_CHROME) &&
+  process.env.CODAR_UI_TESTS !== "0" &&
   (process.env.MAGPIE_CHROME ||
   [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -136,7 +137,26 @@ async function launch() {
   const close = () => {
     try { ws.close() } catch {}
     chrome.kill()
-    setTimeout(() => rmSync(profile, { recursive: true, force: true }), 200).unref()
+    // Chrome keeps writing its profile for a moment after SIGTERM (a lock
+    // file, a last flush), and a directory it fills again after this call is
+    // removed is an ENOTEMPTY after the test has ended — which node --test
+    // reports as a failure of a test that already passed (2026-11-28 review).
+    // Waiting for the child's exit, then retrying the removal, leaves no
+    // activity behind.
+    const remove = (tries = 0) => {
+      try {
+        rmSync(profile, { recursive: true, force: true })
+      } catch (e) {
+        if (tries >= 40 || (e?.code !== "ENOTEMPTY" && e?.code !== "EBUSY" && e?.code !== "EPERM")) return
+        setTimeout(() => remove(tries + 1), 50).unref()
+      }
+    }
+    if (chrome.exitCode !== null || chrome.signalCode !== null) remove()
+    else {
+      chrome.once("exit", () => remove())
+      // a browser that does not exit must not hold the profile forever
+      setTimeout(() => { try { chrome.kill("SIGKILL") } catch {} ; remove() }, 2000).unref()
+    }
   }
   // onMessage subscribes to the socket's events and answers the way off() does.
   const onMessage = (fn) => {
@@ -191,7 +211,7 @@ async function openPage(browser) {
       return r.result?.value
     },
     // until polls the page until fn answers something truthy, then answers it.
-    until: async (source, why, ms = 4000) => {
+    until: async (source, why, ms = 20000) => {
       const deadline = Date.now() + ms
       for (;;) {
         const got = await page.eval(source)
@@ -376,6 +396,9 @@ test("a QR failure waits for the QR tab, and shows there when the person goes ba
     assert.equal(await answerOf(page, 400), "pending", "the host is not told while the person is elsewhere")
     onSms?.()
     await ui.until(`document.getElementById("qr").classList.contains("veil")`, "the failure held for the QR tab")
+    // the class and the sentence are written in the same turn, but a busy
+    // machine can paint between them: wait for the text, not just the class
+    await ui.until(`(document.querySelector("#qr .veil-text")?.textContent || "").length > 0`, "the failure text")
     assert.equal(await ui.eval(panel), "sms", "the SMS tab is not disturbed by it")
     assert.equal(await ui.eval(ended), false, "and the page has not ended")
     assert.match(await ui.eval(`document.getElementById("qr").querySelector(".veil-text").textContent`), /扫码登录失败/)
@@ -514,9 +537,13 @@ test("the tabs answer the arrow keys as tabs do, and a finished sign-in moves th
   const browser = await launch()
   let page
   try {
+    // the sign-in finishes only when the keyboard half of this test is done:
+    // a "done" on the first poll ended the page before the tabs could be
+    // focused, and the test then failed for the wrong reason (2026-11-28)
+    let finishNow = false
     const opened = await ready(browser, {
       qrcode: async () => ({ scene: "scene-1", qrUrl: `data:image/gif;base64,${GIF}` }),
-      status: async () => ({ state: "done", token: TOKEN, username: "user_1" }),
+      status: async () => (finishNow ? { state: "done", token: TOKEN, username: "user_1" } : { state: "waiting" }),
       sendCode: async () => {},
       verifyCode: async () => ({ token: TOKEN, username: "user_1" }),
     })
@@ -527,6 +554,10 @@ test("the tabs answer the arrow keys as tabs do, and a finished sign-in moves th
 
     assert.equal(await ui.eval(selected), "scan:true,sms:false")
     assert.equal(await ui.eval(tabStops), "scan:0,sms:-1", "one tab stop for the pair")
+    // the page must have finished its first layout before a programmatic
+    // focus lands: a focus before that answers false and the test then blamed
+    // the page for a race it did not have (2026-11-28)
+    await ui.until(`document.readyState === "complete" && !document.getElementById("tab-scan").hidden`, "the page's first layout")
     assert.equal(await ui.focus("#tab-scan"), true, "the tab takes the focus")
     await ui.key("ArrowRight")
     await ui.until(`document.getElementById("tab-sms").getAttribute("aria-selected") === "true"`, "the arrow's switch")
@@ -538,6 +569,7 @@ test("the tabs answer the arrow keys as tabs do, and a finished sign-in moves th
     assert.equal(await ui.eval(focusName), "tab-scan")
 
     // the QR sign-in finishes: the end screen takes the focus
+    finishNow = true
     await ui.until(`!document.getElementById("done").hidden`, "the success screen")
     assert.equal(await ui.eval(focusName), "done", "the end screen is where the keyboard is left")
   } finally {

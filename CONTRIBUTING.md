@@ -18,12 +18,16 @@ reason written down so the next review does not have to rediscover it:
   same owner; a process of the same user can read either one, and the Codar
   desktop app's own token file is already readable by it. The file stays for
   the sweep to find abandoned proxies by.
-- **`landed()` asks whether the version is in the registry, not whose bytes.**
-  A packument's `dist.integrity` would say which tarball the registry holds,
-  but npm builds the tarball during `publish`, so its bytes are not known
-  before the call that may fail. Two publishers racing at the same name and
-  version is a serial-release procedure's problem: publish the platform
-  packages first, then the main package, in one run.
+- **`landed()` asks the version first, then whose bytes.** A publish that
+  reports an error asks the packument again; when the version is there, the
+  `dist.integrity` it states is compared with the digest
+  `npm pack --dry-run --json` gives the staged directory
+  (`packIntegrity()`), so a registry that took different bytes under this
+  version is reported rather than counted as published. A registry that
+  states no integrity is answered on the version alone — npm has no way to
+  correct it then. Two publishers racing at the same name and version is a
+  serial-release procedure's problem: publish the platform packages first,
+  then the main package, in one run.
 
 ## The rules the suite defends
 
@@ -115,7 +119,11 @@ bun test                           # the runtime magpie actually loads plugins o
 node scripts/catalog.mjs --check   # is lib/catalog.mjs still what the vendor says?
 ```
 
-The tests stub `fetch`; nothing here talks to speedai. Fixtures follow the
+The tests stub `fetch`; nothing here talks to the vendor. One preflight
+(`scripts/tarball.mjs`, `scripts/check-packed-install.mjs`) reads a
+`127.0.0.1` registry, and a bare `node --test` run may ask
+`registry.npmjs.org` for one check — `CODAR_OFFLINE=1` skips both, and no test
+sends a request to a speedai host. Fixtures follow the
 clock, so they don't expire on a given day. `test/style.test.mjs` pins the
 formatting rules in `.editorconfig` (LF, one final newline, no trailing
 whitespace, two-space indent) for `.mjs`, `.md`, `.json`, `.yml` and `.yaml` files,

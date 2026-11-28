@@ -85,7 +85,10 @@ const readManifest = (path) => {
 // arrives without it cannot be spawned, which is how the 0.2.1 tarball failed
 // its own gate), and answers what it wrote. A build missing from bin is an
 // error: a package staged without one would install and then have no proxy.
-export function stagePackages({ bin, out, version, targets = buildTargets }) {
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
+export const repoLicense = () => join(repoRoot, "LICENSE")
+
+export function stagePackages({ bin, out, version, targets = buildTargets, licensePath = repoLicense() }) {
   const staged = []
   for (const p of platformPackages(targets)) {
     const source = join(bin, p.file)
@@ -102,10 +105,10 @@ export function stagePackages({ bin, out, version, targets = buildTargets }) {
     // The package states MIT and its tarball used to carry no text of it: a
     // platform package is what npm actually installs, so the license has to
     // travel with it (2026-11-27 review).
-    const license = join(bin, "..", "..", "LICENSE")
-    if (existsSync(license)) {
-      copyFileSync(license, join(dir, "LICENSE"))
-    }
+    // from the repository, not from two levels above `bin`: CODAR_NATIVE_OUT
+    // may put the builds anywhere, and staging a temp tree used to look for a
+    // licence that is not there (2026-11-28 review)
+    if (licensePath && existsSync(licensePath)) copyFileSync(licensePath, join(dir, "LICENSE"))
     const manifest = {
       name: p.name,
       version,
@@ -131,8 +134,11 @@ export function checkPackages({ dir, version, targets = buildTargets, bin = null
     const where = join(dir, p.name)
     const manifest = readManifest(join(where, "package.json"))
     if (!manifest) return { name: p.name, state: "broken", reason: "no package.json" }
-    // a package that states MIT without the text is not what it says it is
-    if (existsSync(join(dir, "..", "..", "LICENSE")) && !existsSync(join(where, "LICENSE"))) {
+    // a package that states a licence without the text is not what it says it
+    // is. Asked of the package itself, not of wherever staging happens to
+    // sit: a temporary staging tree used to resolve ../../LICENSE to /tmp and
+    // skip the check (2026-11-28 review).
+    if (manifest.license && !existsSync(join(where, "LICENSE"))) {
       return { name: p.name, state: "broken", reason: "no LICENSE beside the build" }
     }
     if (manifest.name !== p.name) return { name: p.name, state: "broken", reason: `its manifest names ${manifest.name}` }
@@ -174,9 +180,15 @@ const packsBuilds = (entry) => {
   const said = String(entry ?? "")
     .replace(/^\.\//, "")
     .replace(/\/+$/, "")
-    .replace(/\/\*\*?$/, "")
-    .replace(/\/\*\*\/.*$/, "")
-  return said === "native" || said === "native/bin"
+    .replace(/\/\*.*$/, "")
+  // Everything npm can pull the builds in from: the whole native tree, the
+  // build directory under any suffix (native/bin-win, native/bin-arm64), a
+  // file glob inside it, and the staged platform packages themselves
+  // (2026-11-28 review: only the exact "native/bin" used to be refused).
+  if (said === "native" || said.startsWith("native/")) {
+    return said === "native" || /^native\/(?:bin|packages)(?:$|[-/])/.test(said)
+  }
+  return false
 }
 
 // mainPackageProblems lists what a main-package manifest gets wrong about the
@@ -193,7 +205,9 @@ export function mainPackageProblems(manifest, targets = buildTargets) {
     else if (at !== manifest.version) problems.push(`${p.name} is pinned to ${at}; an exact ${manifest.version} is what installs with the main package`)
   }
   const groups = manifest.bundleDependencies ?? manifest.bundledDependencies
-  if (Array.isArray(groups) && groups.some((g) => platformPackages(targets).some((p) => p.name === g))) {
+  // npm accepts a list or an object of names; both bundle what they name
+  const named = Array.isArray(groups) ? groups : groups && typeof groups === "object" ? Object.keys(groups).filter((k) => groups[k]) : []
+  if (named.some((g) => platformPackages(targets).some((p) => p.name === g))) {
     problems.push("a platform package is bundled into the main package")
   }
   const files = manifest.files ?? []
@@ -318,11 +332,15 @@ function main(argv) {
       // it met while writing, and the packument lags the write by a moment.
       // Asking again is what tells "it is there, the client was wrong" (carry
       // on with the next package) from "nothing landed" (stop, bump).
-      if (landed(p.name, manifest.version, { expect: packIntegrity(p.dir) })) {
+      const expect = packIntegrity(p.dir)
+      if (!expect) console.warn(`native-packages: ${p.name}: no local tarball digest (npm pack --dry-run --json did not answer); the registry answer cannot be compared with this build`)
+      if (landed(p.name, manifest.version, { expect })) {
         console.log(`published ${p.name}@${manifest.version} (the client exited ${out.status}, the registry has it)`)
         continue
       }
-      console.error(`native-packages: publishing ${p.name} failed (exit ${out.status}); the packages before it are published, and this version cannot be completed — bump the version for the rest`)
+      console.error(
+        `native-packages: publishing ${p.name} failed (exit ${out.status})${landed.why ? `: ${landed.why}` : ""}; the packages before it are published, and this version cannot be completed — bump the version for the rest`,
+      )
       return 1
     }
   }
@@ -360,14 +378,19 @@ export const landed = (name, version, { tookFn = took, attempts = 4, pauseMs = 1
   landed.why = ""
   for (let i = 0; i < attempts; i++) {
     try {
-      const found = tookFn([{ name }], version)
+      // took() writes each version's stated digest into the object it is given;
+      // the array it answers carries only names. Reading `.integrity` off the
+      // array made the comparison below unanswerable and every publish
+      // "landed" (2026-11-28 review).
+      const digests = {}
+      const found = tookFn([{ name }], version, { integrities: digests })
       if (found.length) {
         if (!expect) return true
         // The version is there — but "there" is a name, and the tarball under
         // it is what a person installs: a registry that answered with another
         // digest published something else under this version, which npm
         // cannot take back (2026-11-27 review).
-        const got = found.integrity?.[name] ?? ""
+        const got = digests[name] ?? found.integrity?.[name] ?? ""
         if (got && got === expect) return true
         if (got && got !== expect) {
           landed.why = `the registry has ${got.slice(0, 24)}… under ${version}, not this build's ${String(expect).slice(0, 24)}…`

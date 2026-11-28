@@ -235,9 +235,8 @@ export async function CodarPlugin(input) {
       // button per method and has no way to group them; the person picks the
       // way in on the page. The password sits beside it rather than on it: it
       // is typed into magpie's own dialog, where no browser password manager
-      // is asked to save a Codar password against a random 127.0.0.1 port, and
-      // it is the method the vendor's IP check hands on to the page's own
-      // security-check step.
+      // is asked to save a Codar password against a random 127.0.0.1 port. Its
+      // own IP check is finished in Codar's app, not on that page.
       //
       // Each hands the host a token and, with it, the token's own exp
       // (signInResult): the host keeps the sign-in as an oauth one, whose
@@ -328,8 +327,15 @@ export async function CodarPlugin(input) {
               const said = unwrapped(body)
               const node = said && typeof said === "object" ? said : body
               if (saidNo(node?.success) || saidNo(body?.success)) return false
-              const code = codeOf(node?.code) ?? codeOf(body?.code)
-              return code == null || code === 0 || code === 200
+              // codeOf answers NaN for a field that is not there, and NaN ?? x
+              // is NaN: a success wrapper with no inner code (`{code:200,
+              // data:{}}`) was read as a refusal and the page released its
+              // cooldown over a code the vendor had sent (2026-11-28 review).
+              const inner = codeOf(node?.code)
+              const outer = codeOf(body?.code)
+              const code = Number.isNaN(inner) ? outer : inner
+              if (Number.isNaN(code)) return true
+              return code === 0 || code === 200
             }
             const smsSide = (send, verify) => ({
               sendCode: (phone, captcha, signal) => send(phone, captcha, signal).then((body) => {
@@ -377,9 +383,13 @@ export async function CodarPlugin(input) {
                     const body = await request(`${ACCOUNT}${WECHAT_QR_PATH}`, { method: "POST", businessCodes: true, signal })
                     const scene = wechatQrOf(body)
                     if (!scene?.scene) {
-                      const why = saidBy(unwrapped(body) ?? body) || "二维码获取失败"
-                      const e = new Error(cut(scrubShapes(String(why), ""), 200))
-                      throw e
+                      // The answer said yes and carried no code: that is not a
+                      // refusal the vendor worded (a refusal is stopped by
+                      // businessCodes above), and naming it as one would make
+                      // the two paths read the same in an error the person
+                      // sees (2026-11-28 review).
+                      const why = saidBy(unwrapped(body) ?? body)
+                      throw new Error(why ? `二维码数据不完整：${cut(scrubShapes(String(why), ""), 180)}` : "二维码数据不完整")
                     }
                     return scene
                   },
@@ -434,6 +444,10 @@ export async function CodarPlugin(input) {
             }
             const onAbort = () => page.close()
             signal?.addEventListener?.("abort", onAbort, { once: true })
+            // a signal that aborted between the check above and this
+            // registration never fires: AbortSignal does not call a listener
+            // added after its abort, and the page would sit for the whole TTL
+            if (signal?.aborted) onAbort()
             // the callback's own signal (see callback below) closes the page
             // the same way the authorize's does
             const closeOnAbort = () => page.close()
@@ -448,7 +462,10 @@ export async function CodarPlugin(input) {
                 // cancelled sign-in aborts.
                 const own = callSignal ?? signal
                 if (own?.aborted) page.close()
-                else own?.addEventListener?.("abort", closeOnAbort, { once: true })
+                else {
+                  own?.addEventListener?.("abort", closeOnAbort, { once: true })
+                  if (own?.aborted) closeOnAbort()
+                }
                 try {
                   const got = await page.wait(own)
                   // a state the vendor will not finish arrives as the page's
@@ -478,9 +495,10 @@ export async function CodarPlugin(input) {
           // answers code 201 or ip_verify_required wants an SMS check this
           // plugin cannot pass for the user, so the answer names the way
           // that works instead of asking for a code that would then be sent
-          // from a different machine. It comes after the sign-in page for that
-          // reason: the hand-off opens that page as its security-check step,
-          // which is usually where this sign-in ends.
+          // from a different machine. It comes after the sign-in page because
+          // the host draws the methods in that order and the password is typed
+          // into the host's own dialog; the IP check itself is finished in
+          // Codar's app, not on this page.
           type: "api",
           label: "科搭账号密码登录",
           prompts: [
@@ -492,12 +510,19 @@ export async function CodarPlugin(input) {
             },
             { key: "password", type: "password", message: "科搭密码", validate: (v) => (String(v ?? "") ? null : "请填写科搭密码") },
           ],
-          async authorize(inputs = {}) {
+          async authorize(inputs = {}, { signal } = {}) {
             const username = String(inputs.username ?? "").trim()
             const password = String(inputs.password ?? "")
             if (!username || !password) return { type: "failed", error: "请填写科搭账号和密码" }
+            // The host gives this method its own signal (0.1.4824 and
+            // 0.1.4940 both do). The login POST used to run without it: the
+            // host's cancellation is wired to the global fetch, and the
+            // native proxy is a socket, so a cancelled sign-in kept the
+            // request until its own timeout (2026-11-28 review).
+            if (signal?.aborted) return { type: "failed", error: "登录已取消" }
             try {
-              const got = await login(username, password)
+              const got = await login(username, password, { signal })
+              if (signal?.aborted) return { type: "failed", error: "登录已取消" }
               return signInResult(got.token)
             } catch (e) {
               // The card shows this line: neither the account nor the password
@@ -588,6 +613,12 @@ export async function CodarPlugin(input) {
         }
         const token = tokenOf(got)
         if (!token) return {}
+        // A token past its own exp is not a credential a request can use, and
+        // every other entry (usage, checkin, models, refresh) refuses one.
+        // The loader handed it over, so the chat request failed upstream
+        // instead of the host asking the person to sign in again
+        // (2026-11-28 review).
+        if (expired(token)) return {}
         return { apiKey: token, ...(loaderBase ? { baseURL: loaderBase } : {}), fetch: chatTransport }
       },
 
